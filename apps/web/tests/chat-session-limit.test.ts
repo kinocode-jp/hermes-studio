@@ -840,7 +840,7 @@ test("modal drop replacement removes a duplicate source pane and keeps the targe
   assert.equal(profileChatModalActivePaneId.value, "three");
 });
 
-test("modal drop replacement dismisses only an unused blank local draft", () => {
+test("modal drop replacement preserves the existing session-list behavior", () => {
   const localDraft: ChatSession = {
     id: "drop-draft", profileId: "profile", title: "", titlePresentation: "new-chat",
     status: "ready", messages: [], remoteKind: "draft", connectionState: "ready", historyState: "loaded",
@@ -859,7 +859,7 @@ test("modal drop replacement dismisses only an unused blank local draft", () => 
   setProfileChatModalPanes([localDraft.id]);
   assert.equal(replaceProfileChatModalPane(localDraft.id, existing.id), true);
   assert.deepEqual(profileChatModalPaneIds.value, [existing.id]);
-  assert.equal(sessions.value.some((session) => session.id === localDraft.id), false, "the replaced unused local draft leaves the session list");
+  assert.equal(sessions.value.some((session) => session.id === localDraft.id), true, "drop replacement only changes pane placement");
 
   sessions.value = [storedEmpty, existing];
   setProfileChatModalPanes([storedEmpty.id]);
@@ -868,7 +868,7 @@ test("modal drop replacement dismisses only an unused blank local draft", () => 
   assert.equal(sessions.value.some((session) => session.id === storedEmpty.id), true, "a persisted empty conversation stays listed");
 });
 
-test("dashboard drop replacement dismisses only an unused blank local draft", () => {
+test("dashboard drop replacement preserves the existing session-list behavior", () => {
   const localDraft: ChatSession = {
     id: "dash-drop-draft", profileId: "profile", title: "", titlePresentation: "new-chat",
     status: "ready", messages: [], remoteKind: "draft", connectionState: "ready", historyState: "loaded",
@@ -892,7 +892,7 @@ test("dashboard drop replacement dismisses only an unused blank local draft", ()
   });
   assert.equal(replaceDashboardPanel("draft-pane", "chat", { sessionId: existing.id }), "replaced");
   assert.deepEqual(activeDashboard.value.panels.map((panel) => panel.sessionId), [existing.id]);
-  assert.equal(sessions.value.some((session) => session.id === localDraft.id), false, "the replaced unused local draft leaves the session list");
+  assert.equal(sessions.value.some((session) => session.id === localDraft.id), true, "drop replacement only changes pane placement");
 
   sessions.value = [storedEmpty, existing];
   openSessionIds.value = [storedEmpty.id];

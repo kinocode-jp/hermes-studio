@@ -703,9 +703,15 @@ export function selectProfileChatModalSession(sessionId: string): boolean {
   const target = current.includes(profileChatModalActivePaneId.value)
     ? profileChatModalActivePaneId.value
     : current.at(-1)!;
-  // replaceProfileChatModalPane discards a replaced unused local draft itself,
-  // so click and drag-drop paths behave identically.
-  return replaceProfileChatModalPane(target, sessionId);
+  const replacedSession = sessions.value.find((item) => item.id === target);
+  const replaced = replaceProfileChatModalPane(target, sessionId);
+  // A list click may discard the unused local composer it replaces. The shared
+  // replace primitive deliberately does not do this so drag-and-drop keeps its
+  // existing pane-only behavior.
+  if (replaced && target !== sessionId && isDiscardableEmptyProfileModalDraft(replacedSession)) {
+    dismissSessions([target]);
+  }
+  return replaced;
 }
 
 /** Replace one modal pane, removing a duplicate source pane when necessary. */
@@ -715,7 +721,6 @@ export function replaceProfileChatModalPane(targetSessionId: string, sessionId: 
   const current = profileChatModalPaneIds.value;
   if (!modalProfileId || session?.profileId !== modalProfileId || !current.includes(targetSessionId)) return false;
   if (targetSessionId === sessionId) return setProfileChatModalActivePane(sessionId);
-  const replacedSession = sessions.value.find((item) => item.id === targetSessionId);
   const next: string[] = [];
   for (const id of current) {
     if (id === targetSessionId) next.push(sessionId);
@@ -723,9 +728,6 @@ export function replaceProfileChatModalPane(targetSessionId: string, sessionId: 
   }
   replaceProfileChatModalPanes(next, sessionId);
   ensureSessionConnection(sessionId);
-  // Every replace path dismisses an unused blank local draft that its pane
-  // presented; persisted conversations stay listed in the session list.
-  if (isDiscardableEmptyProfileModalDraft(replacedSession)) dismissSessions([targetSessionId]);
   return true;
 }
 

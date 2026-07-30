@@ -71,7 +71,14 @@ pub(crate) fn replace_startup_window(
         // an empty document while the native setup hook is still unwinding.
         // Retry once only when Preact has not mounted; successful startups and
         // external/error views are untouched.
-        window.eval(BUNDLED_APP_BOOTSTRAP_RECOVERY)?;
+        if let Err(error) = window.eval(BUNDLED_APP_BOOTSTRAP_RECOVERY) {
+            // This is only a best-effort recovery for an occasional blank
+            // WKWebView. A transient eval race must not tear down an otherwise
+            // ready owned server or replace the app with a startup notice.
+            log_event(&format!(
+                "Bundled app bootstrap recovery script could not be installed: {error}"
+            ));
+        }
     }
     let should_show = replacement_window_should_show(
         app.get_webview_window(STARTUP_WINDOW_LABEL)

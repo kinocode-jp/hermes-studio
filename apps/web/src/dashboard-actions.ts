@@ -260,11 +260,11 @@ export function selectDashboardChatSession(sessionId: string): DashboardChatClic
   // A blank startup composer is a placeholder, not another conversation the
   // user chose to keep, but only a conversation visible nowhere may claim it:
   // a conversation already shown on another dashboard was focused above.
-  // replaceDashboardPanel dismisses the placeholder when it is a purely local
-  // unpersisted draft.
+  // The sidebar-specific replacement dismisses the placeholder when it is a
+  // purely local unpersisted draft.
   const initial = replaceableInitialChatPanel();
   if (initial && initial.sessionId !== sessionId) {
-    return replaceDashboardPanel(initial.panelId, "chat", { sessionId });
+    return replaceDashboardChatPanelFromSidebar(initial.panelId, sessionId);
   }
 
   const activeWithChat = activeDashboard.value.panels.some((panel) => panel.kind === "chat")
@@ -295,7 +295,27 @@ export function selectDashboardChatSession(sessionId: string): DashboardChatClic
   const lastActive = chatPanels.find((panel) => panel.id === activeDashboard.value.activeChatPanelId);
   const target = chatPanels.length === 1 ? chatPanels[0] : lastActive ?? chatPanels.at(-1);
   if (!target) return "missing";
-  return replaceDashboardPanel(target.id, "chat", { sessionId });
+  return replaceDashboardChatPanelFromSidebar(target.id, sessionId);
+}
+
+/**
+ * Sidebar clicks may discard the unused local composer they replace. Keep this
+ * cleanup out of the shared replace primitive so drag-and-drop remains a pure
+ * pane-layout operation.
+ */
+function replaceDashboardChatPanelFromSidebar(
+  panelId: string,
+  sessionId: string,
+): ReplacePanelResult {
+  const replacedPanel = activeDashboard.value.panels.find((panel) => panel.id === panelId);
+  const replacedSession = replacedPanel?.kind === "chat" && replacedPanel.sessionId !== undefined
+    ? sessions.value.find((session) => session.id === replacedPanel.sessionId)
+    : undefined;
+  const result = replaceDashboardPanel(panelId, "chat", { sessionId });
+  if (replacedSession && result === "replaced" && isDiscardableUnusedChatDraft(replacedSession)) {
+    dismissSessions([replacedSession.id]);
+  }
+  return result;
 }
 
 /** Replace a registered pane and keep chat/Studio side effects synchronized. */
@@ -308,13 +328,6 @@ export function replaceDashboardPanel(
     const sessionId = options?.sessionId;
     if (!sessionId || !sessions.value.some((session) => session.id === sessionId)) return "missing";
   }
-  // Capture the outgoing chat session before the swap so every replace path —
-  // sidebar click and drag-drop alike — discards an unused blank local draft
-  // instead of leaving it invisible but listed.
-  const replacedPanel = activeDashboard.value.panels.find((panel) => panel.id === panelId);
-  const replacedSession = replacedPanel?.kind === "chat" && replacedPanel.sessionId !== undefined
-    ? sessions.value.find((session) => session.id === replacedPanel.sessionId)
-    : undefined;
   let result: ReplacePanelResult;
   switching = true;
   try {
@@ -326,7 +339,6 @@ export function replaceDashboardPanel(
       .map((panel) => panel.sessionId!);
     for (const id of openSessionIds.value.filter((sessionId) => !wanted.includes(sessionId))) closeSession(id);
     for (const id of wanted) openSession(id, { workspace: true });
-    if (isDiscardableUnusedChatDraft(replacedSession)) dismissSessions([replacedSession.id]);
   } finally {
     switching = false;
   }
