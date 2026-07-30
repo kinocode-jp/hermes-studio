@@ -78,7 +78,11 @@ pub(crate) fn replace_startup_window(
             .and_then(|startup| startup.is_visible().ok()),
     );
     if let Some(startup) = app.get_webview_window(STARTUP_WINDOW_LABEL) {
-        startup.close()?;
+        // Destroy, not close: on macOS the CloseRequested handler treats the
+        // startup window as a managed document window and prevents its close,
+        // so a programmatic close() would leave the loading view on screen
+        // next to main. destroy() bypasses CloseRequested entirely.
+        startup.destroy()?;
     }
     if should_show {
         window.show()?;

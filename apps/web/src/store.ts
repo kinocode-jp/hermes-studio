@@ -669,7 +669,6 @@ export function addProfileChatModalPane(sessionId: string, options?: { index?: n
       ? moveProfileChatModalPane(sessionId, options.index)
       : setProfileChatModalActivePane(sessionId);
   }
-  cancelPendingProfileChatModalRestore();
   const next = [...current];
   const insertAt = typeof options?.index === "number"
     ? Math.max(0, Math.min(next.length, Math.floor(options.index)))
@@ -704,12 +703,9 @@ export function selectProfileChatModalSession(sessionId: string): boolean {
   const target = current.includes(profileChatModalActivePaneId.value)
     ? profileChatModalActivePaneId.value
     : current.at(-1)!;
-  const replacedSession = sessions.value.find((item) => item.id === target);
-  const replaced = replaceProfileChatModalPane(target, sessionId);
-  if (replaced && isDiscardableEmptyProfileModalDraft(replacedSession)) {
-    dismissSessions([target]);
-  }
-  return replaced;
+  // replaceProfileChatModalPane discards a replaced unused local draft itself,
+  // so click and drag-drop paths behave identically.
+  return replaceProfileChatModalPane(target, sessionId);
 }
 
 /** Replace one modal pane, removing a duplicate source pane when necessary. */
@@ -719,7 +715,7 @@ export function replaceProfileChatModalPane(targetSessionId: string, sessionId: 
   const current = profileChatModalPaneIds.value;
   if (!modalProfileId || session?.profileId !== modalProfileId || !current.includes(targetSessionId)) return false;
   if (targetSessionId === sessionId) return setProfileChatModalActivePane(sessionId);
-  cancelPendingProfileChatModalRestore();
+  const replacedSession = sessions.value.find((item) => item.id === targetSessionId);
   const next: string[] = [];
   for (const id of current) {
     if (id === targetSessionId) next.push(sessionId);
@@ -727,6 +723,9 @@ export function replaceProfileChatModalPane(targetSessionId: string, sessionId: 
   }
   replaceProfileChatModalPanes(next, sessionId);
   ensureSessionConnection(sessionId);
+  // Every replace path dismisses an unused blank local draft that its pane
+  // presented; persisted conversations stay listed in the session list.
+  if (isDiscardableEmptyProfileModalDraft(replacedSession)) dismissSessions([targetSessionId]);
   return true;
 }
 
@@ -734,7 +733,6 @@ export function moveProfileChatModalPane(sessionId: string, index: number): bool
   const current = profileChatModalPaneIds.value;
   const from = current.indexOf(sessionId);
   if (from < 0) return false;
-  cancelPendingProfileChatModalRestore();
   let desired = Math.max(0, Math.min(current.length, Math.floor(index)));
   if (from < desired) desired -= 1;
   const next = current.filter((id) => id !== sessionId);
@@ -744,12 +742,10 @@ export function moveProfileChatModalPane(sessionId: string, index: number): bool
 }
 
 export function removeProfileChatModalPane(sessionId: string): void {
-  cancelPendingProfileChatModalRestore();
   replaceProfileChatModalPanes(profileChatModalPaneIds.value.filter((id) => id !== sessionId));
 }
 
 export function setProfileChatModalPanes(sessionIds: readonly string[]): void {
-  cancelPendingProfileChatModalRestore();
   const modalProfileId = profileChatModalId.value;
   if (!modalProfileId) {
     replaceProfileChatModalPanes([]);
@@ -775,13 +771,11 @@ function replaceProfileChatModalPanes(
   profileChatModalPaneIds.value = next;
   profileChatModalActivePaneId.value = next.includes(activePaneId) ? activePaneId : next.at(-1) ?? "";
   reconcileActiveChatTargets(previousTargets);
-  if (persist) persistCurrentProfileChatModalLayout();
-}
-
-function cancelPendingProfileChatModalRestore(): void {
-  if (pendingProfileChatModalLayout?.profileId === profileChatModalId.value) {
-    pendingProfileChatModalLayout = undefined;
-  }
+  // Pane mutations stay provisional while a saved layout awaits an
+  // authoritative inventory; persisting now would destroy the saved panes
+  // before reconcilePendingProfileChatModalRestore can apply them.
+  const persistAllowed = persist && pendingProfileChatModalLayout?.profileId !== profileChatModalId.value;
+  if (persistAllowed) persistCurrentProfileChatModalLayout();
 }
 
 function discardTemporaryPendingProfileModalDrafts(): void {

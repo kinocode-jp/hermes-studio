@@ -41,7 +41,7 @@ import {
   replacePanelInActiveDashboard,
   resetDashboardStateForTests,
 } from "../src/dashboard-layout.ts";
-import { addDashboardPanel, closeDashboardPanel, createDashboardWithDefaultChat, dashboardChatMirrorSuspended, dashboardSessionInventoryAuthoritative, initializeDefaultDashboardChat, installDashboardWiring, selectDashboardChatSession } from "../src/dashboard-actions.ts";
+import { addDashboardPanel, closeDashboardPanel, createDashboardWithDefaultChat, dashboardChatMirrorSuspended, dashboardSessionInventoryAuthoritative, initializeDefaultDashboardChat, installDashboardWiring, replaceDashboardPanel, selectDashboardChatSession } from "../src/dashboard-actions.ts";
 import { horizontalDropEdge, paneDropTargetAt } from "../src/dashboard-drag.ts";
 import {
   saveProfileChatModalLayout,
@@ -339,21 +339,21 @@ test("sidebar chat clicks search all dashboards, create only when none has chat,
   assert.equal(activeDashboard.value.activeChatPanelId, "chat-two");
 });
 
-test("sidebar chat click replaces the blank initial pane before opening a registered pane elsewhere", () => {
+test("sidebar chat click switches to the dashboard already showing the conversation", () => {
   const draft: ChatSession = {
     id: "initial-draft",
-    storedSessionId: "initial-stored",
     profileId: "profile",
     title: "",
     titlePresentation: "new-chat",
     status: "ready",
     messages: [],
-    remoteKind: "stored",
+    remoteKind: "draft",
     connectionState: "ready",
     historyState: "loaded",
   };
   const existing: ChatSession = {
     id: "existing",
+    storedSessionId: "stored-existing",
     profileId: "profile",
     title: "Existing",
     status: "ready",
@@ -374,12 +374,91 @@ test("sidebar chat click replaces the blank initial pane before opening a regist
     ],
   });
 
+  // A conversation visible on another dashboard is focused there; the blank
+  // initial pane on the active dashboard must not be replaced as a side effect.
+  assert.equal(selectDashboardChatSession(existing.id), "focused");
+  assert.equal(activeDashboardId.value, "other");
+  assert.deepEqual(activeDashboard.value.panels.map((panel) => panel.sessionId), [existing.id]);
+  assert.equal(activeDashboard.value.activeChatPanelId, "existing-pane");
+  assert.deepEqual(
+    dashboards.value.find((dashboard) => dashboard.id === "current")?.panels.map((panel) => panel.sessionId),
+    [draft.id],
+    "the previous dashboard keeps its panes unchanged",
+  );
+  assert.equal(activeSessionId.value, existing.id);
+  assert.equal(sessions.value.some((session) => session.id === draft.id), true, "no replacement leaves the unused draft alone");
+});
+
+test("sidebar chat click replaces the blank initial pane only when the conversation is visible nowhere", () => {
+  const localDraft: ChatSession = {
+    id: "local-initial-draft",
+    profileId: "profile",
+    title: "",
+    titlePresentation: "new-chat",
+    status: "ready",
+    messages: [],
+    remoteKind: "draft",
+    connectionState: "ready",
+    historyState: "loaded",
+  };
+  const storedEmpty: ChatSession = {
+    id: "stored-initial-empty",
+    storedSessionId: "stored-initial",
+    profileId: "profile",
+    title: "",
+    titlePresentation: "new-chat",
+    status: "ready",
+    messages: [],
+    remoteKind: "stored",
+    connectionState: "ready",
+    historyState: "loaded",
+  };
+  const existing: ChatSession = {
+    id: "existing",
+    storedSessionId: "stored-existing",
+    profileId: "profile",
+    title: "Existing",
+    status: "ready",
+    messages: [],
+    remoteKind: "stored",
+    connectionState: "ready",
+    historyState: "loaded",
+  };
+
+  // A purely local unpersisted draft behind the blank initial pane is
+  // dismissed once its pane is replaced.
+  sessions.value = [localDraft, existing];
+  openSessionIds.value = [localDraft.id];
+  activeSessionId.value = localDraft.id;
+  resetDashboardStateForTests({
+    version: 1,
+    activeDashboardId: "current",
+    dashboards: [
+      { id: "current", name: "", activeChatPanelId: "initial-pane", panels: [{ id: "initial-pane", kind: "chat", sessionId: localDraft.id }] },
+    ],
+  });
   assert.equal(selectDashboardChatSession(existing.id), "replaced");
   assert.equal(activeDashboardId.value, "current");
   assert.deepEqual(activeDashboard.value.panels.map((panel) => panel.sessionId), [existing.id]);
   assert.deepEqual(openSessionIds.value, [existing.id]);
   assert.equal(activeSessionId.value, existing.id);
-  assert.equal(sessions.value.some((session) => session.id === draft.id), true, "a persisted empty conversation stays available in the sidebar");
+  assert.equal(sessions.value.some((session) => session.id === localDraft.id), false, "the replaced unused local draft leaves the session list");
+
+  // A persisted empty conversation behind the blank initial pane is replaced
+  // in the layout but stays available in the sidebar.
+  sessions.value = [storedEmpty, existing];
+  openSessionIds.value = [storedEmpty.id];
+  activeSessionId.value = storedEmpty.id;
+  resetDashboardStateForTests({
+    version: 1,
+    activeDashboardId: "current",
+    dashboards: [
+      { id: "current", name: "", activeChatPanelId: "initial-pane", panels: [{ id: "initial-pane", kind: "chat", sessionId: storedEmpty.id }] },
+    ],
+  });
+  assert.equal(selectDashboardChatSession(existing.id), "replaced");
+  assert.deepEqual(activeDashboard.value.panels.map((panel) => panel.sessionId), [existing.id]);
+  assert.equal(sessions.value.some((session) => session.id === storedEmpty.id), true, "a persisted empty conversation stays available in the sidebar");
 });
 
 test("sidebar chat click focuses a visible conversation before considering a blank initial pane", () => {
@@ -621,6 +700,65 @@ test("opening a modal before session pagination completes preserves and later re
   }
 });
 
+test("modal clicks during a pending restore stay provisional until the saved layout is restored", () => {
+  const previousConnection = officeConnection.value;
+  const previousProfiles = profileList.value;
+  const previousSessions = sessions.value;
+  const previousModalId = profileChatModalId.value;
+  const previousPaneIds = profileChatModalPaneIds.value;
+  const previousActivePaneId = profileChatModalActivePaneId.value;
+  const profileId = "provisional-profile";
+  const savedIds = ["saved-a", "saved-b", "saved-c"];
+  const storedSession = (id: string): ChatSession => ({
+    id, storedSessionId: `stored-${id}`, profileId, title: id,
+    status: "ready", messages: [], remoteKind: "stored", connectionState: "disconnected", historyState: "unloaded",
+  });
+  try {
+    officeConnection.value = { ...previousConnection, source: "server", state: "connected", runtime: "ready" };
+    profileList.value = [{
+      id: profileId, name: "Provisional", role: "", status: "idle", color: "#087f70",
+      sessions: 3, taskCount: 0, memoryBytes: 0, memoryNote: "", skills: [], inheritedSkills: [],
+    }];
+    // Only the first saved session has paginated in; the rest arrive later.
+    sessions.value = [storedSession("saved-a")];
+    setProfileChatModalSessionInventoryAuthoritative(false);
+    saveProfileChatModalLayout(profileId, savedIds, "saved-c");
+
+    openProfileChatModal(profileId);
+    assert.deepEqual(profileChatModalPaneIds.value, ["saved-a"]);
+
+    // Clicking another conversation while the inventory is unauthoritative
+    // must not overwrite the saved layout.
+    const other: ChatSession = {
+      id: "other-stored", storedSessionId: "stored-other", profileId, title: "Other",
+      status: "ready", messages: [], remoteKind: "stored", connectionState: "ready", historyState: "loaded",
+    };
+    sessions.value = [...sessions.value, other];
+    assert.equal(selectProfileChatModalSession("other-stored"), true);
+    assert.deepEqual(profileChatModalPaneIds.value, ["other-stored"], "the click applies provisionally on screen");
+    assert.deepEqual(savedProfileChatModalLayout(profileId)?.paneSessionIds, savedIds, "the saved layout survives provisional clicks");
+
+    // Once the inventory is authoritative and every saved session is known,
+    // the saved layout is restored and persisted, superseding provisional panes.
+    sessions.value = [...sessions.value, storedSession("saved-b"), storedSession("saved-c")];
+    setProfileChatModalSessionInventoryAuthoritative(true);
+    assert.deepEqual(profileChatModalPaneIds.value, savedIds);
+    assert.equal(profileChatModalActivePaneId.value, "saved-c");
+    assert.deepEqual(savedProfileChatModalLayout(profileId)?.paneSessionIds, savedIds);
+    assert.equal(sessions.value.some((session) => session.id === "other-stored"), true, "a persisted provisional pane session stays listed");
+  } finally {
+    closeProfileChatModal();
+    saveProfileChatModalLayout(profileId, [], "");
+    officeConnection.value = previousConnection;
+    profileList.value = previousProfiles;
+    sessions.value = previousSessions;
+    profileChatModalId.value = previousModalId;
+    profileChatModalPaneIds.value = previousPaneIds;
+    profileChatModalActivePaneId.value = previousActivePaneId;
+    setProfileChatModalSessionInventoryAuthoritative(true);
+  }
+});
+
 test("profile modals restore their saved panes and create a chat when the saved layout is unavailable", () => {
   const previousConnection = officeConnection.value;
   const previousProfiles = profileList.value;
@@ -700,6 +838,73 @@ test("modal drop replacement removes a duplicate source pane and keeps the targe
   assert.equal(replaceProfileChatModalPane("one", "three"), true);
   assert.deepEqual(profileChatModalPaneIds.value, ["three", "two"]);
   assert.equal(profileChatModalActivePaneId.value, "three");
+});
+
+test("modal drop replacement dismisses only an unused blank local draft", () => {
+  const localDraft: ChatSession = {
+    id: "drop-draft", profileId: "profile", title: "", titlePresentation: "new-chat",
+    status: "ready", messages: [], remoteKind: "draft", connectionState: "ready", historyState: "loaded",
+  };
+  const storedEmpty: ChatSession = {
+    id: "drop-stored-empty", storedSessionId: "stored-empty", profileId: "profile", title: "", titlePresentation: "new-chat",
+    status: "ready", messages: [], remoteKind: "stored", connectionState: "ready", historyState: "loaded",
+  };
+  const existing: ChatSession = {
+    id: "drop-existing", storedSessionId: "stored-existing", profileId: "profile", title: "Existing",
+    status: "ready", messages: [], remoteKind: "stored", connectionState: "ready", historyState: "loaded",
+  };
+  profileChatModalId.value = "profile";
+
+  sessions.value = [localDraft, existing];
+  setProfileChatModalPanes([localDraft.id]);
+  assert.equal(replaceProfileChatModalPane(localDraft.id, existing.id), true);
+  assert.deepEqual(profileChatModalPaneIds.value, [existing.id]);
+  assert.equal(sessions.value.some((session) => session.id === localDraft.id), false, "the replaced unused local draft leaves the session list");
+
+  sessions.value = [storedEmpty, existing];
+  setProfileChatModalPanes([storedEmpty.id]);
+  assert.equal(replaceProfileChatModalPane(storedEmpty.id, existing.id), true);
+  assert.deepEqual(profileChatModalPaneIds.value, [existing.id]);
+  assert.equal(sessions.value.some((session) => session.id === storedEmpty.id), true, "a persisted empty conversation stays listed");
+});
+
+test("dashboard drop replacement dismisses only an unused blank local draft", () => {
+  const localDraft: ChatSession = {
+    id: "dash-drop-draft", profileId: "profile", title: "", titlePresentation: "new-chat",
+    status: "ready", messages: [], remoteKind: "draft", connectionState: "ready", historyState: "loaded",
+  };
+  const storedEmpty: ChatSession = {
+    id: "dash-drop-stored-empty", storedSessionId: "stored-empty", profileId: "profile", title: "", titlePresentation: "new-chat",
+    status: "ready", messages: [], remoteKind: "stored", connectionState: "ready", historyState: "loaded",
+  };
+  const existing: ChatSession = {
+    id: "dash-drop-existing", storedSessionId: "stored-existing", profileId: "profile", title: "Existing",
+    status: "ready", messages: [], remoteKind: "stored", connectionState: "ready", historyState: "loaded",
+  };
+
+  sessions.value = [localDraft, existing];
+  openSessionIds.value = [localDraft.id];
+  activeSessionId.value = localDraft.id;
+  resetDashboardStateForTests({
+    version: 1,
+    activeDashboardId: "drop-dashboard",
+    dashboards: [{ id: "drop-dashboard", name: "", panels: [{ id: "draft-pane", kind: "chat", sessionId: localDraft.id }] }],
+  });
+  assert.equal(replaceDashboardPanel("draft-pane", "chat", { sessionId: existing.id }), "replaced");
+  assert.deepEqual(activeDashboard.value.panels.map((panel) => panel.sessionId), [existing.id]);
+  assert.equal(sessions.value.some((session) => session.id === localDraft.id), false, "the replaced unused local draft leaves the session list");
+
+  sessions.value = [storedEmpty, existing];
+  openSessionIds.value = [storedEmpty.id];
+  activeSessionId.value = storedEmpty.id;
+  resetDashboardStateForTests({
+    version: 1,
+    activeDashboardId: "drop-dashboard",
+    dashboards: [{ id: "drop-dashboard", name: "", panels: [{ id: "stored-pane", kind: "chat", sessionId: storedEmpty.id }] }],
+  });
+  assert.equal(replaceDashboardPanel("stored-pane", "chat", { sessionId: existing.id }), "replaced");
+  assert.deepEqual(activeDashboard.value.panels.map((panel) => panel.sessionId), [existing.id]);
+  assert.equal(sessions.value.some((session) => session.id === storedEmpty.id), true, "a persisted empty conversation stays listed");
 });
 
 test("closing a streaming pane defers its live release until the run becomes terminal", () => {
