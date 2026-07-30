@@ -4,7 +4,7 @@ import type { IncomingMessage } from "node:http";
 import test from "node:test";
 import { WebSocket } from "ws";
 import { createChatSocketAuthGuard } from "./chat-socket-auth.js";
-import type { HermesRuntimeSource } from "./hermes-backend.js";
+import { HermesCommitUnconfirmedError, HermesProfileError, type HermesRuntimeSource } from "./hermes-backend.js";
 import type { HermesChatRequest } from "./hermes-chat.js";
 import { createDemoRuntimeStatus, createDemoSnapshot } from "./demo-state.js";
 import type { OfficeAuth, OfficeAuthSession } from "./office-auth.js";
@@ -121,6 +121,26 @@ test("createOfficeServer origin allowlist always includes remote and Tauri origi
   }
 });
 
+test("usage stats rejects suffixed and fractional day values", async () => {
+  const desktopCapability = "u".repeat(64);
+  const server = createOfficeServer({ port: 0, desktopCapability });
+  const address = await server.listen();
+  const base = `http://127.0.0.1:${address.port}`;
+  const headers = {
+    Origin: "tauri://localhost",
+    "X-Hermes-Office-Desktop-Capability": desktopCapability,
+  };
+
+  try {
+    for (const days of ["1junk", "1.5", "1e1", "0", "91"]) {
+      const response = await fetch(`${base}/api/v1/stats/usage?days=${days}`, { headers });
+      assert.equal(response.status, 400, days);
+    }
+  } finally {
+    await server.close();
+  }
+});
+
 test("snapshot is bounded, explicit, and does not expose secret-shaped fields", async () => {
   const server = createOfficeServer({ port: 0 });
   const address = await server.listen();
@@ -151,7 +171,7 @@ test("snapshot is bounded, explicit, and does not expose secret-shaped fields", 
         "chat.approval.permanent", "kanban.card.create", "kanban.card.update", "kanban.card.comment",
         "team.create", "team.update", "team.delete",
         "profile.create", "profile.update", "profile.delete", "memory.update", "skill.enable", "skill.install",
-        "global-settings.update", "profile-config.update", "privileged-config.read", "privileged-config.update", "host-app.install", "host-fs.read", "obsidian.vault.read", "hermes-agent.update",
+        "global-settings.update", "chat-model-preferences.update", "local-model-providers.sync", "profile-config.update", "privileged-config.read", "privileged-config.update", "host-app.install", "host-fs.read", "host-fs.open", "obsidian.vault.read", "hermes-agent.update",
         "runtime.start", "runtime.stop", "runtime.configure", "secret.write", "device.revoke", "audit.read",
       ],
     });
@@ -208,6 +228,200 @@ test("launch-scoped desktop capability authenticates Tauri HTTP and WebSocket re
     });
     assert.equal(websocket.protocol, "hermes-office.v1");
     websocket.close();
+  } finally {
+    await server.close();
+  }
+});
+
+test("profiles mutations accept only the create body and reject body-bearing deletes", async () => {
+  const desktopCapability = "p".repeat(64);
+  const created: string[] = [];
+  const deleted: string[] = [];
+  const runtime = {
+    status: createDemoRuntimeStatus,
+    snapshot: async () => createDemoSnapshot(),
+    close: async () => undefined,
+    chat: () => { throw new Error("unused"); },
+    kanban: () => { throw new Error("unused"); },
+    createProfile: async (name: string) => { created.push(name); },
+    deleteProfile: async (name: string) => { deleted.push(name); },
+  } as unknown as HermesRuntimeSource;
+  const server = createOfficeServer({ port: 0, desktopCapability, runtimeSource: runtime });
+  const address = await server.listen();
+  const base = `http://127.0.0.1:${address.port}`;
+  const headers = {
+    Origin: "tauri://localhost",
+    "X-Hermes-Office-Desktop-Capability": desktopCapability,
+    "Content-Type": "application/json",
+  };
+
+  try {
+    const create = await fetch(`${base}/api/v1/profiles`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ name: "coder" }),
+    });
+    assert.equal(create.status, 201);
+    assert.deepEqual(created, ["coder"]);
+
+    const rejectedDelete = await fetch(`${base}/api/v1/profiles/coder`, {
+      method: "DELETE",
+      headers,
+      body: "{}",
+    });
+    assert.equal(rejectedDelete.status, 413);
+    assert.equal(rejectedDelete.headers.get("connection"), "close");
+    assert.deepEqual(deleted, []);
+
+    const acceptedDelete = await fetch(`${base}/api/v1/profiles/coder`, {
+      method: "DELETE",
+      headers: {
+        Origin: headers.Origin,
+        "X-Hermes-Office-Desktop-Capability": desktopCapability,
+      },
+    });
+    assert.equal(acceptedDelete.status, 200);
+    assert.deepEqual(deleted, ["coder"]);
+  } finally {
+    await server.close();
+  }
+});
+
+test("profile creation reports an unconfirmed upstream commit without inviting a blind retry", async () => {
+  const desktopCapability = "u".repeat(64);
+  const runtime = {
+    status: createDemoRuntimeStatus,
+    snapshot: async () => createDemoSnapshot(),
+    close: async () => undefined,
+    chat: () => { throw new Error("unused"); },
+    kanban: () => { throw new Error("unused"); },
+    createProfile: async () => { throw new HermesCommitUnconfirmedError("private detail"); },
+  } as unknown as HermesRuntimeSource;
+  const server = createOfficeServer({ port: 0, desktopCapability, runtimeSource: runtime });
+  const address = await server.listen();
+  try {
+    const response = await fetch(`http://127.0.0.1:${address.port}/api/v1/profiles`, {
+      method: "POST",
+      headers: {
+        Origin: "tauri://localhost",
+        "X-Hermes-Office-Desktop-Capability": desktopCapability,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ name: "maybe-created" }),
+    });
+    assert.equal(response.status, 409);
+    const body = await response.json() as { code?: string; message?: string; retryable?: boolean };
+    assert.deepEqual(body, {
+      code: "commit_unconfirmed",
+      message: "Hermes may have created this profile; refresh the profile list before retrying.",
+      retryable: false,
+    });
+    assert.equal(JSON.stringify(body).includes("private detail"), false);
+  } finally {
+    await server.close();
+  }
+});
+
+test("profile mutations expose only typed, stable public errors", async () => {
+  const desktopCapability = "p".repeat(64);
+  const runtime = {
+    status: createDemoRuntimeStatus,
+    snapshot: async () => createDemoSnapshot(),
+    close: async () => undefined,
+    chat: () => { throw new Error("unused"); },
+    kanban: () => { throw new Error("unused"); },
+    createProfile: async () => { throw new Error("invalid private path /Users/example/.hermes"); },
+    deleteProfile: async () => { throw new HermesProfileError("not_found"); },
+  } as unknown as HermesRuntimeSource;
+  const server = createOfficeServer({ port: 0, desktopCapability, runtimeSource: runtime });
+  const address = await server.listen();
+  const headers = {
+    Origin: "tauri://localhost",
+    "X-Hermes-Office-Desktop-Capability": desktopCapability,
+  };
+  try {
+    const create = await fetch(`http://127.0.0.1:${address.port}/api/v1/profiles`, {
+      method: "POST",
+      headers: { ...headers, "Content-Type": "application/json" },
+      body: JSON.stringify({ name: "coder" }),
+    });
+    assert.equal(create.status, 502);
+    assert.equal((await create.text()).includes("/Users/example"), false);
+
+    const remove = await fetch(`http://127.0.0.1:${address.port}/api/v1/profiles/coder`, {
+      method: "DELETE",
+      headers,
+    });
+    assert.equal(remove.status, 404);
+    assert.deepEqual(await remove.json(), {
+      code: "not_found",
+      message: "Hermes profile was not found.",
+      retryable: false,
+    });
+  } finally {
+    await server.close();
+  }
+});
+
+test("session resource rejects and drains bodies before method dispatch", async () => {
+  const desktopCapability = "s".repeat(64);
+  const server = createOfficeServer({ port: 0, desktopCapability });
+  const address = await server.listen();
+  const base = `http://127.0.0.1:${address.port}`;
+  const headers = {
+    Origin: "tauri://localhost",
+    "X-Hermes-Office-Desktop-Capability": desktopCapability,
+    "Content-Type": "application/json",
+  };
+
+  try {
+    const bodyRejected = await fetch(`${base}/api/v1/sessions/stored`, {
+      method: "POST",
+      headers,
+      body: "{}",
+    });
+    assert.equal(bodyRejected.status, 413);
+    assert.equal(bodyRejected.headers.get("connection"), "close");
+
+    const methodRejected = await fetch(`${base}/api/v1/sessions/stored`, {
+      method: "POST",
+      headers: {
+        Origin: headers.Origin,
+        "X-Hermes-Office-Desktop-Capability": desktopCapability,
+      },
+    });
+    assert.equal(methodRejected.status, 405);
+    assert.equal(methodRejected.headers.get("allow"), "DELETE");
+  } finally {
+    await server.close();
+  }
+});
+
+test("session delete never reflects arbitrary runtime diagnostics", async () => {
+  const desktopCapability = "d".repeat(64);
+  const runtime = {
+    status: createDemoRuntimeStatus,
+    snapshot: async () => createDemoSnapshot(),
+    close: async () => undefined,
+    chat: () => { throw new Error("unused"); },
+    kanban: () => { throw new Error("unused"); },
+    deleteSession: async () => { throw new Error("invalid path /Users/private/session-token"); },
+  } as unknown as HermesRuntimeSource;
+  const server = createOfficeServer({ port: 0, desktopCapability, runtimeSource: runtime });
+  const address = await server.listen();
+  try {
+    const response = await fetch(`http://127.0.0.1:${address.port}/api/v1/sessions/stored`, {
+      method: "DELETE",
+      headers: {
+        Origin: "tauri://localhost",
+        "X-Hermes-Office-Desktop-Capability": desktopCapability,
+      },
+    });
+    assert.equal(response.status, 502);
+    const body = await response.text();
+    assert.equal(body.includes("/Users/private"), false);
+    assert.equal(body.includes("session-token"), false);
+    assert.equal(body.includes("Hermes rejected the session delete request."), true);
   } finally {
     await server.close();
   }

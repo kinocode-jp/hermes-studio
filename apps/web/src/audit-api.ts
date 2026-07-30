@@ -26,10 +26,10 @@ const PROTOCOL_AUDIT_OPERATIONS: Record<Operation, true> = {
   "profile.create": true, "profile.update": true, "profile.delete": true,
   "team.create": true, "team.update": true, "team.delete": true,
   "memory.update": true, "skill.enable": true, "skill.install": true,
-  "global-settings.update": true, "profile-config.update": true,
+  "global-settings.update": true, "chat-model-preferences.update": true, "local-model-providers.sync": true, "profile-config.update": true,
   "privileged-config.read": true, "privileged-config.update": true,
   "host-app.install": true,
-  "host-fs.read": true, "obsidian.vault.read": true, "hermes-agent.update": true,
+  "host-fs.read": true, "host-fs.open": true, "obsidian.vault.read": true, "hermes-agent.update": true,
   "runtime.start": true, "runtime.stop": true,
   "runtime.configure": true, "secret.write": true, "device.revoke": true, "audit.read": true,
 };

@@ -9,6 +9,7 @@ import {
   type HermesChatEvent,
   type HermesChatRequest,
 } from "./hermes-chat.js";
+import { appendStudioFollowUpTurnInstruction } from "./office-agent-behavior.js";
 
 const TOKEN = "0123456789abcdef0123456789abcdef"; // gitleaks:allow -- synthetic test credential
 const DASHBOARD_SECRET = "dashboard-example-value-123456"; // gitleaks:allow -- synthetic test credential
@@ -35,7 +36,7 @@ test("fetchHistory authenticates internally and returns a bounded secret-safe DT
     }
     const historyRows = [
       { role: "system", content: "internal system prompt", timestamp: 1_700_000_000 },
-      { role: "user", content: `Use HERMES_DASHBOARD_SESSION_TOKEN=${DASHBOARD_SECRET} and ${GITHUB_SECRET} in this turn\nAuthorization: Token ${AUTH_HEADER_SECRET}\nCookie: hermes_office_session=${COOKIE_SECRET}`, timestamp: 1_700_000_001 },
+      { role: "user", content: appendStudioFollowUpTurnInstruction(`Use HERMES_DASHBOARD_SESSION_TOKEN=${DASHBOARD_SECRET} and ${GITHUB_SECRET} in this turn\nAuthorization: Token ${AUTH_HEADER_SECRET}\nCookie: hermes_office_session=${COOKIE_SECRET}`), timestamp: 1_700_000_001 },
       { role: "assistant", content: [{ type: "text", text: `Working with OPENAI_API_KEY = '${OPENAI_SECRET}'` }, { type: "image", data: "hidden" }] },
       { role: "tool", content: "PRIVATE OUTPUT", tool_name: `TOOL_TOKEN=${DASHBOARD_SECRET}` },
       { role: "invalid", content: "drop" },
@@ -80,6 +81,7 @@ test("fetchHistory authenticates internally and returns a bounded secret-safe DT
   assert.equal(JSON.stringify(history).includes(GITHUB_SECRET), false);
   assert.equal(JSON.stringify(history).includes(AUTH_HEADER_SECRET), false);
   assert.equal(JSON.stringify(history).includes(COOKIE_SECRET), false);
+  assert.equal(JSON.stringify(history).includes("studio-followups"), false);
 });
 
 test("fetchHistory counts and safely drops individual malformed wire rows", async (t) => {
@@ -128,14 +130,21 @@ test("chat connection sends only validated allowlisted RPC and normalizes result
     websocket.send(JSON.stringify({ jsonrpc: "2.0", method: "event", params: { type: "status.update", session_id: "live-1", payload: { kind: `KIND_TOKEN=${DASHBOARD_SECRET}`, status: `STATUS_TOKEN=${OPENAI_SECRET}`, text: `Preparing with ci_token = '${DASHBOARD_SECRET}'`, private_state: "hidden" } } }));
     websocket.send(JSON.stringify({ jsonrpc: "2.0", method: "event", params: { type: "approval.request", session_id: "live-1", payload: { command: "curl https://x/?token=supersecretvalue", description: `AWS_SECRET_ACCESS_KEY = \"${AWS_SECRET}\"`, choices: ["once", `CHOICE_TOKEN=${DASHBOARD_SECRET}`, "deny"], allow_permanent: false, raw_args: { password: "hidden" } } } }));
     websocket.send(JSON.stringify({ jsonrpc: "2.0", method: "event", params: { type: "clarify.request", session_id: "live-1", payload: { request_id: "clarify-1", question: "Continue?", choices: ["yes", `OPENAI_API_KEY=${OPENAI_SECRET}`] } } }));
-    websocket.send(JSON.stringify({ jsonrpc: "2.0", method: "event", params: { type: "message.delta", session_id: "live-1", payload: { text: `OPENAI_API_KEY=${OPENAI_SECRET}; ${OPENAI_STANDALONE_SECRET}; ${JWT_SECRET}\nAuthorization: Bearer ${AUTH_HEADER_SECRET}`, role: "assistant" } } }));
-    websocket.send(JSON.stringify({ jsonrpc: "2.0", method: "event", params: { type: "tool.progress", session_id: "live-1", payload: { tool_id: "tool-1", name: `TOOL_TOKEN=${DASHBOARD_SECRET}`, status: `STATUS_TOKEN=${OPENAI_SECRET}`, summary: `database_password = '${PASSWORD_SECRET}'` } } }));
+    websocket.send(JSON.stringify({ jsonrpc: "2.0", method: "event", params: { type: "message.delta", session_id: "live-1", payload: { message_id: "opaque/message+1==", messageId: "shared-message-alias", text: `OPENAI_API_KEY=${OPENAI_SECRET}; ${OPENAI_STANDALONE_SECRET}; ${JWT_SECRET}\nAuthorization: Bearer ${AUTH_HEADER_SECRET}`, role: "assistant" } } }));
+    websocket.send(JSON.stringify({ jsonrpc: "2.0", method: "event", params: { type: "tool.progress", session_id: "live-1", payload: { tool_id: "shared-tool", tool_call_id: "opaque/call+1==", name: `TOOL_TOKEN=${DASHBOARD_SECRET}`, status: `STATUS_TOKEN=${OPENAI_SECRET}`, summary: `database_password = '${PASSWORD_SECRET}'` } } }));
+    websocket.send(JSON.stringify({ jsonrpc: "2.0", method: "event", params: { type: "tool.generating", session_id: "live-1", payload: { tool_call_id: "x".repeat(2_049), call_id: "tool-call-2", tool_id: "shared-tool", name: "Fallback tool" } } }));
+    websocket.send(JSON.stringify({ jsonrpc: "2.0", method: "event", params: { type: "session.info", session_id: "live-1", payload: { model: "model-safe", provider: "provider-safe", reasoning_effort: "high", private_config: `token=${DASHBOARD_SECRET}` } } }));
     websocket.send(JSON.stringify({ jsonrpc: "2.0", method: "event", params: { type: "error", session_id: "live-1", payload: { status: `STATUS_TOKEN=${DASHBOARD_SECRET}`, message: `service_secret: ${SERVICE_SECRET}`, model: `MODEL_TOKEN=${OPENAI_SECRET}`, provider: `PROVIDER_TOKEN=${AWS_SECRET}`, version: `VERSION_TOKEN=${PASSWORD_SECRET}` } } }));
     websocket.on("message", (data) => {
       const frame = JSON.parse(data.toString()) as Record<string, unknown>;
       received.push(frame);
       const params = frame.params as Record<string, unknown>;
-      websocket.send(JSON.stringify({ jsonrpc: "2.0", id: frame.id, result: { session_id: "live-1", stored_session_id: "stored-1", message_count: 0, info: { running: false }, status: `RPC_TOKEN=${DASHBOARD_SECRET}`, cwd: "/private/path", token: "hidden", echoed: params } }));
+      const result = frame.method === "clarify.respond"
+        ? { status: "ok" }
+        : frame.method === "prompt.submit"
+          ? { status: "streaming", task_id: "task-1" }
+        : { session_id: "live-1", stored_session_id: "stored-1", message_count: 0, model: "model-safe", info: { running: false, provider: "provider-safe", reasoning_effort: "high" }, status: `RPC_TOKEN=${DASHBOARD_SECRET}`, cwd: "/private/path", token: "hidden", echoed: params };
+      websocket.send(JSON.stringify({ jsonrpc: "2.0", id: frame.id, result }));
     });
   });
   const origin = await listen(http);
@@ -153,17 +162,27 @@ test("chat connection sends only validated allowlisted RPC and normalizes result
     { sessionCreateSystemSeed: "Office shared context" },
   );
   await connection.request({ method: "session.resume", params: { session_id: "stored-1", profile: "coder" } });
+  await connection.request(
+    { method: "prompt.submit", params: { session_id: "live-1", text: "What changed?" } },
+    { studioFollowUpTurn: true },
+  );
+  await connection.request({ method: "clarify.respond", params: { request_id: "clarify-1", answer: "" } });
   await new Promise((resolve) => setTimeout(resolve, 20));
 
   assert.equal(observedToken, TOKEN);
-  assert.equal(received.length, 3);
+  assert.equal(received.length, 5);
   assert.equal(received[0]?.method, "session.create");
   assert.deepEqual(received[0]?.params, { profile: "coder", title: "New chat", close_on_disconnect: true, source: "desktop" });
   assert.deepEqual(received[1]?.params, { profile: "coder", title: "Seeded chat", close_on_disconnect: true, source: "desktop", messages: [{ role: "system", content: "Office shared context" }] });
   assert.deepEqual(received[2]?.params, { session_id: "stored-1", profile: "coder", close_on_disconnect: true, source: "desktop" });
-  assert.deepEqual(result.value, { liveSessionId: "live-1", storedSessionId: "stored-1", messageCount: 0, running: false, status: "RPC_TOKEN=[REDACTED]" });
+  assert.deepEqual(received[3]?.params, {
+    session_id: "live-1",
+    text: appendStudioFollowUpTurnInstruction("What changed?"),
+  });
+  assert.deepEqual(received[4]?.params, { request_id: "clarify-1", answer: "" });
+  assert.deepEqual(result.value, { liveSessionId: "live-1", storedSessionId: "stored-1", messageCount: 0, running: false, status: "RPC_TOKEN=[REDACTED]", model: "model-safe", provider: "provider-safe", reasoningEffort: "high" });
   assert.equal(JSON.stringify(result).includes("private/path"), false);
-  assert.equal(events.length, 6);
+  assert.equal(events.length, 8);
   assert.deepEqual(events[0], { type: "status.update", sessionId: "live-1", payload: { kind: "KIND_TOKEN=[REDACTED]", status: "STATUS_TOKEN=[REDACTED]", message: "Preparing with ci_token = '[REDACTED]'" } });
   assert.equal(events[1]?.type, "approval.request");
   assert.equal(events[1]?.payload.command, "curl https://x/?token=[REDACTED]");
@@ -171,10 +190,30 @@ test("chat connection sends only validated allowlisted RPC and normalizes result
   assert.deepEqual(events[1]?.payload.choices, ["once", "CHOICE_TOKEN=[REDACTED]", "deny"]);
   assert.deepEqual(events[2], { type: "clarify.request", sessionId: "live-1", payload: { requestId: "clarify-1", question: "Continue?", choices: ["yes", "OPENAI_API_KEY=[REDACTED]"] } });
   assert.equal(events[3]?.payload.text, "OPENAI_API_KEY=[REDACTED]; [REDACTED]; [REDACTED]\nAuthorization: [REDACTED]");
+  const messageIds = events[3]?.payload.messageIds;
+  assert.ok(Array.isArray(messageIds));
+  assert.equal(messageIds.length, 2);
+  assert.equal(events[3]?.payload.messageId, messageIds[0]);
+  assert.equal(String(messageIds[0]).startsWith("message-source-"), true);
+  assert.equal(JSON.stringify(events[3]).includes("opaque/message+1=="), false);
+  assert.equal(JSON.stringify(events[3]).includes("shared-message-alias"), false);
   assert.equal(events[4]?.payload.name, "TOOL_TOKEN=[REDACTED]");
+  const firstToolIds = events[4]?.payload.toolIds;
+  assert.ok(Array.isArray(firstToolIds));
+  assert.equal(firstToolIds.length, 2);
+  assert.equal(events[4]?.payload.toolId, firstToolIds[0]);
+  assert.equal(String(firstToolIds[0]).startsWith("tool-source-"), true);
+  assert.equal(JSON.stringify(events[4]).includes("opaque/call+1=="), false);
   assert.equal(events[4]?.payload.status, "STATUS_TOKEN=[REDACTED]");
   assert.equal(events[4]?.payload.summary, "database_password = '[REDACTED]'");
-  assert.deepEqual(events[5]?.payload, {
+  const secondToolIds = events[5]?.payload.toolIds;
+  assert.ok(Array.isArray(secondToolIds));
+  assert.equal(secondToolIds.length, 2, "an oversized occurrence id is ignored before hashing");
+  assert.equal(events[5]?.payload.toolId, secondToolIds[0]);
+  assert.equal(firstToolIds[1], secondToolIds[1], "the shared alias remains stable across phases");
+  assert.equal(JSON.stringify(events[5]).includes("tool-call-2"), false);
+  assert.deepEqual(events[6]?.payload, { model: "model-safe", provider: "provider-safe", reasoningEffort: "high" });
+  assert.deepEqual(events[7]?.payload, {
     status: "STATUS_TOKEN=[REDACTED]",
     message: "service_secret: [REDACTED]",
     model: "MODEL_TOKEN=[REDACTED]",
@@ -216,10 +255,110 @@ test("chat boundary rejects arbitrary methods, unsafe params, IDs, and profiles 
     (error: unknown) => error instanceof HermesChatTransportError && error.code === "invalid_request",
   );
   await assert.rejects(
+    connection.request({ method: "slash.exec", params: { session_id: "live-1", command: "/config set unsafe" } }),
+    (error: unknown) => error instanceof HermesChatTransportError && error.code === "invalid_request",
+  );
+  await assert.rejects(
+    connection.request({ method: "slash.exec", params: { session_id: "live-1", command: "/memory clear" } }),
+    (error: unknown) => error instanceof HermesChatTransportError && error.code === "invalid_request",
+  );
+  await assert.rejects(
+    connection.request({ method: "slash.exec", params: { session_id: "live-1", command: "/model gpt-5.6-terra" } }),
+    (error: unknown) => error instanceof HermesChatTransportError && error.code === "invalid_request",
+  );
+  await assert.rejects(
+    connection.request({ method: "slash.exec", params: { session_id: "live-1", command: "/help", confirm_expensive_model: true } }),
+    (error: unknown) => error instanceof HermesChatTransportError && error.code === "invalid_request",
+  );
+  await assert.rejects(
     transport.fetchHistory({ sessionId: "../../state.db", profile: "coder" }),
     (error: unknown) => error instanceof HermesChatTransportError && error.code === "invalid_request",
   );
   assert.equal(frameCount, 0);
+  await connection.close();
+});
+
+test("an expensive session model switch can be confirmed without widening the slash boundary", async (t) => {
+  const received: Array<Record<string, unknown>> = [];
+  const http = createServer((_request, response) => { response.writeHead(404).end(); });
+  const sockets = new WebSocketServer({ noServer: true });
+  http.on("upgrade", (request, socket, head) => sockets.handleUpgrade(request, socket, head, (websocket) => sockets.emit("connection", websocket, request)));
+  sockets.on("connection", (websocket) => websocket.on("message", (data) => {
+    const frame = JSON.parse(data.toString()) as Record<string, unknown>;
+    received.push(frame);
+    const params = frame.params as Record<string, unknown>;
+    const confirmed = params.confirm_expensive_model === true;
+    websocket.send(JSON.stringify({
+      jsonrpc: "2.0",
+      id: frame.id,
+      result: confirmed
+        ? { key: "model", value: "costly-model", warning: "", confirm_required: false }
+        : { key: "model", value: "costly-model", warning: "High known pricing", confirm_required: true, confirm_message: "Continue with costly-model?" },
+    }));
+  }));
+  const origin = await listen(http);
+  t.after(() => {
+    for (const client of sockets.clients) client.terminate();
+    sockets.close();
+    http.close();
+  });
+
+  const connection = await createHermesChatTransport({ baseUrl: origin, sessionToken: TOKEN }).connect(() => undefined);
+  const command = "/model costly-model --provider costly --session";
+  const initial = await connection.request({ method: "slash.exec", params: { session_id: "live-1", command } });
+  const confirmed = await connection.request({
+    method: "slash.exec",
+    params: { session_id: "live-1", command, confirm_expensive_model: true },
+  });
+
+  assert.deepEqual(initial.value, {
+    status: "confirm_required",
+    warning: "High known pricing",
+    confirmMessage: "Continue with costly-model?",
+    key: "model",
+    value: "costly-model",
+  });
+  assert.deepEqual(confirmed.value, {
+    status: "ok",
+    warning: "",
+    key: "model",
+    value: "costly-model",
+  });
+  assert.deepEqual(received.map((frame) => frame.method), ["config.set", "config.set"]);
+  assert.deepEqual(received.map((frame) => (frame.params as Record<string, unknown>).confirm_expensive_model), [false, true]);
+  await connection.close();
+});
+
+test("session reasoning can be restored to the Hermes default", async (t) => {
+  let received: Record<string, unknown> | undefined;
+  const http = createServer((_request, response) => { response.writeHead(404).end(); });
+  const sockets = new WebSocketServer({ noServer: true });
+  http.on("upgrade", (request, socket, head) => sockets.handleUpgrade(request, socket, head, (websocket) => sockets.emit("connection", websocket, request)));
+  sockets.on("connection", (websocket) => websocket.on("message", (data) => {
+    const frame = JSON.parse(data.toString()) as Record<string, unknown>;
+    received = frame;
+    websocket.send(JSON.stringify({
+      jsonrpc: "2.0",
+      id: frame.id,
+      result: { key: "reasoning", value: "" },
+    }));
+  }));
+  const origin = await listen(http);
+  t.after(() => {
+    for (const client of sockets.clients) client.terminate();
+    sockets.close();
+    http.close();
+  });
+
+  const connection = await createHermesChatTransport({ baseUrl: origin, sessionToken: TOKEN }).connect(() => undefined);
+  const result = await connection.request({
+    method: "slash.exec",
+    params: { session_id: "live-1", command: "/reasoning default" },
+  });
+
+  assert.equal(received?.method, "config.set");
+  assert.deepEqual(received?.params, { session_id: "live-1", key: "reasoning", value: "" });
+  assert.deepEqual(result.value, { status: "ok", key: "reasoning", value: "" });
   await connection.close();
 });
 

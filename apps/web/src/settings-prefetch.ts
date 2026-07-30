@@ -50,17 +50,18 @@ async function withTimeout<T>(promise: Promise<T>, ms: number, label: string): P
 async function readOrLoad<T>(
   current: CacheEntry<T> | null | undefined,
   loader: () => Promise<T>,
+  publish: (entry: CacheEntry<T>) => void,
   force = false,
-): Promise<{ entry: CacheEntry<T>; value: T }> {
+): Promise<T> {
   if (!force && current?.value !== undefined && isFresh(current.fetchedAt)) {
-    return { entry: current, value: current.value };
+    return current.value;
   }
   if (!force && current?.promise) {
     // Reuse in-flight work, but never hang callers if the first request stalls.
     try {
       const value = await withTimeout(current.promise, FETCH_GUARD_MS + 1_000, "cached settings");
-      return { entry: current, value };
-    } catch (error) {
+      return value;
+    } catch {
       // Fall through and start a fresh attempt.
     }
   }
@@ -78,18 +79,21 @@ async function readOrLoad<T>(
       entry.promise = undefined;
       throw error;
     });
-  const value = await entry.promise;
-  return { entry, value };
+  // Publish before awaiting so concurrent readers share this exact flight.
+  // Invalidation or a forced replacement removes this identity immediately;
+  // the old promise may still settle for its caller but can no longer republish
+  // stale data into the cache.
+  publish(entry);
+  return await entry.promise;
 }
 
 export async function getCachedGlobalSettings(options?: { force?: boolean }): Promise<GlobalAgentSettings> {
-  const { entry, value } = await readOrLoad(
+  return await readOrLoad(
     globalCache.entry,
     () => withTimeout(loadGlobalSettings(), FETCH_GUARD_MS, "global settings"),
+    (entry) => { globalCache.entry = entry; },
     options?.force === true,
   );
-  globalCache.entry = entry;
-  return value;
 }
 
 export async function getCachedProfileCoreSettings(
@@ -97,7 +101,7 @@ export async function getCachedProfileCoreSettings(
   options?: { force?: boolean },
 ): Promise<PrefetchedProfileSettings> {
   const existing = profileCache.get(profileId) ?? null;
-  const { entry, value } = await readOrLoad(
+  return await readOrLoad(
     existing,
     async () => {
       const profile = await withTimeout(loadProfileSettings(profileId), FETCH_GUARD_MS, `profile settings:${profileId}`);
@@ -118,10 +122,9 @@ export async function getCachedProfileCoreSettings(
         fetchedAt: Date.now(),
       } satisfies PrefetchedProfileSettings;
     },
+    (entry) => { profileCache.set(profileId, entry); },
     options?.force === true,
   );
-  profileCache.set(profileId, entry);
-  return value;
 }
 
 export function peekCachedGlobalSettings(): GlobalAgentSettings | null {

@@ -8,11 +8,13 @@ import {
   assignTask,
   createTask,
   createSession,
+  closeEmbeddedChatSession,
   kanbanAssignees,
   kanbanState,
   moveTask,
   officeConnection,
   openSession,
+  openEmbeddedChatSession,
   openSessionIds,
   profileList,
   registerChatRuntime,
@@ -25,6 +27,7 @@ import {
   toggleTaskComments,
   tasks
 } from "../src/store.ts";
+import { chatComposerState, setChatComposerDraft } from "../src/chat-composer-state.ts";
 import { chatSessionTitle, locale, localizeRuntimeMessage, setLocale } from "../src/i18n.ts";
 
 const serverUrl = "http://127.0.0.1:4317";
@@ -35,6 +38,7 @@ function snapshot(options: {
   profiles?: OfficeSnapshot["profiles"];
   sessions?: OfficeSnapshot["sessions"];
   profileInventory?: OfficeSnapshot["inventory"]["profiles"];
+  sessionInventory?: OfficeSnapshot["inventory"]["sessions"];
 } = {}): OfficeSnapshot {
   const snapshotProfiles = options.profiles ?? [{ id: "live-profile", name: "Live Profile", activity: "idle", activeSessionCount: 0 }];
   const snapshotSessions = options.sessions ?? [];
@@ -58,7 +62,7 @@ function snapshot(options: {
     sessions: snapshotSessions,
     inventory: {
       profiles: options.profileInventory ?? completePage(snapshotProfiles.length),
-      sessions: completePage(snapshotSessions.length)
+      sessions: options.sessionInventory ?? completePage(snapshotSessions.length)
     },
     boards: []
   };
@@ -218,6 +222,56 @@ test("temporary live inventory failure and recovery retain last-known-good state
   assert.equal(officeConnection.value.state, "connected");
   assert.deepEqual(openSessionIds.value, [liveSessionId]);
   assert.deepEqual(calls, { ensured: [liveSessionId], released: [] });
+});
+
+test("temporary non-ready runtime retains last-known-good live state and composer draft", () => {
+  resetRuntime();
+  const calls = recordChatRuntime();
+  const live = snapshot({
+    sessions: [{ id: "stored-session", profileId: "live-profile", title: "Live session", activity: "idle" }]
+  });
+  applyOfficeSnapshot(live, serverUrl);
+  const liveSessionId = sessions.value[0]!.id;
+  openSession(liveSessionId);
+  setChatComposerDraft(liveSessionId, "unsent recovery draft");
+
+  applyOfficeSnapshot(snapshot({
+    state: "unreachable",
+    profiles: [],
+    sessions: [],
+    profileInventory: unavailablePage(),
+    sessionInventory: unavailablePage()
+  }), serverUrl);
+
+  assert.equal(officeConnection.value.state, "degraded");
+  assert.equal(officeConnection.value.runtime, "unreachable");
+  assert.deepEqual(profileList.value.map((profile) => profile.id), ["live-profile"]);
+  assert.deepEqual(sessions.value.map((session) => session.id), [liveSessionId]);
+  assert.deepEqual(openSessionIds.value, [liveSessionId]);
+  assert.equal(chatComposerState(liveSessionId).value.draft, "unsent recovery draft");
+  assert.deepEqual(calls, { ensured: [liveSessionId], released: [] });
+
+  applyOfficeSnapshot(live, serverUrl);
+  assert.equal(officeConnection.value.state, "connected");
+  assert.deepEqual(openSessionIds.value, [liveSessionId]);
+  assert.equal(chatComposerState(liveSessionId).value.draft, "unsent recovery draft");
+  assert.deepEqual(calls, { ensured: [liveSessionId], released: [] });
+});
+
+test("a new embedded chat connects without entering the workspace list", () => {
+  resetRuntime();
+  const calls = recordChatRuntime();
+  applyOfficeSnapshot(snapshot(), serverUrl);
+
+  const sessionId = createSession("live-profile", { workspace: false });
+  assert.ok(sessionId);
+  assert.equal(openSessionIds.value.includes(sessionId!), false);
+  assert.deepEqual(calls.ensured, []);
+
+  assert.equal(openEmbeddedChatSession(sessionId!), true);
+  assert.deepEqual(calls.ensured, [sessionId]);
+  closeEmbeddedChatSession(sessionId!);
+  assert.deepEqual(calls.released, [sessionId]);
 });
 
 test("authoritative stored inventory replaces a promoted draft title presentation in both locales", () => {

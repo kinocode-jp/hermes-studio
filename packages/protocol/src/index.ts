@@ -8,6 +8,17 @@
 
 export const PROTOCOL_VERSION = 1 as const;
 
+/** Maximum UTF-8 payload accepted for a single Hermes chat prompt. */
+export const CHAT_PROMPT_MAX_UTF8_BYTES = 512 * 1024;
+/** JSON-escaped prompt budget inside the 1 MiB chat RPC frame. */
+export const CHAT_PROMPT_MAX_JSON_UTF8_BYTES = (1024 * 1024) - 2_048;
+
+export function isChatPromptWithinBudget(value: string): boolean {
+  if (value.includes("\0") || utf8ByteLength(value) > CHAT_PROMPT_MAX_UTF8_BYTES) return false;
+  const encoded = JSON.stringify(value);
+  return utf8ByteLength(encoded.slice(1, -1)) <= CHAT_PROMPT_MAX_JSON_UTF8_BYTES;
+}
+
 /**
  * Global context crosses the settings HTTP boundary and is later embedded in
  * a `session.create` JSON-RPC frame. Keep one wire contract for every layer.
@@ -130,6 +141,8 @@ export type Operation =
   | "skill.enable"
   | "skill.install"
   | "global-settings.update"
+  | "chat-model-preferences.update"
+  | "local-model-providers.sync"
   /** Schema-driven safe Hermes config leaves for a profile. */
   | "profile-config.update"
   /**
@@ -142,6 +155,8 @@ export type Operation =
   | "host-app.install"
   /** Browse host directories (names only) for folder pickers. */
   | "host-fs.read"
+  /** Open or reveal a user-selected absolute path on the local Studio host. */
+  | "host-fs.open"
   /** Read registered Obsidian vault metadata and its bounded note graph. */
   | "obsidian.vault.read"
   /** Update the fixed local Hermes Agent install on the Studio host. */
@@ -203,6 +218,23 @@ export const OPERATION_POLICIES: Readonly<Record<Operation, OperationPolicy>> = 
     "step-up-required",
     true,
   ),
+  // These preferences only select values the same operator may already send
+  // when creating a chat session. Keep cross-device synchronization available
+  // to enrolled Tailnet operators while retaining CSRF and revision checks.
+  "chat-model-preferences.update": policy(
+    "chat-model-preferences.update",
+    "operator",
+    "remote-safe",
+    true,
+  ),
+  // Bounded discovery only: the server probes fixed loopback model endpoints
+  // and may update only Studio-owned custom endpoint ids for this profile.
+  "local-model-providers.sync": policy(
+    "local-model-providers.sync",
+    "operator",
+    "remote-safe",
+    true,
+  ),
   // Safe ordinary Hermes config only (fail-closed policy strips secrets /
   // execution-adjacent fields). Still step-up-required: remaining leaves can
   // change agent behavior, so remote devices without local step-up fail closed
@@ -235,6 +267,9 @@ export const OPERATION_POLICIES: Readonly<Record<Operation, OperationPolicy>> = 
   // Directory-name browsing for folder pickers. Same remote-privileged
   // deployment gate as other host-scoped reads.
   "host-fs.read": policy("host-fs.read", "owner", "read-only", true),
+  // Launching a file or revealing it in the host file manager is always a
+  // local-owner gesture. Remote clients may still see and copy MEDIA paths.
+  "host-fs.open": policy("host-fs.open", "owner", "local-only", true),
   "obsidian.vault.read": policy("obsidian.vault.read", "owner", "read-only", true),
   // Fixed Hermes Agent update (`hermes update --yes`). Same remote-privileged
   // deployment gate as host-app install / privileged config / secrets.
@@ -436,6 +471,10 @@ export interface ChatSessionSummary {
   /** `UNKNOWN_INVENTORY_TIMESTAMP` means both update fields were absent. */
   updatedAt: IsoDateTime;
   lastMessagePreview?: string;
+  /** `delegated` identifies a durable specialist-profile worker conversation. */
+  conversationKind?: "direct" | "delegated";
+  delegationTaskId?: string;
+  delegatedByProfileId?: ProfileId;
 }
 
 export type ChatRole = "user" | "assistant" | "system" | "tool";
@@ -605,6 +644,40 @@ export interface UpdateGlobalSettingsRequest {
   sharedSkillsEnabled?: boolean;
 }
 
+/** One main/sub model selection used by the Studio chat composer. */
+export interface ChatModelPreferenceSlot {
+  provider: string;
+  model: string;
+  /** Empty means the selected model's default reasoning effort. */
+  reasoningEffort: string;
+}
+
+/** Named main/sub pairing shared by every client connected to this Studio host. */
+export interface ChatModelPreferencePreset {
+  id: string;
+  name: string;
+  main: ChatModelPreferenceSlot;
+  sub: ChatModelPreferenceSlot;
+}
+
+export interface ChatModelPreferencesDocument {
+  main: ChatModelPreferenceSlot;
+  sub: ChatModelPreferenceSlot;
+  presets: ChatModelPreferencePreset[];
+  activePresetId?: string;
+}
+
+export interface ChatModelPreferencesSnapshot {
+  revision: number;
+  document: ChatModelPreferencesDocument;
+  updatedAt: IsoDateTime;
+}
+
+export interface UpdateChatModelPreferencesRequest {
+  expectedRevision: number;
+  document: ChatModelPreferencesDocument;
+}
+
 /** Dotted-leaf patch for schema-driven safe Hermes profile config. */
 export interface UpdateProfileConfigRequest {
   profileId: ProfileId;
@@ -724,10 +797,13 @@ export interface OperationPayloadMap {
   "skill.enable": SetSkillEnabledRequest;
   "skill.install": { source: string; expectedDigest?: string };
   "global-settings.update": UpdateGlobalSettingsRequest;
+  "chat-model-preferences.update": UpdateChatModelPreferencesRequest;
+  "local-model-providers.sync": { profileId: ProfileId };
   "profile-config.update": UpdateProfileConfigRequest;
   "privileged-config.read": { profileId: ProfileId };
   "privileged-config.update": UpdatePrivilegedProfileConfigRequest;
   "host-app.install": { appId: "obsidian" };
+  "host-fs.open": { path: string; action: "open" | "reveal" };
   "hermes-agent.update": Record<string, never>;
   "runtime.start": Record<string, never>;
   "runtime.stop": Record<string, never>;

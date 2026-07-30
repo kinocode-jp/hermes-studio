@@ -11,7 +11,7 @@ use crate::constants::{
     DESKTOP_PROOF_DOMAIN, DESKTOP_PROOF_NONCE_BYTES, DESKTOP_PROOF_VERSION, MAX_HEALTH_RESPONSE,
     OFFICE_HOST, OFFICE_PORT,
 };
-use crate::hex_util::{decode_lower_hex_32, encode_lower_hex, random_hex};
+use crate::hex_util::{decode_lower_hex_32, random_hex};
 use crate::http::{
     http_status_is_ok, read_bounded_response, remaining_timeout, response_deadline,
     set_write_timeout_until, BoundedReadError,

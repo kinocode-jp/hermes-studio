@@ -4,8 +4,9 @@ import { CharacterPortrait } from "./character-portrait";
 import { InfoTip } from "./info-tip";
 import { CloseIcon, ResetIcon, UploadIcon } from "./icons";
 import { t } from "../i18n";
-import { appModalSizes, createModalResizeHandlers, getAppModalSize, shouldIgnoreModalOutsideClose } from "../app-modal-layout";
+import { appModalSizes, createModalResizeHandlers, getAppModalSize } from "../app-modal-layout";
 import { canRestoreModalFocus, isTopmostModal, registerModal } from "../modal-layer";
+import { useModalOutsideClose } from "./use-modal-outside-close";
 
 type AvatarPickerProps = {
   profileId: string;
@@ -59,6 +60,7 @@ export function AvatarPicker({ profileId, profileName, onClose }: AvatarPickerPr
   const [resetting, setResetting] = useState(false);
   const selected = avatarForProfile(profileId);
   const busy = !canDismissAvatarPicker(uploading, resetting);
+  const outsideClose = useModalOutsideClose(() => { if (!busy) onClose(); });
   const busyRef = useRef(busy);
   const onCloseRef = useRef(onClose);
   busyRef.current = busy;
@@ -116,7 +118,7 @@ export function AvatarPicker({ profileId, profileName, onClose }: AvatarPickerPr
   }
 
   return (
-    <div class="avatar-picker-backdrop" role="presentation" onClick={(event) => { if (shouldIgnoreModalOutsideClose()) return; if (!busy && event.currentTarget === event.target) onClose(); }}>
+    <div class="avatar-picker-backdrop" role="presentation" {...outsideClose}>
       <section
         ref={dialogRef}
         class="avatar-picker"

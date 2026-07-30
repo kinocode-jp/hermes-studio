@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -154,4 +154,33 @@ test("profiles are isolated and default period is 30", async () => {
   assert.equal(alpha.days, 30);
   assert.equal(alpha.items[0]?.total, 1);
   assert.equal(beta.items[0]?.total, 2);
+});
+
+test("a transient read failure is retryable and never cached as an empty store", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "hermes-studio-usage-retry-"));
+  const filePath = join(directory, "usage.json");
+  await mkdir(filePath);
+  const store = new UsageTelemetryStore({
+    filePath,
+    now: () => Date.parse("2026-06-01T12:00:00.000Z"),
+  });
+
+  await assert.rejects(store.query("alpha"));
+  await rm(filePath, { recursive: true });
+  await writeFile(filePath, `${JSON.stringify({
+    version: 1,
+    profiles: {
+      alpha: {
+        items: {
+          "tool::shell": {
+            kind: "tool", total: 3, lastUsedAt: "2026-06-01T00:00:00.000Z", days: { "2026-06-01": 3 },
+          },
+        },
+      },
+    },
+  })}\n`, "utf8");
+
+  const recovered = await store.query("alpha");
+  assert.equal(recovered.items[0]?.name, "shell");
+  assert.equal(recovered.items[0]?.total, 3);
 });

@@ -5,6 +5,7 @@ import {
   activeDashboard,
   dashboardEffectiveSizes,
   dashboardRowLayout,
+  MAX_CHAT_PANELS,
   MAX_DASHBOARD_PANELS,
   movePanel,
   resetActiveDashboardSizes,
@@ -13,7 +14,20 @@ import {
   type DashboardPanelKind,
   type DashboardSizes,
 } from "../dashboard-layout";
-import { addDashboardPanel, closeDashboardPanel } from "../dashboard-actions";
+import { addDashboardPanel, closeDashboardPanel, replaceDashboardPanel } from "../dashboard-actions";
+import {
+  DASHBOARD_PANEL_DRAG_TYPE,
+  DASHBOARD_PANEL_KIND_DRAG_TYPE,
+  DASHBOARD_SESSION_DRAG_TYPE,
+  activateSidebarPanelPointerDrag,
+  activateSidebarSessionPointerDrag,
+  currentSidebarPanelPointerDrag,
+  currentSidebarSessionPointerDrag,
+  endSidebarPanelPointerDrag,
+  endSidebarSessionPointerDrag,
+  paneDropTargetAt,
+  parseDashboardPanelKind,
+} from "../dashboard-drag";
 import { profileList, sessions } from "../store";
 import { profileDisplayName } from "../profile-names";
 import { ChatPane } from "./chat-pane";
@@ -24,10 +38,20 @@ import { ScheduledSessionsPanel } from "./scheduled-sessions-panel";
 import { ProfilesPanel } from "./profiles-panel";
 import { CloseIcon } from "./icons";
 
-const PANEL_DRAG_TYPE = "application/x-hermes-panel";
-const SESSION_DRAG_TYPE = "application/x-hermes-session";
 /** Minimum pane share of the resized axis. */
 const MIN_FRACTION = 0.15;
+/** Minimum rendered row height; below this the dashboard scrolls vertically. */
+const MIN_ROW_PX = 240;
+/** Movement before a sidebar click becomes a pointer drag. */
+const SIDEBAR_DRAG_THRESHOLD_PX = 7;
+
+/** Reject coordinates covered by fixed overlays such as the mobile profile sheet. */
+function isVisibleDashboardPoint(host: HTMLElement, x: number, y: number): boolean {
+  const rect = host.getBoundingClientRect();
+  if (x < rect.left || x > rect.right || y < rect.top || y > rect.bottom) return false;
+  const hit = document.elementFromPoint(x, y);
+  return hit === host || (hit instanceof Node && host.contains(hit));
+}
 
 type ResizeGesture = {
   pointerId: number;
@@ -55,7 +79,9 @@ export function panelKindLabel(kind: DashboardPanelKind): string {
   }
 }
 
-type DropTarget = { index: number };
+type DropTarget =
+  | { mode: "insert"; index: number; anchorPanelId?: string; edge?: "before" | "after" }
+  | { mode: "replace"; index: number; panelId: string };
 
 export function DashboardView() {
   const [dropTarget, setDropTarget] = useState<DropTarget | null>(null);
@@ -96,11 +122,9 @@ export function DashboardView() {
     window.setTimeout(() => setNote(null), 2200);
   };
 
-  const resolveDropIndex = (event: DragEvent, host: HTMLElement): number => {
+  const resolveDropIndexAt = (x: number, y: number, host: HTMLElement): number => {
     const slots = [...host.querySelectorAll<HTMLElement>(".dashboard-panel")];
     if (slots.length === 0) return 0;
-    const x = event.clientX;
-    const y = event.clientY;
     for (let i = 0; i < slots.length; i += 1) {
       const rect = slots[i]!.getBoundingClientRect();
       if (y < rect.top) return i;
@@ -109,35 +133,207 @@ export function DashboardView() {
     return slots.length;
   };
 
+  const resolveDropTargetAt = (
+    x: number,
+    y: number,
+    host: HTMLElement,
+    external: boolean,
+  ): DropTarget => {
+    if (external) {
+      const geometry = paneDropTargetAt(
+        x,
+        y,
+        [...host.querySelectorAll<HTMLElement>(".dashboard-panel")].map((panel, index) => {
+          const rect = panel.getBoundingClientRect();
+          return { index, left: rect.left, right: rect.right, top: rect.top, bottom: rect.bottom, width: rect.width };
+        }),
+      );
+      if (geometry?.mode === "replace") {
+        const panel = panels[geometry.index];
+        if (panel) return { ...geometry, panelId: panel.id };
+      }
+      if (geometry?.mode === "insert") {
+        const anchorPanelId = panels[geometry.anchorIndex]?.id;
+        return anchorPanelId
+          ? { mode: "insert", index: geometry.index, anchorPanelId, edge: geometry.edge }
+          : { mode: "insert", index: geometry.index };
+      }
+    }
+    return { mode: "insert", index: resolveDropIndexAt(x, y, host) };
+  };
+
+  const resolveDropTarget = (event: DragEvent, host: HTMLElement, external: boolean): DropTarget =>
+    resolveDropTargetAt(event.clientX, event.clientY, host, external);
+
+  const placePanelKind = (kind: DashboardPanelKind, target: DropTarget): void => {
+    const result = target.mode === "replace"
+      ? replaceDashboardPanel(target.panelId, kind)
+      : (() => {
+          const existing = activeDashboard.value.panels.find((panel) => panel.kind === kind);
+          if (existing) {
+            movePanel(existing.id, target.index);
+            return "focused" as const;
+          }
+          return addDashboardPanel(kind, { index: target.index });
+        })();
+    if (result === "full") showNote(t("dashboard.panelLimit", { count: MAX_DASHBOARD_PANELS }));
+  };
+
+  const placeSession = (sessionId: string, target: DropTarget): void => {
+    if (!sessions.value.some((session) => session.id === sessionId)) return;
+    if (target.mode === "replace") {
+      const result = replaceDashboardPanel(target.panelId, "chat", { sessionId });
+      if (result === "full") showNote(t("dashboard.chatPanelLimit", { count: MAX_CHAT_PANELS }));
+      return;
+    }
+    const existing = panels.find((panel) => panel.kind === "chat" && panel.sessionId === sessionId);
+    if (existing) {
+      movePanel(existing.id, target.index);
+      return;
+    }
+    const result = addDashboardPanel("chat", { sessionId, index: target.index });
+    if (result === "full") {
+      const chatCount = panels.filter((panel) => panel.kind === "chat").length;
+      showNote(chatCount >= MAX_CHAT_PANELS
+        ? t("dashboard.chatPanelLimit", { count: MAX_CHAT_PANELS })
+        : t("dashboard.panelLimit", { count: MAX_DASHBOARD_PANELS }));
+    }
+  };
+
+  const panelStructureKey = panels.map((panel) => `${panel.id}:${panel.kind}:${panel.sessionId ?? ""}`).join("|");
+  useEffect(() => {
+    const pointerMove = (event: PointerEvent) => {
+      const pending = currentSidebarPanelPointerDrag();
+      if (!pending || pending.pointerId !== event.pointerId) return;
+      const distance = Math.hypot(event.clientX - pending.startX, event.clientY - pending.startY);
+      if (!pending.active && distance < SIDEBAR_DRAG_THRESHOLD_PX) return;
+      const drag = activateSidebarPanelPointerDrag(event.pointerId);
+      if (!drag) return;
+      event.preventDefault();
+      const host = hostRef.current;
+      if (!host || !isVisibleDashboardPoint(host, event.clientX, event.clientY)) {
+        setDropTarget(null);
+        return;
+      }
+      setDropTarget(resolveDropTargetAt(event.clientX, event.clientY, host, true));
+    };
+    const pointerUp = (event: PointerEvent) => {
+      const drag = currentSidebarPanelPointerDrag();
+      if (!drag || drag.pointerId !== event.pointerId) return;
+      if (drag.active) {
+        event.preventDefault();
+        const host = hostRef.current;
+        if (host && isVisibleDashboardPoint(host, event.clientX, event.clientY)) {
+          placePanelKind(drag.kind, resolveDropTargetAt(event.clientX, event.clientY, host, true));
+        }
+      }
+      endSidebarPanelPointerDrag(true);
+      setDropTarget(null);
+    };
+    const pointerCancel = () => {
+      endSidebarPanelPointerDrag(false);
+      setDropTarget(null);
+    };
+    window.addEventListener("pointermove", pointerMove, { passive: false });
+    window.addEventListener("pointerup", pointerUp);
+    window.addEventListener("pointercancel", pointerCancel);
+    window.addEventListener("blur", pointerCancel);
+    return () => {
+      window.removeEventListener("pointermove", pointerMove);
+      window.removeEventListener("pointerup", pointerUp);
+      window.removeEventListener("pointercancel", pointerCancel);
+      window.removeEventListener("blur", pointerCancel);
+    };
+  }, [dashboard.id, panelStructureKey]);
+
+  useEffect(() => {
+    const pointerMove = (event: PointerEvent) => {
+      const pending = currentSidebarSessionPointerDrag();
+      if (!pending || pending.pointerId !== event.pointerId) return;
+      const distance = Math.hypot(event.clientX - pending.startX, event.clientY - pending.startY);
+      if (!pending.active && distance < SIDEBAR_DRAG_THRESHOLD_PX) return;
+      const drag = activateSidebarSessionPointerDrag(event.pointerId);
+      if (!drag) return;
+      event.preventDefault();
+      const host = hostRef.current;
+      if (!host || !isVisibleDashboardPoint(host, event.clientX, event.clientY)) {
+        setDropTarget(null);
+        return;
+      }
+      setDropTarget(resolveDropTargetAt(event.clientX, event.clientY, host, true));
+    };
+    const pointerUp = (event: PointerEvent) => {
+      const drag = currentSidebarSessionPointerDrag();
+      if (!drag || drag.pointerId !== event.pointerId) return;
+      if (drag.active) {
+        event.preventDefault();
+        const host = hostRef.current;
+        if (host && isVisibleDashboardPoint(host, event.clientX, event.clientY)) {
+          placeSession(drag.sessionId, resolveDropTargetAt(event.clientX, event.clientY, host, true));
+        }
+      }
+      endSidebarSessionPointerDrag(true);
+      setDropTarget(null);
+    };
+    const pointerCancel = () => {
+      endSidebarSessionPointerDrag(false);
+      setDropTarget(null);
+    };
+    window.addEventListener("pointermove", pointerMove, { passive: false });
+    window.addEventListener("pointerup", pointerUp);
+    window.addEventListener("pointercancel", pointerCancel);
+    window.addEventListener("blur", pointerCancel);
+    return () => {
+      window.removeEventListener("pointermove", pointerMove);
+      window.removeEventListener("pointerup", pointerUp);
+      window.removeEventListener("pointercancel", pointerCancel);
+      window.removeEventListener("blur", pointerCancel);
+    };
+  }, [dashboard.id, panelStructureKey, sessions.value.map((session) => session.id).join("|")]);
+
   const onDragOver = (event: DragEvent) => {
     const types = event.dataTransfer?.types ? [...event.dataTransfer.types] : [];
-    const relevant = types.includes(PANEL_DRAG_TYPE) || types.includes(SESSION_DRAG_TYPE) || types.includes("text/plain");
+    const internal = types.includes(DASHBOARD_PANEL_DRAG_TYPE);
+    const external = types.includes(DASHBOARD_PANEL_KIND_DRAG_TYPE) || types.includes(DASHBOARD_SESSION_DRAG_TYPE);
+    const relevant = internal || external;
     if (!relevant || !(event.currentTarget instanceof HTMLElement)) return;
     event.preventDefault();
-    if (event.dataTransfer) event.dataTransfer.dropEffect = types.includes(PANEL_DRAG_TYPE) ? "move" : "copy";
-    const index = resolveDropIndex(event, event.currentTarget);
-    setDropTarget((current) => (current && current.index === index ? current : { index }));
+    if (event.dataTransfer) event.dataTransfer.dropEffect = internal ? "move" : "copy";
+    const next = resolveDropTarget(event, event.currentTarget, external);
+    setDropTarget((current) => {
+      if (!current || current.mode !== next.mode || current.index !== next.index) return next;
+      if (current.mode === "replace" && next.mode === "replace") {
+        return current.panelId === next.panelId ? current : next;
+      }
+      if (current.mode === "insert" && next.mode === "insert") {
+        return current.anchorPanelId === next.anchorPanelId && current.edge === next.edge ? current : next;
+      }
+      return next;
+    });
   };
 
   const onDrop = (event: DragEvent) => {
     event.preventDefault();
     const host = event.currentTarget instanceof HTMLElement ? event.currentTarget : null;
-    const index = host ? resolveDropIndex(event, host) : dropTarget?.index ?? panels.length;
+    const types = event.dataTransfer?.types ? [...event.dataTransfer.types] : [];
+    const external = types.includes(DASHBOARD_PANEL_KIND_DRAG_TYPE) || types.includes(DASHBOARD_SESSION_DRAG_TYPE);
+    const target = host ? resolveDropTarget(event, host, external) : dropTarget ?? { mode: "insert", index: panels.length };
+    const index = target.index;
     setDropTarget(null);
-    const panelId = event.dataTransfer?.getData(PANEL_DRAG_TYPE);
+    const panelId = event.dataTransfer?.getData(DASHBOARD_PANEL_DRAG_TYPE);
     if (panelId) {
       movePanel(panelId, index);
       return;
     }
-    const sessionId = event.dataTransfer?.getData(SESSION_DRAG_TYPE) || event.dataTransfer?.getData("text/plain");
-    if (!sessionId || !sessions.value.some((session) => session.id === sessionId)) return;
-    const existing = panels.find((panel) => panel.kind === "chat" && panel.sessionId === sessionId);
-    if (existing) {
-      movePanel(existing.id, index);
+
+    const kind = parseDashboardPanelKind(event.dataTransfer?.getData(DASHBOARD_PANEL_KIND_DRAG_TYPE) ?? "");
+    if (kind && kind !== "chat") {
+      placePanelKind(kind, target);
       return;
     }
-    const result = addDashboardPanel("chat", { sessionId, index });
-    if (result === "full") showNote(t("dashboard.panelLimit", { count: MAX_DASHBOARD_PANELS }));
+
+    const sessionId = event.dataTransfer?.getData(DASHBOARD_SESSION_DRAG_TYPE);
+    if (sessionId) placeSession(sessionId, target);
   };
 
   const cloneSizes = (source: DashboardSizes): DashboardSizes => ({
@@ -211,10 +407,46 @@ export function DashboardView() {
     }
   };
 
-  const separatorProps = (axis: "col" | "row", row: number, index: number) => ({
+  const resizeWithKeyboard = (axis: "col" | "row", row: number, index: number) => (event: KeyboardEvent) => {
+    const current = dashboardEffectiveSizes(activeDashboard.value);
+    const fractions = axis === "row" ? current.rowFr : current.colFr[row];
+    const first = fractions?.[index];
+    const second = fractions?.[index + 1];
+    if (first === undefined || second === undefined) return;
+    const pair = first + second;
+    const currentShare = pair > 0 ? first / pair : 0.5;
+    let nextShare: number | undefined;
+    if (event.key === "Home") nextShare = MIN_FRACTION;
+    else if (event.key === "End") nextShare = 1 - MIN_FRACTION;
+    else if (event.key === (axis === "row" ? "ArrowUp" : "ArrowLeft")) nextShare = currentShare - 0.05;
+    else if (event.key === (axis === "row" ? "ArrowDown" : "ArrowRight")) nextShare = currentShare + 0.05;
+    if (nextShare === undefined) return;
+    event.preventDefault();
+    const share = Math.min(1 - MIN_FRACTION, Math.max(MIN_FRACTION, nextShare));
+    const next = cloneSizes(current);
+    if (axis === "row") {
+      next.rowFr[index] = pair * share;
+      next.rowFr[index + 1] = pair * (1 - share);
+    } else {
+      next.colFr[row]![index] = pair * share;
+      next.colFr[row]![index + 1] = pair * (1 - share);
+    }
+    setActiveDashboardSizes(next);
+  };
+
+  const separatorProps = (axis: "col" | "row", row: number, index: number) => {
+    const fractions = axis === "row" ? sizes.rowFr : sizes.colFr[row];
+    const first = fractions?.[index] ?? 1;
+    const second = fractions?.[index + 1] ?? 1;
+    const valueNow = Math.round((first / (first + second)) * 100);
+    return ({
     class: `dashboard-resize dashboard-resize--${axis}`,
     role: "separator" as const,
+    tabIndex: 0,
     "aria-orientation": (axis === "col" ? "vertical" : "horizontal") as "vertical" | "horizontal",
+    "aria-valuemin": Math.round(MIN_FRACTION * 100),
+    "aria-valuemax": Math.round((1 - MIN_FRACTION) * 100),
+    "aria-valuenow": valueNow,
     "aria-label": t("dashboard.resize"),
     title: t("dashboard.resizeTitle"),
     draggable: false,
@@ -223,13 +455,15 @@ export function DashboardView() {
     onPointerUp: finishResize,
     onPointerCancel: finishResize,
     onLostPointerCapture: finishResize,
+    onKeyDown: resizeWithKeyboard(axis, row, index),
     onDblClick: () => resetActiveDashboardSizes(),
     onDragStart: (event: DragEvent) => event.preventDefault(),
-  });
+    });
+  };
 
   if (panels.length === 0) {
     return (
-      <section class="dashboard-view is-empty" onDragOver={onDragOver} onDrop={onDrop}>
+      <section ref={hostRef} class="dashboard-view is-empty" onDragOver={onDragOver} onDrop={onDrop}>
         <div class="dashboard-empty-copy">
           <b>{t("dashboard.empty")}</b>
           <small>{t("dashboard.emptyHint")}</small>
@@ -249,8 +483,10 @@ export function DashboardView() {
     }
   }
 
+  // Rows keep a readable minimum height; when they cannot fit (many rows on a
+  // short viewport) the dashboard scrolls vertically instead of crushing panels.
   const rowTemplate = sizes.rowFr
-    .map((fr) => `minmax(0, ${round(fr)}fr)`)
+    .map((fr) => `minmax(${MIN_ROW_PX}px, ${round(fr)}fr)`)
     .join(" 1px ");
 
   return (
@@ -279,8 +515,20 @@ export function DashboardView() {
                 <DashboardPanelFrame
                   key={panel.id}
                   panel={panel}
-                  showDropBefore={dropTarget?.index === globalIndex}
-                  showDropAfter={dropTarget?.index === panels.length && globalIndex === panels.length - 1}
+                  showDropBefore={dropTarget?.mode === "insert" && (dropTarget.anchorPanelId
+                    ? dropTarget.anchorPanelId === panel.id && dropTarget.edge === "before"
+                    : dropTarget.index === globalIndex)}
+                  showDropAfter={dropTarget?.mode === "insert" && (dropTarget.anchorPanelId
+                    ? dropTarget.anchorPanelId === panel.id && dropTarget.edge === "after"
+                    : dropTarget.index === panels.length && globalIndex === panels.length - 1)}
+                  showDropReplace={dropTarget?.mode === "replace" && dropTarget.panelId === panel.id}
+                  dropInsertLabel={dropTarget?.mode === "insert"
+                    ? dropTarget.index === 0
+                      ? t("dashboard.dropInsertStart")
+                      : dropTarget.index === panels.length
+                        ? t("dashboard.dropInsertEnd")
+                        : t("dashboard.dropInsertBetween")
+                    : ""}
                 />
               )];
               if (!mobile && columnIndex < row.panels.length - 1) {
@@ -303,25 +551,37 @@ function round(value: number): number {
   return Math.round(value * 1000) / 1000;
 }
 
-function DashboardPanelFrame({ panel, showDropBefore, showDropAfter }: {
+function DashboardPanelFrame({ panel, showDropBefore, showDropAfter, showDropReplace, dropInsertLabel }: {
   panel: DashboardPanel;
   showDropBefore: boolean;
   showDropAfter: boolean;
+  showDropReplace: boolean;
+  dropInsertLabel: string;
 }) {
   const title = panelTitle(panel);
+  const delegated = panel.kind === "chat"
+    && sessions.value.find((item) => item.id === panel.sessionId)?.conversationKind === "delegated";
   return (
     <article
-      class={`dashboard-panel dashboard-panel--${panel.kind} ${showDropBefore ? "has-drop-before" : ""} ${showDropAfter ? "has-drop-after" : ""}`}
+      class={`dashboard-panel dashboard-panel--${panel.kind} ${showDropBefore ? "has-drop-before" : ""} ${showDropAfter ? "has-drop-after" : ""} ${showDropReplace ? "is-drop-replace" : ""}`}
       data-panel-id={panel.id}
+      data-panel-kind={panel.kind}
+      data-session-id={panel.kind === "chat" ? panel.sessionId : undefined}
     >
-      {showDropBefore && <div class="workspace-drop-line" aria-hidden="true" />}
+      {showDropBefore && <div class="workspace-drop-line" aria-hidden="true"><span>{dropInsertLabel}</span></div>}
+      {showDropReplace && (
+        <div class="dashboard-replace-drop" aria-hidden="true">
+          <span>{t("dashboard.dropReplace")}</span>
+          <small>{t("dashboard.dropReplaceHint")}</small>
+        </div>
+      )}
       <header
         class="dashboard-panel-head"
         draggable
         title={t("dashboard.dragPanel")}
         onDragStart={(event) => {
           event.stopPropagation();
-          event.dataTransfer?.setData(PANEL_DRAG_TYPE, panel.id);
+          event.dataTransfer?.setData(DASHBOARD_PANEL_DRAG_TYPE, panel.id);
           if (event.dataTransfer) event.dataTransfer.effectAllowed = "move";
           if (event.currentTarget instanceof HTMLElement) event.currentTarget.classList.add("is-dragging");
         }}
@@ -330,7 +590,12 @@ function DashboardPanelFrame({ panel, showDropBefore, showDropAfter }: {
         }}
       >
         <b class="dashboard-panel-kind">{panelKindLabel(panel.kind)}</b>
-        {title && <span class="dashboard-panel-title" title={title}>{title}</span>}
+        {title && (
+          <span class="dashboard-panel-title">
+            <span title={title}>{title}</span>
+            {delegated && <em class="delegated-chat-badge">{t("profile.delegatedChat")}</em>}
+          </span>
+        )}
         <button
           class="icon-button dashboard-panel-close"
           type="button"
@@ -345,7 +610,7 @@ function DashboardPanelFrame({ panel, showDropBefore, showDropAfter }: {
       <div class="dashboard-panel-body">
         <PanelContent panel={panel} />
       </div>
-      {showDropAfter && <div class="workspace-drop-line is-after" aria-hidden="true" />}
+      {showDropAfter && <div class="workspace-drop-line is-after" aria-hidden="true"><span>{dropInsertLabel}</span></div>}
     </article>
   );
 }
@@ -366,7 +631,7 @@ function PanelContent({ panel }: { panel: DashboardPanel }): ComponentChildren {
     if (!session || !profile) {
       return <p class="dashboard-panel-missing">{t("dashboard.chatMissing")}</p>;
     }
-    return <ChatPane session={session} profile={profile} hideHeader onClosePane={() => closeDashboardPanel(panel.id)} />;
+    return <ChatPane session={session} profile={profile} hideHeader activateWorkspaceOnPointerDown onClosePane={() => closeDashboardPanel(panel.id)} />;
   }
   if (panel.kind === "kanban") return <KanbanBoard hideTitle />;
   if (panel.kind === "studio") return <OfficeScene profiles={profileList.value} embedded />;

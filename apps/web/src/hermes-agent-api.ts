@@ -6,8 +6,10 @@ import type {
 import { officeFetchJson } from "./office-api";
 
 export async function loadHermesAgentUpdateStatus(options: { force?: boolean } = {}): Promise<HermesAgentUpdateStatus> {
-  const query = options.force ? "?force=1" : "";
-  return parseStatus(await officeFetchJson<unknown>(`/api/v1/host/hermes-agent${query}`));
+  const path = options.force
+    ? "/api/v1/host/hermes-agent/check"
+    : "/api/v1/host/hermes-agent";
+  return parseStatus(await officeFetchJson<unknown>(path, options.force ? { method: "POST" } : {}));
 }
 
 export async function startHermesAgentUpdate(): Promise<HermesAgentUpdateStatus> {

@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { once } from "node:events";
 import { existsSync } from "node:fs";
+import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -117,6 +118,24 @@ test("CLI invocation never passes executable text through a shell", async () => 
   const result = await probeHermesCli(`/missing/hermes;touch ${sentinel}`, 200);
   assert.equal(result.state, "unavailable");
   assert.equal(existsSync(sentinel), false);
+});
+
+test("CLI detection accepts a flushed version line before the helper exits", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "hermes-studio-cli-probe-"));
+  const executable = join(directory, "fake-hermes.mjs");
+  await writeFile(executable, `#!/usr/bin/env node
+if (process.argv.includes("--version")) {
+  process.stdout.write("Hermes Agent v0.19.0\\n");
+  setInterval(() => undefined, 1_000);
+}
+`, "utf8");
+  await chmod(executable, 0o755);
+  try {
+    const result = await probeHermesCli(executable, 200);
+    assert.deepEqual(result, { state: "available", version: "0.19.0" });
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
 });
 
 test("Hermes detection accepts any semantic version", () => {

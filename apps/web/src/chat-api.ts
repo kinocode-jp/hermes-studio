@@ -17,12 +17,15 @@ import {
   explicitRpcRejection,
   interruptResultWasAccepted,
   interactionResultWasAccepted,
+  isCommitUnconfirmedRpcError,
   isCommitUnconfirmedRpcFrame,
   isExplicitRpcRejection,
   isSessionInUseRpcError,
+  isSessionLimitRpcError,
   normalizePromptResult,
   normalizeSteerResult,
   sessionInUseRpcError,
+  sessionLimitRpcError,
 } from "./chat-rpc-results";
 
 export type { ChatHistoryResult } from "./history-loader";
@@ -50,13 +53,20 @@ export type ChatApiCallbacks = {
   onHistory(clientSessionId: string, messages: ChatMessage[], resolvedStoredSessionId?: string, result?: ChatHistoryResult): void;
   onHistoryError(clientSessionId: string, message: string): void;
   onSessionConnecting(clientSessionId: string): void;
+  onSessionQueued?(clientSessionId: string): void;
   onSessionReady(clientSessionId: string, liveSessionId: string, storedSessionId?: string, runtime?: ChatSessionRuntime): void;
   onSessionDisconnected(clientSessionId: string): void;
   onSessionError(clientSessionId: string, message: string): void;
   onEvent(clientSessionId: string, event: ChatGatewayEvent): "resync-required" | void;
 };
 
-export type ChatSessionRuntime = { running?: boolean; status?: string };
+export type ChatSessionRuntime = {
+  running?: boolean;
+  status?: string;
+  model?: string;
+  provider?: string;
+  reasoningEffort?: string;
+};
 
 export type ChatSteerResult =
   | { status: "queued" }
@@ -68,11 +78,27 @@ export type ChatPromptResult =
   | { status: "rejected"; message: string }
   | { status: "unconfirmed"; message: string };
 
+export type SlashCompletionItem = { text: string; display: string; meta: string };
+
+export type ChatSlashResult = {
+  status: "ok" | "confirm-required";
+  output: string;
+  warning: string;
+  confirmMessage?: string;
+  action?: "prefill" | "send";
+  message?: string;
+  notice?: string;
+  key?: "model" | "reasoning";
+  value?: string;
+};
+
 export type ChatApiConnection = {
   ensureSession(target: ChatTarget): void;
   releaseSession(clientSessionId: string): void;
   submitPrompt(clientSessionId: string, text: string, operationId: string): Promise<ChatPromptResult>;
   steer(clientSessionId: string, text: string): Promise<ChatSteerResult>;
+  execSlash(clientSessionId: string, command: string, confirmExpensiveModel?: boolean): Promise<ChatSlashResult>;
+  completeSlash(text: string): Promise<SlashCompletionItem[]>;
   interrupt(clientSessionId: string): Promise<void>;
   respondClarify(clientSessionId: string, requestId: string, answer: string): Promise<void>;
   respondApproval(clientSessionId: string, approvalId: string, choice: ApprovalChoice): Promise<void>;
@@ -100,6 +126,10 @@ type JsonRpcResult = {
   resumedSessionId?: unknown;
   running?: unknown;
   status?: unknown;
+  model?: unknown;
+  provider?: unknown;
+  reasoningEffort?: unknown;
+  reasoning_effort?: unknown;
 };
 
 type PendingRequest = {
@@ -110,14 +140,21 @@ type PendingRequest = {
 
 type ActiveTarget = { generation: number; target: ChatTarget };
 type LiveTarget = { clientSessionId: string; generation: number };
+type QueuedPromptSubmission = {
+  text: string;
+  operationId: string;
+  resolve(result: ChatPromptResult): void;
+};
 
 const RPC_TIMEOUT_MS = 15_000;
+const SLASH_RPC_TIMEOUT_MS = 185_000;
 const HISTORY_TIMEOUT_MS = 10_000;
 const RECONNECT_MAX_MS = 8_000;
 const MAX_RECONNECT_ATTEMPTS = 5;
 const MAX_PREOPEN_WEBSOCKET_FAILURES = 3;
 const HISTORY_PAGE_LIMIT = 25;
 const MAX_HISTORY_PAGES = DEFAULT_CLIENT_HISTORY_LIMITS.maxPages;
+const SESSION_SLOT_RETRY_MS = 750;
 
 export function connectChatApi(callbacks: ChatApiCallbacks, dependencies: ChatApiDependencies = {}): ChatApiConnection {
   const serverUrl = dependencies.serverUrl ?? officeServerUrl();
@@ -157,6 +194,10 @@ export function connectChatApi(callbacks: ChatApiCallbacks, dependencies: ChatAp
   let latestSynchronizedAuthRevision = -1;
   let unsubscribeSessionSynchronizations = () => {};
   let closeHandoffTail: Promise<void> = Promise.resolve();
+  const pendingTargetStartRetries = new Map<string, ReturnType<typeof setTimeout>>();
+  const queuedSessionStarts: string[] = [];
+  const pendingQueuedPrompts = new Map<string, QueuedPromptSubmission>();
+  let queuedSessionStartTimer: ReturnType<typeof setTimeout> | undefined;
 
   const rejectPending = (message: string) => {
     for (const request of pending.values()) {
@@ -180,6 +221,8 @@ export function connectChatApi(callbacks: ChatApiCallbacks, dependencies: ChatAp
 
   const haltTransport = (message: string) => {
     transportHalted = true;
+    for (const timer of pendingTargetStartRetries.values()) globalThis.clearTimeout(timer);
+    pendingTargetStartRetries.clear();
     callbacks.onSocketState("error", message);
     for (const clientSessionId of targets.keys()) callbacks.onSessionError(clientSessionId, message);
   };
@@ -257,10 +300,7 @@ export function connectChatApi(callbacks: ChatApiCallbacks, dependencies: ChatAp
     }
 
     if (frame.method === "office.ready") {
-      if (gatewayReady) return;
-      gatewayReady = true;
-      callbacks.onSocketState("ready");
-      for (const target of targets.values()) startTarget(target);
+      markGatewayReady();
       return;
     }
 
@@ -309,13 +349,24 @@ export function connectChatApi(callbacks: ChatApiCallbacks, dependencies: ChatAp
     if (error) {
       const message = error.code === -32006
         ? "このセッションは別の端末で使用中です。別の端末で閉じてから再接続してください。"
-        : typeof error.message === "string" ? error.message : "Chat RPCに失敗しました。";
+        : error.code === -32007
+          ? "Live Sessionの実行枠が埋まっています。空き次第、自動で開始します。"
+          : typeof error.message === "string" ? error.message : "Chat RPCに失敗しました。";
       request.reject(isCommitUnconfirmedRpcFrame(error)
         ? commitUnconfirmedRpcError(message)
-        : error.code === -32006 ? sessionInUseRpcError(message) : explicitRpcRejection(message));
+        : error.code === -32006
+          ? sessionInUseRpcError(message)
+          : error.code === -32007 ? sessionLimitRpcError(message) : explicitRpcRejection(message));
       return;
     }
     request.resolve(frame.result);
+  };
+
+  const markGatewayReady = () => {
+    if (gatewayReady) return;
+    gatewayReady = true;
+    callbacks.onSocketState("ready");
+    for (const target of targets.values()) startTarget(target);
   };
 
   const openSocket = async () => {
@@ -353,6 +404,10 @@ export function connectChatApi(callbacks: ChatApiCallbacks, dependencies: ChatAp
     socketAuthRevision = lease.authRevision;
     socketOpened = false;
     socketFailedBeforeOpen = false;
+    const announceReadyForGateway = () => {
+      if (socket !== nextSocket || stopped || nextSocket.readyState !== WebSocket.OPEN) return;
+      nextSocket.send(JSON.stringify({ jsonrpc: "2.0", method: "office.hello", params: {} }));
+    };
     nextSocket.addEventListener("open", () => {
       if (socket !== nextSocket || stopped) return;
       socketOpened = true;
@@ -360,6 +415,7 @@ export function connectChatApi(callbacks: ChatApiCallbacks, dependencies: ChatAp
       preOpenFailureCount = 0;
       reconnectAttempt = 0;
       attemptedRecoveryRevision = undefined;
+      announceReadyForGateway();
     });
     nextSocket.addEventListener("message", (event) => handleMessage(event.data, nextSocket));
     nextSocket.addEventListener("close", (event) => {
@@ -372,20 +428,99 @@ export function connectChatApi(callbacks: ChatApiCallbacks, dependencies: ChatAp
       for (const clientSessionId of targets.keys()) callbacks.onSessionError(clientSessionId, "Chat WebSocketへ接続できませんでした。");
       nextSocket.close();
     });
+    // On a fast loopback upgrade, `open` can have fired before the listeners
+    // above were attached. Announce after installing the message handler so
+    // the gateway can resend its readiness signal deterministically.
+    if (nextSocket.readyState === WebSocket.OPEN) {
+      socketOpened = true;
+      transportHalted = false;
+      preOpenFailureCount = 0;
+      reconnectAttempt = 0;
+      attemptedRecoveryRevision = undefined;
+      announceReadyForGateway();
+    }
   };
 
-  const rpc = (method: string, params: Record<string, string>, requestId?: string): Promise<unknown> => {
-    if (!socket || socket.readyState !== WebSocket.OPEN) return Promise.reject(new Error("Chat接続は準備中です。"));
+  const rpc = (
+    method: string,
+    params: Record<string, boolean | string>,
+    requestId?: string,
+    timeoutMs = RPC_TIMEOUT_MS,
+  ): Promise<unknown> => {
+    const requestSocket = socket;
+    if (!requestSocket || requestSocket.readyState !== WebSocket.OPEN) return Promise.reject(new Error("Chat接続は準備中です。"));
     const id = requestId ?? randomId();
     return new Promise((resolve, reject) => {
       const timeout = globalThis.setTimeout(() => {
         pending.delete(id);
         reject(new Error(`${method}がタイムアウトしました。`));
-      }, RPC_TIMEOUT_MS);
+      }, timeoutMs);
       pending.set(id, { resolve, reject, timeout });
-      socket?.send(JSON.stringify({ jsonrpc: "2.0", id, method, params }));
+      try {
+        requestSocket.send(JSON.stringify({ jsonrpc: "2.0", id, method, params }));
+      } catch (error) {
+        globalThis.clearTimeout(timeout);
+        pending.delete(id);
+        reject(error);
+      }
     });
   };
+
+  const isSessionStartQueued = (clientSessionId: string): boolean => queuedSessionStarts.includes(clientSessionId);
+
+  const removeQueuedSessionStart = (clientSessionId: string): void => {
+    const index = queuedSessionStarts.indexOf(clientSessionId);
+    if (index >= 0) queuedSessionStarts.splice(index, 1);
+    if (queuedSessionStarts.length === 0 && queuedSessionStartTimer !== undefined) {
+      globalThis.clearTimeout(queuedSessionStartTimer);
+      queuedSessionStartTimer = undefined;
+    }
+  };
+
+  const settleQueuedPrompt = (clientSessionId: string, result: ChatPromptResult): void => {
+    const submission = pendingQueuedPrompts.get(clientSessionId);
+    if (!submission) return;
+    pendingQueuedPrompts.delete(clientSessionId);
+    submission.resolve(result);
+  };
+
+  const scheduleQueuedSessionStart = (delayMs = SESSION_SLOT_RETRY_MS): void => {
+    if (stopped || queuedSessionStarts.length === 0) return;
+    if (queuedSessionStartTimer !== undefined) {
+      if (delayMs > 0) return;
+      globalThis.clearTimeout(queuedSessionStartTimer);
+      queuedSessionStartTimer = undefined;
+    }
+    queuedSessionStartTimer = globalThis.setTimeout(() => {
+      queuedSessionStartTimer = undefined;
+      pumpQueuedSessionStarts();
+    }, delayMs);
+  };
+
+  const enqueueSessionStart = (active: ActiveTarget): void => {
+    const clientSessionId = active.target.clientSessionId;
+    if (!isCurrentTarget(active)) return;
+    if (!isSessionStartQueued(clientSessionId)) queuedSessionStarts.push(clientSessionId);
+    callbacks.onSessionQueued?.(clientSessionId);
+    scheduleQueuedSessionStart();
+  };
+
+  function pumpQueuedSessionStarts(): void {
+    if (stopped || queuedSessionStarts.length === 0) return;
+    const clientSessionId = queuedSessionStarts[0]!;
+    const active = targets.get(clientSessionId);
+    if (!active || liveSessionIdFor(active, liveToClient) !== undefined) {
+      removeQueuedSessionStart(clientSessionId);
+      scheduleQueuedSessionStart(0);
+      return;
+    }
+    if (transportHalted || !gatewayReady || opening.has(clientSessionId) || targetStartOperations.has(clientSessionId)) {
+      scheduleQueuedSessionStart();
+      return;
+    }
+    retryTargetStartWhenReady(active);
+    scheduleQueuedSessionStart();
+  }
 
   const openRemoteSession = async (active: ActiveTarget) => {
     await waitForCloseHandoffs();
@@ -404,7 +539,7 @@ export function connectChatApi(callbacks: ChatApiCallbacks, dependencies: ChatAp
     const openingPromise = new Promise<void>((resolve) => { resolveOpening = resolve; });
     const openingSettlement = { operation, promise: openingPromise, resolve: resolveOpening };
     openingSettlements.set(target.clientSessionId, openingSettlement);
-    callbacks.onSessionConnecting(target.clientSessionId);
+    if (!isSessionStartQueued(target.clientSessionId)) callbacks.onSessionConnecting(target.clientSessionId);
     try {
       const raw = target.storedSessionId
         ? await rpc("session.resume", { session_id: target.storedSessionId, profile: target.profileId })
@@ -429,20 +564,49 @@ export function connectChatApi(callbacks: ChatApiCallbacks, dependencies: ChatAp
         : typeof result?.storedSessionId === "string" ? result.storedSessionId
           : typeof result?.resumed === "string" ? result.resumed
             : typeof result?.resumedSessionId === "string" ? result.resumedSessionId : target.storedSessionId;
+      // Preserve the per-session model preferences while attaching the durable
+      // Hermes identity. Dropping them makes a later render look like a new
+      // target and immediately replaces this live session with another
+      // connecting attempt.
       active.target = {
-        clientSessionId: target.clientSessionId,
-        profileId: target.profileId,
-        ...(storedSessionId ? { storedSessionId } : {})
+        ...target,
+        ...(storedSessionId ? { storedSessionId } : {}),
       };
       liveToClient.set(liveSessionId, { clientSessionId: target.clientSessionId, generation: active.generation });
       const runtime: ChatSessionRuntime = {
         ...(typeof result?.running === "boolean" ? { running: result.running } : {}),
-        ...(typeof result?.status === "string" ? { status: result.status } : {})
+        ...(typeof result?.status === "string" ? { status: result.status } : {}),
+        ...(typeof result?.model === "string" ? { model: result.model } : {}),
+        ...(typeof result?.provider === "string" ? { provider: result.provider } : {}),
+        ...(typeof result?.reasoningEffort === "string"
+          ? { reasoningEffort: result.reasoningEffort }
+          : typeof result?.reasoning_effort === "string" ? { reasoningEffort: result.reasoning_effort } : {}),
+      };
+      active.target = {
+        ...active.target,
+        ...(runtime.model ? { model: runtime.model } : {}),
+        ...(runtime.provider ? { provider: runtime.provider } : {}),
+        ...(runtime.reasoningEffort ? { reasoningEffort: runtime.reasoningEffort } : {}),
       };
       historiesAwaitingReset.delete(target.clientSessionId);
-      callbacks.onSessionReady(target.clientSessionId, liveSessionId, storedSessionId, runtime);
+      const queuedPromptWillStart = pendingQueuedPrompts.has(target.clientSessionId);
+      removeQueuedSessionStart(target.clientSessionId);
+      callbacks.onSessionReady(
+        target.clientSessionId,
+        liveSessionId,
+        storedSessionId,
+        queuedPromptWillStart ? { ...runtime, running: true } : runtime,
+      );
+      void flushQueuedPrompt(active, liveSessionId);
+      scheduleQueuedSessionStart();
     } catch (error) {
       if (isCurrentTarget(active) && socket === requestSocket) {
+        if (isSessionLimitRpcError(error)) {
+          enqueueSessionStart(active);
+          return;
+        }
+        removeQueuedSessionStart(target.clientSessionId);
+        settleQueuedPrompt(target.clientSessionId, { status: "rejected", message: errorText(error) });
         if (historiesAwaitingReset.has(target.clientSessionId) || isSessionInUseRpcError(error)) {
           loadedHistories.delete(target.clientSessionId);
         }
@@ -496,7 +660,7 @@ export function connectChatApi(callbacks: ChatApiCallbacks, dependencies: ChatAp
           serverUrl
         );
         if (!isCurrentHistoryLoad(active, operation)) return;
-        const page = normalizeHistoryPage(body, target.storedSessionId);
+        const page = normalizeHistoryPage(body, target.storedSessionId, pageNumber);
         resolvedStoredSessionId = page.resolvedStoredSessionId ?? resolvedStoredSessionId;
         const shouldContinue = history.append(page);
         if (!shouldContinue) break;
@@ -551,6 +715,29 @@ export function connectChatApi(callbacks: ChatApiCallbacks, dependencies: ChatAp
     });
   };
 
+  // A fast loopback upgrade can complete before the browser observes the
+  // readiness notification. Keep a newly opened chat eligible for one later
+  // start attempt instead of leaving it in "connecting" indefinitely.
+  const retryTargetStartWhenReady = (active: ActiveTarget): void => {
+    const clientSessionId = active.target.clientSessionId;
+    if (transportHalted || !isCurrentTarget(active) || liveSessionIdFor(active, liveToClient) !== undefined) return;
+    if (gatewayReady) {
+      const pendingRetry = pendingTargetStartRetries.get(clientSessionId);
+      if (pendingRetry !== undefined) {
+        globalThis.clearTimeout(pendingRetry);
+        pendingTargetStartRetries.delete(clientSessionId);
+      }
+      startTarget(active);
+      return;
+    }
+    if (pendingTargetStartRetries.has(clientSessionId)) return;
+    const timer = globalThis.setTimeout(() => {
+      pendingTargetStartRetries.delete(clientSessionId);
+      retryTargetStartWhenReady(active);
+    }, 250);
+    pendingTargetStartRetries.set(clientSessionId, timer);
+  };
+
   const beginHistoryBarrier = (active: ActiveTarget, closeReason = "Prompt commit unconfirmed; reload history"): void => {
     if (!isCurrentTarget(active)) return;
     const clientSessionId = active.target.clientSessionId;
@@ -561,6 +748,22 @@ export function connectChatApi(callbacks: ChatApiCallbacks, dependencies: ChatAp
     callbacks.onSessionDisconnected(clientSessionId);
     // Browsers reserve the server's 1013 for servers; 4001 is the defensive client close.
     if (socket?.readyState === WebSocket.OPEN) socket.close(4001, closeReason);
+  };
+
+  const reloadHistoryAfterSlash = async (active: ActiveTarget): Promise<void> => {
+    if (!isCurrentTarget(active) || !active.target.storedSessionId) {
+      throw new Error("保存済み履歴を再同期できませんでした。再接続してください。");
+    }
+    const clientSessionId = active.target.clientSessionId;
+    loadedHistories.delete(clientSessionId);
+    historiesAwaitingReset.add(clientSessionId);
+    await loadHistory(active);
+    if (!isCurrentTarget(active) || loadedHistories.get(clientSessionId) !== active) {
+      throw new Error("保存済み履歴を再同期できませんでした。再接続してください。");
+    }
+    historiesAwaitingReset.delete(clientSessionId);
+    const liveSessionId = liveSessionIdFor(active, liveToClient);
+    if (liveSessionId) callbacks.onSessionReady(clientSessionId, liveSessionId, active.target.storedSessionId);
   };
 
   const waitForCloseHandoffs = async (): Promise<void> => {
@@ -579,12 +782,14 @@ export function connectChatApi(callbacks: ChatApiCallbacks, dependencies: ChatAp
         const result = asRecord(await rpc("session.close", { session_id: liveSessionId }));
         if (typeof result?.closed !== "boolean") throw new Error("Hermes returned an invalid close acknowledgement.");
       } catch {
-        // A failed close may still own the fourth server lease. Never race a
-        // replacement create on this socket; disconnect cleanup is the
-        // authoritative fence before the next office.ready.
+        // A failed close may still own a server lease. Never race a replacement
+        // create on this socket; disconnect cleanup is the authoritative fence
+        // before the next office.ready.
         if (socket === closeSocket && closeSocket.readyState === WebSocket.OPEN) {
           closeSocket.close(4002, "Session close unconfirmed; reload history");
         }
+      } finally {
+        scheduleQueuedSessionStart(0);
       }
     });
   };
@@ -597,6 +802,11 @@ export function connectChatApi(callbacks: ChatApiCallbacks, dependencies: ChatAp
       closeHandoffTail = closeHandoffTail.then(async () => await openingSettlement.promise);
     }
     targets.delete(clientSessionId);
+    removeQueuedSessionStart(clientSessionId);
+    settleQueuedPrompt(clientSessionId, { status: "rejected", message: "セッションが閉じられたため、待機中の指示を取り消しました。" });
+    const pendingRetry = pendingTargetStartRetries.get(clientSessionId);
+    if (pendingRetry !== undefined) globalThis.clearTimeout(pendingRetry);
+    pendingTargetStartRetries.delete(clientSessionId);
     opening.delete(clientSessionId);
     historyLoads.delete(clientSessionId);
     loadedHistories.delete(clientSessionId);
@@ -625,6 +835,8 @@ export function connectChatApi(callbacks: ChatApiCallbacks, dependencies: ChatAp
     preOpenFailureCount = 0;
     rejectPending("Chat接続を再試行します。");
     opening.clear();
+    for (const timer of pendingTargetStartRetries.values()) globalThis.clearTimeout(timer);
+    pendingTargetStartRetries.clear();
     if (force) {
       historyLoads.clear();
       targetStartOperations.clear();
@@ -642,6 +854,42 @@ export function connectChatApi(callbacks: ChatApiCallbacks, dependencies: ChatAp
     socketFailedBeforeOpen = false;
     closingSocket?.close();
     void openSocket();
+  };
+
+  const submitPromptToLive = async (
+    active: ActiveTarget,
+    liveSessionId: string,
+    text: string,
+    operationId: string,
+  ): Promise<ChatPromptResult> => {
+    const requestSocket = socket;
+    const clientSessionId = active.target.clientSessionId;
+    if (!isCurrentTarget(active) || historiesAwaitingReset.has(clientSessionId)
+      || liveSessionIdFor(active, liveToClient) !== liveSessionId
+      || !requestSocket || requestSocket.readyState !== WebSocket.OPEN) {
+      return { status: "rejected", message: "Live Sessionが未接続です。" };
+    }
+    try {
+      const raw = await rpc("prompt.submit", { session_id: liveSessionId, text }, operationId);
+      const result = normalizePromptResult(raw);
+      if (result !== undefined) return result;
+      beginHistoryBarrier(active);
+      return { status: "unconfirmed", message: "Hermesが不正な送信確認を返しました。保存済み履歴を再確認します。" };
+    } catch (error) {
+      const message = errorText(error);
+      if (!isExplicitRpcRejection(error) && isCurrentTarget(active) && socket === requestSocket) beginHistoryBarrier(active);
+      return isExplicitRpcRejection(error)
+        ? { status: "rejected", message }
+        : { status: "unconfirmed", message };
+    }
+  };
+
+  const flushQueuedPrompt = async (active: ActiveTarget, liveSessionId: string): Promise<void> => {
+    const clientSessionId = active.target.clientSessionId;
+    const submission = pendingQueuedPrompts.get(clientSessionId);
+    if (!submission) return;
+    pendingQueuedPrompts.delete(clientSessionId);
+    submission.resolve(await submitPromptToLive(active, liveSessionId, submission.text, submission.operationId));
   };
 
   unsubscribeSessionSynchronizations = subscribeSessionSynchronizations((recoveredServerUrl, authRevision) => {
@@ -662,21 +910,24 @@ export function connectChatApi(callbacks: ChatApiCallbacks, dependencies: ChatAp
         // not-yet-live start. Do not re-enter startTarget when a live session exists,
         // or the UI flaps through connecting/ready on every ensure call.
         restartTransport(false);
-        if (!gatewayReady) return;
         if (liveSessionIdFor(existing, liveToClient) !== undefined) return;
+        if (isSessionStartQueued(target.clientSessionId)) {
+          scheduleQueuedSessionStart(0);
+          return;
+        }
         if (
           targetStartOperations.has(target.clientSessionId)
           || opening.has(target.clientSessionId)
           || historyLoads.has(target.clientSessionId)
         ) return;
-        startTarget(existing);
+        retryTargetStartWhenReady(existing);
         return;
       }
       if (existing !== undefined) deactivateTarget(existing);
       const active: ActiveTarget = { generation: ++nextGeneration, target: { ...target } };
       targets.set(target.clientSessionId, active);
       restartTransport(false);
-      if (gatewayReady) startTarget(active);
+      retryTargetStartWhenReady(active);
     },
     releaseSession(clientSessionId) {
       const active = targets.get(clientSessionId);
@@ -684,24 +935,23 @@ export function connectChatApi(callbacks: ChatApiCallbacks, dependencies: ChatAp
     },
     async submitPrompt(clientSessionId, text, operationId) {
       const active = targets.get(clientSessionId);
-      const requestSocket = socket;
       const liveSessionId = active === undefined ? undefined : liveSessionIdFor(active, liveToClient);
-      if (!active || historiesAwaitingReset.has(clientSessionId) || !liveSessionId || !requestSocket || requestSocket.readyState !== WebSocket.OPEN) {
+      if (!active || historiesAwaitingReset.has(clientSessionId)) {
         return { status: "rejected", message: "Live Sessionが未接続です。" };
       }
-      try {
-        const raw = await rpc("prompt.submit", { session_id: liveSessionId, text }, operationId);
-        const result = normalizePromptResult(raw);
-        if (result !== undefined) return result;
-        beginHistoryBarrier(active);
-        return { status: "unconfirmed", message: "Hermesが不正な送信確認を返しました。保存済み履歴を再確認します。" };
-      } catch (error) {
-        const message = errorText(error);
-        if (!isExplicitRpcRejection(error) && isCurrentTarget(active) && socket === requestSocket) beginHistoryBarrier(active);
-        return isExplicitRpcRejection(error)
-          ? { status: "rejected", message }
-          : { status: "unconfirmed", message };
+      if (!liveSessionId) {
+        if (!isSessionStartQueued(clientSessionId)) {
+          return { status: "rejected", message: "Live Sessionが未接続です。" };
+        }
+        if (pendingQueuedPrompts.has(clientSessionId)) {
+          return { status: "rejected", message: "このセッションには既に待機中の指示があります。" };
+        }
+        return await new Promise<ChatPromptResult>((resolve) => {
+          pendingQueuedPrompts.set(clientSessionId, { text, operationId, resolve });
+          enqueueSessionStart(active);
+        });
       }
+      return await submitPromptToLive(active, liveSessionId, text, operationId);
     },
     async steer(clientSessionId, text) {
       const trimmed = text.trim();
@@ -712,11 +962,95 @@ export function connectChatApi(callbacks: ChatApiCallbacks, dependencies: ChatAp
       if (!active || historiesAwaitingReset.has(clientSessionId) || !liveSessionId || !requestSocket || requestSocket.readyState !== WebSocket.OPEN) {
         throw new Error("Live Sessionが未接続です。");
       }
-      const raw = await rpc("session.steer", { session_id: liveSessionId, text: trimmed });
-      if (!isCurrentTarget(active) || socket !== requestSocket || liveSessionIdFor(active, liveToClient) !== liveSessionId) {
-        throw new Error("追加指示の送信先が変更されました。現在のセッションで再試行してください。");
+      try {
+        const raw = await rpc("session.steer", { session_id: liveSessionId, text: trimmed });
+        if (!isCurrentTarget(active) || socket !== requestSocket || liveSessionIdFor(active, liveToClient) !== liveSessionId) {
+          throw new Error("追加指示の送信先が変更されました。現在のセッションで再試行しないでください。");
+        }
+        const result = normalizeSteerResult(raw);
+        if (result.status === "invalid") {
+          throw commitUnconfirmedRpcError("Hermesが不正な追加指示確認を返しました。自動では再送しません。");
+        }
+        return result;
+      } catch (error) {
+        // The request has already been handed to the WebSocket here. Only an
+        // explicit upstream rejection proves it is safe to retry; timeout,
+        // disconnect, target replacement, and malformed success are ambiguous.
+        if (isExplicitRpcRejection(error) || isCommitUnconfirmedRpcError(error)) throw error;
+        throw commitUnconfirmedRpcError(errorText(error));
       }
-      return normalizeSteerResult(raw);
+    },
+    async execSlash(clientSessionId, command, confirmExpensiveModel = false) {
+      const trimmed = command.trim();
+      if (!trimmed.startsWith("/")) throw new Error("スラッシュコマンドを指定してください。");
+      const active = targets.get(clientSessionId);
+      const requestSocket = socket;
+      const liveSessionId = active === undefined ? undefined : liveSessionIdFor(active, liveToClient);
+      if (!active || historiesAwaitingReset.has(clientSessionId) || !liveSessionId || !requestSocket || requestSocket.readyState !== WebSocket.OPEN) {
+        throw new Error("Live Sessionが未接続です。");
+      }
+      try {
+        const raw = await rpc("slash.exec", {
+          session_id: liveSessionId,
+          command: trimmed,
+          ...(confirmExpensiveModel ? { confirm_expensive_model: true } : {}),
+        }, undefined, chatSlashRpcTimeoutMs(trimmed));
+        if (!isCurrentTarget(active) || socket !== requestSocket || liveSessionIdFor(active, liveToClient) !== liveSessionId) {
+          throw new Error("スラッシュコマンドの送信先が変更されました。保存済み履歴を再確認します。");
+        }
+        const record = raw !== null && typeof raw === "object" ? raw as Record<string, unknown> : undefined;
+        if (!record || (record.status !== "ok" && record.status !== "confirm_required")) {
+          throw new Error("Hermesが不正なスラッシュコマンド結果を返しました。");
+        }
+        const result: ChatSlashResult = {
+          status: record.status === "confirm_required" ? "confirm-required" : "ok",
+          output: typeof record.output === "string" ? record.output : "",
+          warning: typeof record.warning === "string" ? record.warning : "",
+          ...(typeof record.confirmMessage === "string" ? { confirmMessage: record.confirmMessage } : {}),
+          ...(record.type === "prefill" || record.type === "send" ? { action: record.type } : {}),
+          ...(typeof record.message === "string" ? { message: record.message } : {}),
+          ...(typeof record.notice === "string" ? { notice: record.notice } : {}),
+          ...(record.key === "model" || record.key === "reasoning" ? { key: record.key } : {}),
+          ...(typeof record.value === "string" ? { value: record.value } : {}),
+        };
+        if (result.status === "ok" && slashMutatesHistory(trimmed)) await reloadHistoryAfterSlash(active);
+        return result;
+      } catch (error) {
+        if (isExplicitRpcRejection(error) || isCommitUnconfirmedRpcError(error) || !slashMutatesSession(trimmed)) {
+          throw error;
+        }
+        if (isCurrentTarget(active) && socket === requestSocket) beginHistoryBarrier(active);
+        // The command was already handed to Hermes. Timeout, disconnect,
+        // target replacement, malformed success, and history reload failure do
+        // not prove that a session mutation was rejected, so never present
+        // these outcomes as safe to retry.
+        throw commitUnconfirmedRpcError(errorText(error));
+      }
+    },
+    async completeSlash(text) {
+      const trimmed = text.trim();
+      if (!trimmed.startsWith("/")) return [];
+      const requestSocket = socket;
+      if (!requestSocket || requestSocket.readyState !== WebSocket.OPEN) return [];
+      const raw = await rpc("complete.slash", { text: trimmed });
+      const record = raw !== null && typeof raw === "object" ? raw as Record<string, unknown> : {};
+      if (typeof record.itemsJson !== "string") return [];
+      try {
+        const parsed = JSON.parse(record.itemsJson) as unknown;
+        if (!Array.isArray(parsed)) return [];
+        return parsed.flatMap((item) => {
+          if (item === null || typeof item !== "object") return [];
+          const entry = item as Record<string, unknown>;
+          if (typeof entry.text !== "string" || !entry.text.startsWith("/")) return [];
+          return [{
+            text: entry.text,
+            display: typeof entry.display === "string" ? entry.display : entry.text,
+            meta: typeof entry.meta === "string" ? entry.meta : "",
+          }];
+        });
+      } catch {
+        return [];
+      }
     },
     async interrupt(clientSessionId) {
       const active = targets.get(clientSessionId);
@@ -731,17 +1065,33 @@ export function connectChatApi(callbacks: ChatApiCallbacks, dependencies: ChatAp
     },
     async respondClarify(clientSessionId, requestId, answer) {
       const active = targets.get(clientSessionId);
+      const requestSocket = socket;
       const liveSessionId = active === undefined ? undefined : liveSessionIdFor(active, liveToClient);
-      if (historiesAwaitingReset.has(clientSessionId) || !liveSessionId) throw new Error("Live Sessionが未接続です。");
-      const raw = await rpc("clarify.respond", { request_id: requestId, answer });
-      if (!interactionResultWasAccepted("clarify.respond", raw)) throw new Error("Hermesが不正な回答確認を返しました。");
+      if (!active || historiesAwaitingReset.has(clientSessionId) || !liveSessionId || !requestSocket || requestSocket.readyState !== WebSocket.OPEN) throw new Error("Live Sessionが未接続です。");
+      try {
+        const raw = await rpc("clarify.respond", { request_id: requestId, answer });
+        if (!interactionResultWasAccepted("clarify.respond", raw)) throw commitUnconfirmedRpcError("Hermesが不正な回答確認を返しました。");
+      } catch (error) {
+        if (!isExplicitRpcRejection(error) && isCurrentTarget(active) && socket === requestSocket) {
+          beginHistoryBarrier(active, "Clarification commit unconfirmed; reload history");
+        }
+        throw error;
+      }
     },
     async respondApproval(clientSessionId, approvalId, choice) {
       const active = targets.get(clientSessionId);
+      const requestSocket = socket;
       const liveSessionId = active === undefined ? undefined : liveSessionIdFor(active, liveToClient);
-      if (historiesAwaitingReset.has(clientSessionId) || !liveSessionId) throw new Error("Live Sessionが未接続です。");
-      const raw = await rpc("approval.respond", { session_id: liveSessionId, approval_id: approvalId, choice });
-      if (!interactionResultWasAccepted("approval.respond", raw)) throw new Error("Hermesが不正な承認確認を返しました。");
+      if (!active || historiesAwaitingReset.has(clientSessionId) || !liveSessionId || !requestSocket || requestSocket.readyState !== WebSocket.OPEN) throw new Error("Live Sessionが未接続です。");
+      try {
+        const raw = await rpc("approval.respond", { session_id: liveSessionId, approval_id: approvalId, choice });
+        if (!interactionResultWasAccepted("approval.respond", raw)) throw commitUnconfirmedRpcError("Hermesが不正な承認確認を返しました。");
+      } catch (error) {
+        if (!isExplicitRpcRejection(error) && isCurrentTarget(active) && socket === requestSocket) {
+          beginHistoryBarrier(active, "Approval commit unconfirmed; reload history");
+        }
+        throw error;
+      }
     },
     retry() {
       restartTransport(true);
@@ -757,7 +1107,14 @@ export function connectChatApi(callbacks: ChatApiCallbacks, dependencies: ChatAp
       socketOpening = false;
       if (reconnectTimer !== undefined) globalThis.clearTimeout(reconnectTimer);
       reconnectTimer = undefined;
+      if (queuedSessionStartTimer !== undefined) globalThis.clearTimeout(queuedSessionStartTimer);
+      queuedSessionStartTimer = undefined;
+      for (const timer of pendingTargetStartRetries.values()) globalThis.clearTimeout(timer);
+      pendingTargetStartRetries.clear();
       for (const active of [...targets.values()]) deactivateTarget(active);
+      for (const clientSessionId of [...pendingQueuedPrompts.keys()]) {
+        settleQueuedPrompt(clientSessionId, { status: "rejected", message: "Chat clientが停止したため、待機中の指示を取り消しました。" });
+      }
       rejectPending("Chat client stopped.");
       const closingSocket = socket;
       socket = undefined;
@@ -793,6 +1150,19 @@ function targetsMatch(current: ChatTarget, incoming: ChatTarget): boolean {
   return current.clientSessionId === incoming.clientSessionId
     && current.profileId === incoming.profileId
     && (incoming.storedSessionId === undefined || current.storedSessionId === incoming.storedSessionId);
+}
+
+function slashMutatesHistory(command: string): boolean {
+  return /^\/(?:undo|compact)(?:\s|$)/i.test(command);
+}
+
+function slashMutatesSession(command: string): boolean {
+  return /^\/(?:undo|compact|model|reasoning)(?:\s|$)/i.test(command);
+}
+
+/** Session-mutating slash RPCs share Hermes' 180-second server budget. */
+export function chatSlashRpcTimeoutMs(command: string): number {
+  return slashMutatesSession(command) ? SLASH_RPC_TIMEOUT_MS : RPC_TIMEOUT_MS;
 }
 
 function errorText(error: unknown): string {

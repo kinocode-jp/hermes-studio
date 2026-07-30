@@ -1,5 +1,5 @@
 import { computed, signal } from "@preact/signals";
-import type { ChatPromptResult, ChatSteerResult, ChatTarget } from "./chat-api";
+import type { ChatPromptResult, ChatSlashResult, ChatSteerResult, ChatTarget } from "./chat-api";
 import type {
   ApprovalChoice,
   ChatConnectionState,
@@ -41,6 +41,14 @@ export const profileSettingsModalTab = signal<SettingsTab>("soul");
 export const settingsModalOpen = signal(false);
 export const profileChatModalId = signal<string | null>(null);
 export const profileChatModalPaneIds = signal<string[]>([]);
+/** Most recently interacted-with conversation pane inside the profile chat modal. */
+export const profileChatModalActivePaneId = signal("");
+/** Chat sessions rendered inside another modal (currently Kanban task detail). */
+export const embeddedChatSessionIds = signal<string[]>([]);
+/** Chat panes share one multiplexed WebSocket, so this is a UI bound, not a socket bound. */
+// Keep this aligned with the server's per-device live-session lease limit.
+// Opening a fifth pane releases the oldest live session before starting the
+// new one; durable conversation history remains untouched.
 export const MAX_OPEN_CHAT_SESSIONS = 4;
 export const MAX_PROFILE_CHAT_MODAL_PANES = 4;
 export const chatSocketState = signal<{ state: ChatConnectionState; message: RuntimeMessage }>({
@@ -77,6 +85,12 @@ export const officeRuntimeHooks = {
   steerChatSession: (async () => { throw new Error("Chat runtime is not registered."); }) as (
     clientSessionId: string, text: string
   ) => Promise<ChatSteerResult>,
+  execSlashCommand: (async () => { throw new Error("Chat runtime is not registered."); }) as (
+    clientSessionId: string, command: string, confirmExpensiveModel?: boolean
+  ) => Promise<ChatSlashResult>,
+  completeSlashCommand: (async () => [] as import("./chat-api").SlashCompletionItem[]) as (
+    text: string
+  ) => Promise<import("./chat-api").SlashCompletionItem[]>,
   interruptChatSession: ((_clientSessionId: string) => {}) as (clientSessionId: string) => Promise<void> | void,
   respondClarify: async (_clientSessionId: string, _requestId: string, _answer: string) => {},
   respondApproval: async (_clientSessionId: string, _approvalId: string, _choice: ApprovalChoice) => {},

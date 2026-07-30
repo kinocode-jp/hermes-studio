@@ -4,12 +4,11 @@
  * A dashboard is a user-named collection of panels (chat / kanban / studio /
  * teams / scheduled) shown together on one surface. Multiple dashboards can
  * exist; exactly one is active. The whole structure persists in localStorage
- * via brand-storage. On first run, the legacy ui-nav "activeSurface" plus the
- * previously open chat sessions are migrated into the initial dashboard.
+ * via brand-storage. On first run, an empty dashboard shell is created; the
+ * runtime wiring attaches its default-profile draft chat once profiles load.
  */
 import { computed, signal } from "@preact/signals";
 import { readBrandStorage, writeBrandStorage } from "./brand-storage";
-import { readUiNavPreferences } from "./ui-nav-prefs";
 
 export const DASHBOARDS_STORAGE_KEY = "hermes-studio:dashboards:v1";
 export const DASHBOARDS_VERSION = 1;
@@ -20,7 +19,7 @@ export type DashboardPanelKind = (typeof dashboardPanelKinds)[number];
 
 /** Only chat panels may appear more than once per dashboard. */
 export const SINGLETON_PANEL_KINDS: readonly DashboardPanelKind[] = ["kanban", "studio", "teams", "scheduled", "profiles"];
-export const MAX_DASHBOARD_PANELS = 6;
+export const MAX_DASHBOARD_PANELS = 12;
 /** Matches MAX_OPEN_CHAT_SESSIONS in store-state (kept literal to avoid an import cycle). */
 export const MAX_CHAT_PANELS = 4;
 export const MAX_DASHBOARDS = 12;
@@ -50,6 +49,8 @@ export type Dashboard = {
   id: string;
   name: string;
   panels: DashboardPanel[];
+  /** Once true, removing every panel must leave the dashboard empty. */
+  defaultChatSeeded?: boolean | undefined;
   /** Optional; absent for dashboards saved before resizing existed. */
   sizes?: DashboardSizes | undefined;
 };
@@ -68,7 +69,7 @@ function defaultState(): DashboardsState {
 }
 
 function createDefaultDashboard(): Dashboard {
-  return { id: newDashboardId(), name: "", panels: [{ id: newPanelId(), kind: "studio" }] };
+  return { id: newDashboardId(), name: "", panels: [], defaultChatSeeded: false };
 }
 
 export function newDashboardId(): string {
@@ -113,12 +114,24 @@ export function normalizeDashboardsState(value: unknown): DashboardsState | unde
           : undefined;
         if (kind === "chat" && sessionId === undefined) continue;
         if (kind === "chat" && panels.some((existing) => existing.kind === "chat" && existing.sessionId === sessionId)) continue;
+        if (kind === "chat" && panels.filter((existing) => existing.kind === "chat").length >= MAX_CHAT_PANELS) continue;
         if (panels.length >= MAX_DASHBOARD_PANELS) break;
         panels.push({ id: panel.id.slice(0, 64), kind, ...(kind === "chat" ? { sessionId } : {}) });
       }
     }
     const sizes = normalizeSizes(item.sizes, panels.length);
-    dashboards.push({ id: item.id.slice(0, 64), name: item.name.slice(0, 80), panels, ...(sizes ? { sizes } : {}) });
+    // Empty dashboards saved before this flag existed receive the default chat
+    // once after upgrading. An explicit true survives later user deletion.
+    const defaultChatSeeded = typeof item.defaultChatSeeded === "boolean"
+      ? item.defaultChatSeeded
+      : panels.length > 0;
+    dashboards.push({
+      id: item.id.slice(0, 64),
+      name: item.name.slice(0, 80),
+      panels,
+      defaultChatSeeded,
+      ...(sizes ? { sizes } : {}),
+    });
   }
   if (dashboards.length === 0) return undefined;
   const activeDashboardId = typeof record.activeDashboardId === "string"
@@ -128,42 +141,41 @@ export function normalizeDashboardsState(value: unknown): DashboardsState | unde
   return { version: DASHBOARDS_VERSION, dashboards, activeDashboardId };
 }
 
-/**
- * First-run migration: convert the legacy exclusive-surface preference into a
- * dashboard so the user lands on a familiar layout. Open chat sessions are
- * re-attached later by `adoptOpenChatSessions` once the session list loads,
- * because session ids are not known at module-init time.
- */
+/** First-run dashboard shell. Its default chat is attached after profiles load. */
 export function migrateLegacyNavigation(): DashboardsState {
-  const legacy = readUiNavPreferences();
-  const panels: DashboardPanel[] = [];
-  const surfaceKind: DashboardPanelKind = legacy.surface === "kanban" ? "kanban"
-    : legacy.surface === "teams" ? "teams"
-    : legacy.surface === "scheduled" ? "scheduled"
-    : "studio";
-  panels.push({ id: newPanelId(), kind: surfaceKind });
-  const dashboard: Dashboard = { id: newDashboardId(), name: "", panels };
-  return { version: DASHBOARDS_VERSION, dashboards: [dashboard], activeDashboardId: dashboard.id };
+  return defaultState();
 }
 
-export function readDashboardsState(read: StorageReader = () => readBrandStorage(DASHBOARDS_STORAGE_KEY)): DashboardsState {
+type DashboardsReadResult = {
+  state: DashboardsState;
+  needsInitialDefaultChat: boolean;
+};
+
+function readDashboardsStateResult(read: StorageReader): DashboardsReadResult {
   try {
     const raw = read();
     if (raw !== null) {
       const normalized = normalizeDashboardsState(JSON.parse(raw));
-      if (normalized) return normalized;
+      if (normalized) {
+        const active = normalized.dashboards.find((dashboard) => dashboard.id === normalized.activeDashboardId);
+        return { state: normalized, needsInitialDefaultChat: active?.defaultChatSeeded !== true };
+      }
     }
   } catch {
-    // fall through to migration
+    // Fall through to a fresh dashboard.
   }
-  try {
-    return migrateLegacyNavigation();
-  } catch {
-    return defaultState();
-  }
+  return { state: migrateLegacyNavigation(), needsInitialDefaultChat: true };
 }
 
-const initial = readDashboardsState();
+export function readDashboardsState(read: StorageReader = () => readBrandStorage(DASHBOARDS_STORAGE_KEY)): DashboardsState {
+  return readDashboardsStateResult(read).state;
+}
+
+const initialRead = readDashboardsStateResult(() => readBrandStorage(DASHBOARDS_STORAGE_KEY));
+const initial = initialRead.state;
+
+/** True when the active dashboard still needs its one-time default chat seed. */
+export const initialDashboardNeedsDefaultChat = initialRead.needsInitialDefaultChat;
 
 export const dashboards = signal<Dashboard[]>(initial.dashboards);
 export const activeDashboardId = signal<string>(initial.activeDashboardId);
@@ -204,10 +216,29 @@ export function switchDashboard(dashboardId: string): void {
   persistDashboards();
 }
 
+/** Find the dashboard that already presents a panel, preferring the active one. */
+export function dashboardContainingPanel(
+  kind: DashboardPanelKind,
+  options?: { sessionId?: string },
+): Dashboard | undefined {
+  const matches = (dashboard: Dashboard): boolean => dashboard.panels.some((panel) =>
+    panel.kind === kind && (kind !== "chat" || panel.sessionId === options?.sessionId),
+  );
+  const active = dashboards.value.find((dashboard) => dashboard.id === activeDashboardId.value);
+  return active && matches(active) ? active : dashboards.value.find(matches);
+}
+
 export function createDashboard(name = ""): string | undefined {
   if (dashboards.value.length >= MAX_DASHBOARDS) return undefined;
-  const dashboard: Dashboard = { id: newDashboardId(), name: name.trim().slice(0, 80), panels: [] };
-  commit([...dashboards.value, dashboard], dashboard.id);
+  const dashboard: Dashboard = {
+    id: newDashboardId(),
+    name: name.trim().slice(0, 80),
+    panels: [],
+    defaultChatSeeded: false,
+  };
+  // Dashboard activation owns the chat-session handoff. Keep this pure state
+  // mutation from making the new dashboard active before that handoff runs.
+  commit([...dashboards.value, dashboard]);
   return dashboard.id;
 }
 
@@ -263,8 +294,44 @@ export function addPanelToActiveDashboard(kind: DashboardPanelKind, options?: { 
     ? Math.max(0, Math.min(panels.length, Math.floor(options.index)))
     : panels.length;
   panels.splice(insertAt, 0, panel);
-  commit(dashboards.value.map((item) => item.id === dashboard.id ? { ...item, panels } : item));
+  commit(dashboards.value.map((item) => item.id === dashboard.id ? replaceDashboardPanels(item, panels) : item));
   return "added";
+}
+
+export type ReplacePanelResult = "replaced" | "focused" | "full" | "missing";
+
+/**
+ * Replace one active-dashboard panel in place. If the replacement is already
+ * present elsewhere on the same dashboard, its old pane is removed so the
+ * singleton/session uniqueness rules remain intact.
+ */
+export function replacePanelInActiveDashboard(
+  panelId: string,
+  kind: DashboardPanelKind,
+  options?: { sessionId?: string },
+): ReplacePanelResult {
+  const dashboard = activeDashboard.value;
+  const target = dashboard.panels.find((panel) => panel.id === panelId);
+  if (!target) return "missing";
+  const sessionId = kind === "chat" ? options?.sessionId : undefined;
+  if (kind === "chat" && !sessionId) return "missing";
+  if (target.kind === kind && (kind !== "chat" || target.sessionId === sessionId)) return "focused";
+
+  const duplicate = dashboard.panels.find((panel) => panel.id !== panelId
+    && panel.kind === kind
+    && (kind !== "chat" || panel.sessionId === sessionId));
+  const retained = dashboard.panels.filter((panel) => panel.id !== duplicate?.id);
+  const existingChatCount = retained.filter((panel) => panel.kind === "chat" && panel.id !== panelId).length;
+  if (kind === "chat" && existingChatCount >= MAX_CHAT_PANELS) return "full";
+
+  const replacement: DashboardPanel = {
+    id: target.id,
+    kind,
+    ...(kind === "chat" ? { sessionId } : {}),
+  };
+  const panels = retained.map((panel) => panel.id === panelId ? replacement : panel);
+  commit(dashboards.value.map((item) => item.id === dashboard.id ? replaceDashboardPanels(item, panels) : item));
+  return "replaced";
 }
 
 export function removePanel(panelId: string): DashboardPanel | undefined {
@@ -273,7 +340,7 @@ export function removePanel(panelId: string): DashboardPanel | undefined {
   if (!removed) return undefined;
   commit(dashboards.value.map((item) =>
     item.id === dashboard.id
-      ? { ...item, panels: item.panels.filter((panel) => panel.id !== panelId) }
+      ? replaceDashboardPanels(item, item.panels.filter((panel) => panel.id !== panelId))
       : item,
   ));
   return removed;
@@ -288,7 +355,7 @@ export function movePanel(panelId: string, index: number): void {
   if (from < desired) desired -= 1;
   const panels = dashboard.panels.filter((panel) => panel.id !== panelId);
   panels.splice(Math.max(0, Math.min(panels.length, desired)), 0, dashboard.panels[from]!);
-  commit(dashboards.value.map((item) => item.id === dashboard.id ? { ...item, panels } : item));
+  commit(dashboards.value.map((item) => item.id === dashboard.id ? replaceDashboardPanels(item, panels) : item));
 }
 
 /** Persist user-dragged sizes for the active dashboard. */
@@ -318,9 +385,23 @@ export function reconcileChatPanels(liveSessionIds: ReadonlySet<string>): void {
     );
     if (panels.length === dashboard.panels.length) return dashboard;
     changed = true;
-    return { ...dashboard, panels };
+    return replaceDashboardPanels(dashboard, panels);
   });
   if (changed) commit(next);
+}
+
+/**
+ * Replace panel membership/order and invalidate position-based resize data.
+ * DashboardSizes has no panel-id signature, so retaining it across structural
+ * changes can later apply old fractions to unrelated panels.
+ */
+export function replaceDashboardPanels(dashboard: Dashboard, panels: DashboardPanel[]): Dashboard {
+  const defaultChatSeeded = dashboard.defaultChatSeeded === true || panels.length > 0;
+  const unchanged = dashboard.panels.length === panels.length
+    && dashboard.panels.every((panel, index) => panel.id === panels[index]?.id);
+  if (unchanged) return { ...dashboard, panels, defaultChatSeeded };
+  const { sizes: _staleSizes, ...rest } = dashboard;
+  return { ...rest, panels, defaultChatSeeded };
 }
 
 /** Chat session ids currently placed on the active dashboard, in panel order. */
@@ -336,13 +417,22 @@ export function resetDashboardStateForTests(state?: DashboardsState): void {
   dashboards.value = next.dashboards;
   activeDashboardId.value = next.activeDashboardId;
 }
-/** Panels per row for a given panel count: 1-3 one row, 4 -> 2+2, 5 -> 3+2, 6 -> 3+3. */
+/**
+ * Panels per row for a given panel count. Up to 4 per row, balanced rows:
+ * 1-3 one row, 4=[2,2], 5=[3,2], 6=[3,3], 7=[4,3], 8=[4,4],
+ * 9=[3,3,3], 10=[4,3,3], 11=[4,4,3], 12=[4,4,4].
+ */
 export function dashboardRowLayout(count: number): number[] {
   if (count <= 0) return [];
   if (count <= 3) return [count];
   if (count === 4) return [2, 2];
   if (count === 5) return [3, 2];
-  return [3, 3];
+  if (count === 6) return [3, 3];
+  const rows = Math.ceil(count / 4);
+  const base = Math.floor(count / rows);
+  const remainder = count % rows;
+  // `remainder` leading rows get one extra panel (e.g. 10 -> [4,3,3]).
+  return Array.from({ length: rows }, (_unused, index) => base + (index < remainder ? 1 : 0));
 }
 
 /** Sizes for rendering: stored fractions when they match the layout, else equal fractions. */

@@ -1,8 +1,17 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import type { ChatApiCallbacks, ChatHistoryResult, ChatTarget } from "../src/chat-api";
-import { connectChatApi } from "../src/chat-api";
+import { chatSlashRpcTimeoutMs, connectChatApi } from "../src/chat-api";
 import { storedSessionClientId } from "../src/session-identity.ts";
+import { isCommitUnconfirmedRpcError } from "../src/chat-rpc-results.ts";
+
+test("session-mutating slash commands use the Hermes long-running RPC budget", () => {
+  assert.equal(chatSlashRpcTimeoutMs("/model model --session"), 185_000);
+  assert.equal(chatSlashRpcTimeoutMs("/reasoning high"), 185_000);
+  assert.equal(chatSlashRpcTimeoutMs("/undo"), 185_000);
+  assert.equal(chatSlashRpcTimeoutMs("/compact"), 185_000);
+  assert.equal(chatSlashRpcTimeoutMs("/status"), 15_000);
+});
 
 test("delayed create from a four-pane eviction is closed and cannot resurrect the target", async () => {
   const harness = await createHarness();
@@ -49,6 +58,42 @@ test("a fifth pane waits for the evicted live session close acknowledgement", as
   harness.socket.respond(close.id, { closed: true });
   await flush();
   assert.ok(harness.socket.frame("session.create", "profile-5"), "the replacement starts after its lease slot is released");
+  harness.api.stop();
+});
+
+test("a session-limit rejection waits in FIFO and submits its prompt after a slot closes", async () => {
+  const harness = await createHarness();
+  harness.api.ensureSession({ clientSessionId: "blocker", profileId: "default" });
+  await flush();
+  const blockerCreate = harness.socket.frame("session.create", "default")!;
+  harness.socket.respond(blockerCreate.id, { session_id: "live-blocker" });
+  await flush();
+
+  harness.api.ensureSession({ clientSessionId: "queued-client", profileId: "queued-profile" });
+  await flush();
+  const limitedCreate = harness.socket.frame("session.create", "queued-profile")!;
+  harness.socket.respond(limitedCreate.id, undefined, {
+    code: -32007,
+    message: "live session limit",
+    data: { reason: "session_limit" },
+  });
+  await flush();
+  assert.deepEqual(harness.queued, ["queued-client"]);
+
+  const submission = harness.api.submitPrompt("queued-client", "start after capacity is free", "queued-operation");
+  harness.api.releaseSession("blocker");
+  const close = harness.socket.frame("session.close", "live-blocker")!;
+  harness.socket.respond(close.id, { closed: true });
+  await flush();
+  await flush();
+
+  const retriedCreate = harness.socket.frames("session.create", "queued-profile").at(-1)!;
+  assert.notEqual(retriedCreate.id, limitedCreate.id);
+  harness.socket.respond(retriedCreate.id, { session_id: "live-queued" });
+  await flush();
+  const prompt = harness.socket.frame("prompt.submit", "start after capacity is free")!;
+  harness.socket.respond(prompt.id, { status: "streaming" });
+  assert.deepEqual(await submission, { status: "accepted" });
   harness.api.stop();
 });
 
@@ -235,23 +280,32 @@ test("session-in-use errors are localized and the same target can retry resume",
 });
 
 test("interaction methods reject malformed success acknowledgements", async () => {
-  const harness = await createHarness();
-  harness.api.ensureSession({ clientSessionId: "interaction-client", profileId: "coder" });
+  const approvalHarness = await createHarness();
+  approvalHarness.api.ensureSession({ clientSessionId: "interaction-client", profileId: "coder" });
   await flush();
-  const create = harness.socket.frame("session.create", "coder")!;
-  harness.socket.respond(create.id, { session_id: "live-interaction" });
+  const create = approvalHarness.socket.frame("session.create", "coder")!;
+  approvalHarness.socket.respond(create.id, { session_id: "live-interaction", stored_session_id: "stored-interaction" });
   await flush();
 
-  const approval = harness.api.respondApproval("interaction-client", "approval-1", "once");
-  const approvalFrame = harness.socket.frames("approval.respond", "approval-1").at(-1)!;
-  harness.socket.respond(approvalFrame.id, { resolved: false });
+  const approval = approvalHarness.api.respondApproval("interaction-client", "approval-1", "once");
+  const approvalFrame = approvalHarness.socket.frames("approval.respond", "approval-1").at(-1)!;
+  approvalHarness.socket.respond(approvalFrame.id, { resolved: false });
   await assert.rejects(approval, /不正な承認確認/);
+  assert.deepEqual(approvalHarness.socket.closes.at(-1), { code: 4001, reason: "Approval commit unconfirmed; reload history" });
+  approvalHarness.api.stop();
 
-  const clarification = harness.api.respondClarify("interaction-client", "clarify-1", "answer");
-  const clarifyFrame = harness.socket.frames("clarify.respond", "clarify-1").at(-1)!;
-  harness.socket.respond(clarifyFrame.id, { status: "rejected" });
+  const clarificationHarness = await createHarness();
+  clarificationHarness.api.ensureSession({ clientSessionId: "clarification-client", profileId: "coder" });
+  await flush();
+  const clarificationCreate = clarificationHarness.socket.frame("session.create", "coder")!;
+  clarificationHarness.socket.respond(clarificationCreate.id, { session_id: "live-clarification", stored_session_id: "stored-clarification" });
+  await flush();
+  const clarification = clarificationHarness.api.respondClarify("clarification-client", "clarify-1", "answer");
+  const clarifyFrame = clarificationHarness.socket.frames("clarify.respond", "clarify-1").at(-1)!;
+  clarificationHarness.socket.respond(clarifyFrame.id, { status: "rejected" });
   await assert.rejects(clarification, /不正な回答確認/);
-  harness.api.stop();
+  assert.deepEqual(clarificationHarness.socket.closes.at(-1), { code: 4001, reason: "Clarification commit unconfirmed; reload history" });
+  clarificationHarness.api.stop();
 });
 
 test("a server resync_required event enters the durable history barrier", async () => {
@@ -308,7 +362,7 @@ test("steer sends one exact live session.steer request and rejects empty or unre
   const malformed = harness.api.steer("client-steer", "invalid ack");
   const malformedFrame = harness.socket.frames("session.steer", "live-steer").at(-1)!;
   harness.socket.respond(malformedFrame.id, { status: "accepted" });
-  assert.deepEqual(await malformed, { status: "invalid" });
+  await assert.rejects(malformed, (error: unknown) => isCommitUnconfirmedRpcError(error));
   harness.api.stop();
 });
 
@@ -341,6 +395,46 @@ test("prompt submit accepts only streaming and treats malformed success as uncon
   harness.api.stop();
 });
 
+test("a malformed read-only slash result does not disconnect unrelated live panes", async () => {
+  const harness = await createHarness();
+  for (const [clientSessionId, profileId, liveSessionId] of [
+    ["slash-reader", "coder", "live-reader"],
+    ["slash-neighbor", "reviewer", "live-neighbor"],
+  ] as const) {
+    harness.api.ensureSession({ clientSessionId, profileId });
+    await flush();
+    const create = harness.socket.frame("session.create", profileId)!;
+    harness.socket.respond(create.id, { session_id: liveSessionId });
+    await flush();
+  }
+
+  const reading = harness.api.execSlash("slash-reader", "/help");
+  const frame = harness.socket.frame("slash.exec", "/help")!;
+  harness.socket.respond(frame.id, { status: "malformed" });
+  await assert.rejects(reading, /不正なスラッシュコマンド結果/);
+  assert.equal(harness.socket.closes.some(({ code }) => code === 4001), false);
+  assert.deepEqual(harness.disconnections, []);
+  assert.equal(harness.ready.some(({ clientSessionId }) => clientSessionId === "slash-neighbor"), true);
+  harness.api.stop();
+});
+
+test("an ambiguous session-mutating slash result is never presented as safe to retry", async () => {
+  const harness = await createHarness();
+  harness.api.ensureSession({ clientSessionId: "slash-writer", profileId: "coder" });
+  await flush();
+  const create = harness.socket.frame("session.create", "coder")!;
+  harness.socket.respond(create.id, { session_id: "live-writer", stored_session_id: "stored-writer" });
+  await flush();
+
+  const command = harness.api.execSlash("slash-writer", "/undo");
+  const frame = harness.socket.frame("slash.exec", "/undo")!;
+  harness.socket.respond(frame.id, { status: "malformed" });
+  await assert.rejects(command, (error: unknown) => isCommitUnconfirmedRpcError(error));
+  assert.deepEqual(harness.socket.closes.at(-1), { code: 4001, reason: "Prompt commit unconfirmed; reload history" });
+  assert.equal(harness.socket.frames("slash.exec", "/undo").length, 1);
+  harness.api.stop();
+});
+
 test("commit_unconfirmed data is ambiguous even when the generic RPC code is used", async () => {
   const harness = await createHarness();
   harness.api.ensureSession({ clientSessionId: "client-reason", profileId: "reviewer" });
@@ -355,6 +449,24 @@ test("commit_unconfirmed data is ambiguous even when the generic RPC code is use
   });
   assert.deepEqual(await submission, { status: "unconfirmed", message: "write acknowledgement lost" });
   assert.equal(harness.socket.frames("prompt.submit", "live-reason").length, 1);
+  harness.api.stop();
+});
+
+test("steer commit_unconfirmed reaches the store as an ambiguity marker", async () => {
+  const harness = await createHarness();
+  harness.api.ensureSession({ clientSessionId: "client-steer", profileId: "reviewer" });
+  await flush();
+  const create = harness.socket.frame("session.create", "reviewer")!;
+  harness.socket.respond(create.id, { session_id: "live-steer", running: true });
+  await flush();
+
+  const steering = harness.api.steer("client-steer", "keep going once");
+  const frame = harness.socket.frame("session.steer", "live-steer")!;
+  harness.socket.respond(frame.id, undefined, {
+    code: -32008, message: "steer acknowledgement lost", data: { reason: "commit_unconfirmed" },
+  });
+  await assert.rejects(steering, (error: unknown) => isCommitUnconfirmedRpcError(error));
+  assert.equal(harness.socket.frames("session.steer", "live-steer").length, 1);
   harness.api.stop();
 });
 
@@ -417,7 +529,9 @@ test("steer never crosses a target generation, release, or transport close", asy
   const staleFrame = harness.socket.frame("session.steer", "live-old")!;
   harness.api.ensureSession({ clientSessionId: "client-race", profileId: "new" });
   harness.socket.respond(staleFrame.id, { status: "queued" });
-  await assert.rejects(stale, /送信先が変更/);
+  await assert.rejects(stale, (error: unknown) => (
+    isCommitUnconfirmedRpcError(error) && /送信先が変更/.test(error.message)
+  ));
   await flush();
   const oldClose = harness.socket.frame("session.close", "live-old")!;
   harness.socket.respond(oldClose.id, { closed: true });
@@ -431,7 +545,9 @@ test("steer never crosses a target generation, release, or transport close", asy
   const closing = harness.api.steer("client-race", "before disconnect");
   assert.ok(harness.socket.frame("session.steer", "live-new"));
   harness.socket.close(1006, "network lost");
-  await assert.rejects(closing, /切断/);
+  await assert.rejects(closing, (error: unknown) => (
+    isCommitUnconfirmedRpcError(error) && /切断/.test(error.message)
+  ));
   assert.equal(harness.socket.sent.filter(({ method }) => method === "session.steer").length, 2);
   harness.api.stop();
 });
@@ -526,9 +642,11 @@ async function createHarness(
   const events: string[] = [];
   const disconnections: string[] = [];
   const errors: Array<{ clientSessionId: string; message: string }> = [];
+  const queued: string[] = [];
   let sequence = 0;
   const callbacks: ChatApiCallbacks = {
     onSocketState() {}, onHistoryLoading() {}, onSessionConnecting() {},
+    onSessionQueued(clientSessionId) { queued.push(clientSessionId); },
     onSessionDisconnected(clientSessionId) { disconnections.push(clientSessionId); },
     onHistoryError(clientSessionId, message) { historyErrors.push({ clientSessionId, message }); },
     onSessionError(clientSessionId, message) { errors.push({ clientSessionId, message }); },
@@ -545,10 +663,10 @@ async function createHarness(
   await flush();
   socket.open();
   await flush();
-  return { api, socket, ready, histories, historyBodies, historyResults, historyErrors, events, errors, disconnections };
+  return { api, socket, ready, queued, histories, historyBodies, historyResults, historyErrors, events, errors, disconnections };
 }
 
-type RpcFrame = { id: string; method: string; params: Record<string, string> };
+type RpcFrame = { id: string; method: string; params: Record<string, boolean | string> };
 
 class FakeWebSocket {
   readyState = WebSocket.CONNECTING;

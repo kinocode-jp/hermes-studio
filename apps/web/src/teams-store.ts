@@ -33,7 +33,8 @@ let teamsApi: TeamsApi | undefined;
 let liveTeamsApi: TeamsApi | undefined;
 let demoRuntimeActive = false;
 let runtimeGeneration = 0;
-let loadFlight: Promise<boolean> | undefined;
+let dataGeneration = 0;
+let loadFlight: { api: TeamsApi; runtime: number; data: number; promise: Promise<boolean> } | undefined;
 
 export function registerTeamsRuntime(api: TeamsApi): void {
   liveTeamsApi = api;
@@ -60,25 +61,32 @@ export function resetTeamsRuntimeState(): void {
 
 function activateRuntime(api: TeamsApi | undefined): void {
   runtimeGeneration += 1;
+  dataGeneration += 1;
   teamsApi = api;
+  // The old request may still settle, but it must not suppress or clear the
+  // first load for this runtime generation.
+  loadFlight = undefined;
   teamMutationBusy.value = false;
   teams.value = [];
 }
 
 export async function refreshTeams(options: { acknowledgeErrors?: boolean } = {}): Promise<boolean> {
-  if (!teamsApi) return false;
+  const api = teamsApi;
+  if (!api) return false;
   const runtime = runtimeGeneration;
+  const data = dataGeneration;
   if (options.acknowledgeErrors) {
     /* no sticky error to clear beyond state */
   }
-  if (loadFlight) return loadFlight;
-  loadFlight = (async () => {
+  const currentFlight = loadFlight;
+  if (currentFlight?.api === api && currentFlight.runtime === runtime && currentFlight.data === data) return currentFlight.promise;
+  const promise = (async () => {
     try {
       if (teamsState.value.state !== "saving") {
         teamsState.value = { state: "loading", message: officeMessage("runtime.teams.loading") };
       }
-      const result = await teamsApi!.list();
-      if (runtime !== runtimeGeneration) return false;
+      const result = await api.list();
+      if (api !== teamsApi || runtime !== runtimeGeneration || data !== dataGeneration) return false;
       teams.value = result.teams;
       if (kanbanTeamFilterId.value && !result.teams.some((team) => team.id === kanbanTeamFilterId.value)) {
         kanbanTeamFilterId.value = "";
@@ -89,27 +97,32 @@ export async function refreshTeams(options: { acknowledgeErrors?: boolean } = {}
       };
       return true;
     } catch {
-      if (runtime !== runtimeGeneration) return false;
+      if (api !== teamsApi || runtime !== runtimeGeneration || data !== dataGeneration) return false;
       teamsState.value = {
         state: "error",
         message: officeMessage("runtime.teams.loadFailed"),
       };
       return false;
-    } finally {
-      loadFlight = undefined;
     }
   })();
-  return loadFlight;
+  const flight = { api, runtime, data, promise };
+  loadFlight = flight;
+  void promise.finally(() => {
+    if (loadFlight === flight) loadFlight = undefined;
+  });
+  return promise;
 }
 
 export async function createTeam(input: CreateTeamInput): Promise<TeamsSubmissionOutcome> {
   if (!teamsApi || teamMutationBusy.value) return "stale";
   const runtime = runtimeGeneration;
+  invalidateTeamLoads();
   teamMutationBusy.value = true;
   teamsState.value = { state: "saving", message: officeMessage("runtime.teams.creating") };
   try {
     const created = await teamsApi.create(input);
     if (runtime !== runtimeGeneration) return "stale";
+    invalidateTeamLoads();
     teams.value = [...teams.value, created];
     teamsState.value = {
       state: "ready",
@@ -118,6 +131,7 @@ export async function createTeam(input: CreateTeamInput): Promise<TeamsSubmissio
     return "success";
   } catch (error) {
     if (runtime !== runtimeGeneration) return "stale";
+    invalidateTeamLoads();
     return applyMutationFailure(error);
   } finally {
     if (runtime === runtimeGeneration) teamMutationBusy.value = false;
@@ -160,12 +174,14 @@ export async function updateTeam(teamId: string, input: UpdateTeamInput): Promis
     createdAt: current.createdAt,
     updatedAt: current.updatedAt,
   };
+  invalidateTeamLoads();
   teamMutationBusy.value = true;
   teams.value = previous.map((team, i) => i === index ? optimistic : team);
   teamsState.value = { state: "saving", message: officeMessage("runtime.teams.updating") };
   try {
     const updated = await teamsApi.update(teamId, input);
     if (runtime !== runtimeGeneration) return "stale";
+    invalidateTeamLoads();
     teams.value = teams.value.map((team) => team.id === teamId ? updated : team);
     teamsState.value = {
       state: "ready",
@@ -174,6 +190,7 @@ export async function updateTeam(teamId: string, input: UpdateTeamInput): Promis
     return "success";
   } catch (error) {
     if (runtime !== runtimeGeneration) return "stale";
+    invalidateTeamLoads();
     teams.value = previous;
     return applyMutationFailure(error);
   } finally {
@@ -191,11 +208,13 @@ export async function updateTeamSettings(
   const index = previous.findIndex((team) => team.id === teamId);
   if (index < 0) return "rejected";
   const current = previous[index]!;
+  invalidateTeamLoads();
   teamMutationBusy.value = true;
   teamsState.value = { state: "saving", message: officeMessage("runtime.teams.updating") };
   try {
     const settings = await teamsApi.updateSettings(teamId, input);
     if (runtime !== runtimeGeneration) return "stale";
+    invalidateTeamLoads();
     teams.value = teams.value.map((team) => team.id === teamId
       ? {
           ...team,
@@ -217,6 +236,7 @@ export async function updateTeamSettings(
     return "success";
   } catch (error) {
     if (runtime !== runtimeGeneration) return "stale";
+    invalidateTeamLoads();
     teams.value = previous;
     return applyMutationFailure(error);
   } finally {
@@ -228,6 +248,7 @@ export async function deleteTeam(teamId: string, expectedRevision: number): Prom
   if (!teamsApi || teamMutationBusy.value) return "stale";
   const runtime = runtimeGeneration;
   const previous = teams.value;
+  invalidateTeamLoads();
   teamMutationBusy.value = true;
   teams.value = previous.filter((team) => team.id !== teamId);
   if (kanbanTeamFilterId.value === teamId) kanbanTeamFilterId.value = "";
@@ -235,6 +256,8 @@ export async function deleteTeam(teamId: string, expectedRevision: number): Prom
   try {
     await teamsApi.remove(teamId, expectedRevision);
     if (runtime !== runtimeGeneration) return "stale";
+    invalidateTeamLoads();
+    teams.value = teams.value.filter((team) => team.id !== teamId);
     teamsState.value = {
       state: "ready",
       message: officeMessage("runtime.teams.count", { count: teams.value.length }),
@@ -242,6 +265,7 @@ export async function deleteTeam(teamId: string, expectedRevision: number): Prom
     return "success";
   } catch (error) {
     if (runtime !== runtimeGeneration) return "stale";
+    invalidateTeamLoads();
     teams.value = previous;
     return applyMutationFailure(error);
   } finally {
@@ -251,6 +275,10 @@ export async function deleteTeam(teamId: string, expectedRevision: number): Prom
 
 export function setKanbanTeamFilter(teamId: string): void {
   kanbanTeamFilterId.value = teamId;
+}
+
+function invalidateTeamLoads(): void {
+  dataGeneration += 1;
 }
 
 /** Teams that include the given Hermes profile (many-to-many). */

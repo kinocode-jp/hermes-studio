@@ -41,7 +41,8 @@ the Tauri native deposit path.
 ## Prerequisites
 
 1. **Host**
-   - Hermes Studio built for production (`npm run build:production`)
+   - Either Hermes Studio built for production (`npm run build:production`) or
+     the packaged macOS app installed for `npm run start:tailnet:desktop`
    - Tailscale installed, logged in, and connected (`tailscale status` shows
      `BackendState: Running`)
    - Tailscale CLI on `PATH` (`tailscale`)
@@ -53,7 +54,8 @@ the Tauri native deposit path.
      PWA from that browser after enrollment
 3. **Secret**
    - A unique random `HERMES_STUDIO_REMOTE_TOKEN` of **at least 32 characters**
-   - Set only in the host environment (shell, process supervisor, or secret store)
+   - Set in the host environment for the initial launch; integrated macOS
+     desktop mode then persists the validated configuration in Keychain
    - Never commit the token, write it into the repo, or log it
 
 ## Quick start
@@ -65,6 +67,25 @@ export HERMES_STUDIO_REMOTE_TOKEN='replace-with-a-random-32+-character-token'
 npm run build:production   # once, or after pulling changes
 npm run start:tailnet
 ```
+
+To use the installed macOS desktop app as the owner of that same remote-enabled
+Office Server, quit Hermes Studio completely first and run:
+
+```bash
+export HERMES_STUDIO_REMOTE_TOKEN='replace-with-a-random-32+-character-token'
+npm run start:tailnet:desktop
+```
+
+This launches `/Applications/Hermes Studio.app` directly with the validated
+Tailnet environment, so the desktop WebView and remote browsers share one Office
+Server on `127.0.0.1:4317`. On this first launch, the desktop app saves the
+validated token, canonical Tailnet origin, trusted proxy-hop count, and remote
+privileged flag as one encrypted macOS Keychain item. Afterward, normal Finder
+or Dock launches restore that configuration automatically; rerun
+`start:tailnet:desktop` only to update or rotate it. Closing the desktop window
+does not quit the macOS app; use **Hermes Studio → Quit Hermes Studio** before
+restarting this mode. Set `HERMES_STUDIO_DESKTOP_EXECUTABLE` to an alternate
+absolute `Contents/MacOS/hermes-studio` path when the app is installed elsewhere.
 
 The launcher:
 
@@ -86,9 +107,10 @@ The launcher:
      `443` → `http://127.0.0.1:4317` → leave as-is (idempotent no-op).
    - Any other mapping, service, port, path, proxy target, Funnel mapping, or
      unrecognized non-empty shape → **fail closed** without overwriting.
-7. Verifies production assets (`apps/web/dist`, `apps/server/dist`) **before**
-   creating any new persistent Serve configuration, so a missing build cannot
-   leave a newly configured proxy behind.
+7. Verifies the selected target **before** creating any new persistent Serve
+   configuration: production assets (`apps/web/dist`, `apps/server/dist`) for
+   `start:tailnet`, or the executable and bundled server/Web UI for
+   `start:tailnet:desktop`.
 8. When Serve was empty, configures persistent private Serve with the current
    CLI syntax (**no** `--yes`; Tailscale may require explicit interactive
    HTTPS/Serve consent):
@@ -98,8 +120,10 @@ The launcher:
    ```
 
    Then re-reads Serve status and requires the exact expected mapping.
-9. Starts the production Office launcher, forwards `SIGINT`/`SIGTERM`, and prints
-   the canonical URL plus mobile steps.
+9. Starts the production Office launcher, or directly starts the packaged
+   desktop executable in desktop mode, forwards `SIGINT`/`SIGTERM`, and prints
+   the canonical URL plus mobile steps. Direct desktop launch is required so
+   the validated environment reaches the desktop-owned Office child.
 
 Open **only** the printed HTTPS origin in the remote browser. Local owner tools
 remain available on the host at `http://127.0.0.1:4317` as before.
@@ -120,7 +144,7 @@ remain available on the host at `http://127.0.0.1:4317` as before.
 
 ## Environment variables
 
-| Variable | Role in `start:tailnet` |
+| Variable | Role in both Tailnet launch modes |
 | --- | --- |
 | `HERMES_STUDIO_REMOTE_TOKEN` | **Required.** One-time enrollment token (≥32 characters). |
 | `HERMES_STUDIO_REMOTE_PRIVILEGED` | **Set to `true` by `start:tailnet`.** Allows authenticated **owner** devices to use Privileged settings and one-shot secret deposit over the private tailnet HTTPS origin. Default is **off** for other launchers. Tailscale is only the network boundary; Office owner-device authentication and CSRF remain mandatory. Managers/operators cannot use this surface. |
@@ -128,6 +152,7 @@ remain available on the host at `http://127.0.0.1:4317` as before.
 | `HERMES_STUDIO_TRUSTED_PROXY_HOPS` | Defaults to `1` (Serve → loopback). Set only if you knowingly insert additional trusted loopback hops. |
 | `HERMES_STUDIO_HOST` | Must stay loopback (`127.0.0.1` / `localhost` / `::1`). Default `127.0.0.1`. |
 | `HERMES_STUDIO_PORT` | Must be `4317` when set. Serve is fixed to that target. |
+| `HERMES_STUDIO_DESKTOP_EXECUTABLE` | Desktop mode only. Optional absolute path to the packaged macOS executable. Defaults to `/Applications/Hermes Studio.app/Contents/MacOS/hermes-studio`. |
 
 Unsupported / fail-closed when using `start:tailnet`:
 
@@ -139,7 +164,12 @@ Unsupported / fail-closed when using `start:tailnet`:
 - `HERMES_STUDIO_ALLOW_NON_LOOPBACK=true` or a non-loopback `HERMES_STUDIO_HOST`
 - `HERMES_STUDIO_PORT` set to anything other than `4317`
 - `HERMES_STUDIO_TRUSTED_PROXY_HOPS` outside `1`–`8`
-- Missing production build assets (checked before creating Serve config)
+- Missing production build assets, or a missing/incomplete packaged desktop app
+  when using desktop mode (checked before creating Serve config)
+- Port `4317` already in use when using desktop mode; quit the existing desktop
+  app completely before relaunching it with the Tailnet environment
+- macOS Keychain cannot save the validated desktop configuration, or a saved
+  configuration is inaccessible, malformed, unsupported, or fails revalidation
 - Existing Tailscale Serve configuration that is not empty and not an exact
   private HTTPS root reverse-proxy for this host on port `443` to
   `http://127.0.0.1:4317` (different ports, paths, targets, services, or
@@ -150,13 +180,16 @@ Unsupported / fail-closed when using `start:tailnet`:
 
 | Current `tailscale serve status --json` | Launcher behavior |
 | --- | --- |
-| Empty / absent | After production asset preflight, creates the Office mapping (may prompt for HTTPS/Serve consent). |
+| Empty / absent | After the selected production or desktop target preflight, creates the Office mapping (may prompt for HTTPS/Serve consent). |
 | Exact Office mapping (host `:443` root → `http://127.0.0.1:4317`, private HTTPS only) | Idempotent: leaves Serve unchanged and continues. |
 | Anything else (other ports/paths/targets, services, Funnel, invalid JSON, unrecognized non-empty shape) | Fails closed; does **not** overwrite. Operator must inspect and, only if appropriate, reset. |
 
-The launcher never writes the enrollment token to disk, never prints it, and does
-not create project-local secret files. Device credentials after enrollment are
-handled by Office itself (see [`SECURITY.md`](SECURITY.md)).
+Neither launcher prints the enrollment token or creates project-local secret
+files. The server-only launcher keeps it in the process environment. Desktop
+mode asks the native app to store the validated configuration as an encrypted
+macOS Keychain generic-password item so later icon launches can restore it;
+invalid or inaccessible saved data fails closed. Device credentials after
+enrollment are handled by Office itself (see [`SECURITY.md`](SECURITY.md)).
 
 ## Networking model
 
@@ -225,6 +258,16 @@ tailscale serve --https=443 off
 tailscale serve reset
 ```
 
+To make future desktop icon launches local-only, remove the saved Keychain
+configuration, then quit and reopen Hermes Studio:
+
+```bash
+npm run forget:tailnet:desktop
+```
+
+This removal command intentionally leaves Tailscale Serve unchanged. Run one of
+the Serve commands above as well when remote proxying should be disabled.
+
 ### Rotate the enrollment token
 
 Token rotation is a **global remote-device reset** (same as non-Tailscale remote
@@ -232,7 +275,8 @@ access):
 
 1. Stop Office.
 2. Set a new random `HERMES_STUDIO_REMOTE_TOKEN`.
-3. Run `npm run start:tailnet` again.
+3. Run the same launcher again: `npm run start:tailnet` or
+   `npm run start:tailnet:desktop`.
 4. Enroll the replacement browser/PWA. Previous remote devices are invalidated.
 
 ### Revoke a device without rotating

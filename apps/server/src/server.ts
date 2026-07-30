@@ -1,4 +1,4 @@
-import { createServer as createHttpServer } from "node:http";
+import { createServer as createHttpServer, type Server as HttpServer } from "node:http";
 import type { AddressInfo } from "node:net";
 import type { EventTopic } from "@hermes-studio/protocol";
 import { WebSocketServer, type WebSocket } from "ws";
@@ -16,9 +16,14 @@ import { ChatSessionCoordinator } from "./chat-session-coordinator.js";
 import { ChatUpstreamHub } from "./chat-upstream-hub.js";
 import { fetchOfficeHistoryPage, HistoryHttpInputError } from "./history-http.js";
 import { routeInventoryHttp } from "./inventory-http.js";
-import { handleSessionDelete, isSessionResourcePath } from "./sessions-http.js";
+import { handleSessionDelete, isSessionResourcePath, SESSION_BULK_DELETE_PATH } from "./sessions-http.js";
 import { handleProfilesHttp, isProfilesHttpPath, isProfilesMutation, profilesOperation } from "./profiles-http.js";
-import { isModelsHttpPath, routeModelsHttp } from "./models-http.js";
+import {
+  isModelsHttpPath,
+  OFFICE_MODELS_LOCAL_CLI_SYNC_PATH,
+  OFFICE_MODELS_REFRESH_PATH,
+  routeModelsHttp,
+} from "./models-http.js";
 import { StaticWebAssets } from "./static-web.js";
 import {
   OFFICE_PROTOCOL_VERSION,
@@ -55,7 +60,18 @@ import { SecretTransferStore } from "./secret-transfer.js";
 import { HostAppManager } from "./host-apps.js";
 import { HermesAgentUpdateManager } from "./hermes-agent-update.js";
 import { ObsidianVaultManager } from "./obsidian-vaults.js";
-import { listHostDirectories } from "./host-fs.js";
+import { OfficeChatModelPreferencesStore } from "./chat-model-preferences.js";
+import {
+  HostFileActionError,
+  listHostDirectories,
+  performHostFileAction,
+  readHostFileAction,
+} from "./host-fs.js";
+
+const TRANSPORT_CLOSE_GRACE_MS = 750;
+const SHUTDOWN_PERSISTENCE_GRACE_MS = 1_500;
+const SHUTDOWN_MANAGER_GRACE_MS = 3_000;
+const SHUTDOWN_RUNTIME_GRACE_MS = 4_250;
 
 export {
   allowedCorsOrigin,
@@ -80,10 +96,22 @@ export interface OfficeServerOptions {
   tokenUsagePath?: string;
   /** Studio-owned skill/MCP/tool usage telemetry JSON path. */
   usageTelemetryPath?: string;
+  /** Studio-owned model preference JSON shared by every authenticated client. */
+  chatModelPreferencesPath?: string;
   maxJsonBytes?: number;
+  /** Chat WebSocket frame cap; defaults to 1 MiB so bounded inline attachments fit. */
+  maxChatJsonBytes?: number;
+  /** Large profile text settings (skills/SOUL/memory) use a separate JSON body cap. */
+  maxSettingsJsonBytes?: number;
   maxResponseJsonBytes?: number;
   maxEventBytes?: number;
   maxWebSocketClients?: number;
+  /** Live chat attachments allowed for one authenticated Studio connection. */
+  maxChatSessionLeasesPerOwner?: number;
+  /** Per-profile share of one connection's live chat attachments. */
+  maxChatSessionLeasesPerProfile?: number;
+  /** Process-wide live chat attachment ceiling across all connections. */
+  maxChatSessionLeasesTotal?: number;
   runtimeSource?: HermesRuntimeSource;
   remoteToken?: string;
   desktopCapability?: string;
@@ -111,9 +139,34 @@ export function createOfficeServer(options: OfficeServerOptions = {}): OfficeSer
   const host = options.host ?? "127.0.0.1";
   const port = options.port ?? 4317;
   const maxJsonBytes = boundedInteger(options.maxJsonBytes, 64 * 1024, 1_024, 1024 * 1024);
+  const maxChatJsonBytes = boundedInteger(
+    options.maxChatJsonBytes,
+    options.maxJsonBytes === undefined ? 1024 * 1024 : maxJsonBytes,
+    4_096,
+    1024 * 1024,
+  );
+  const maxSettingsJsonBytes = boundedInteger(
+    options.maxSettingsJsonBytes,
+    4 * 1024 * 1024,
+    64 * 1024,
+    8 * 1024 * 1024,
+  );
   const maxResponseJsonBytes = boundedInteger(options.maxResponseJsonBytes, 4 * 1024 * 1024, 1024 * 1024, 8 * 1024 * 1024);
   const maxEventBytes = boundedInteger(options.maxEventBytes, 64 * 1024, 1_024, 1024 * 1024);
   const maxWebSocketClients = boundedInteger(options.maxWebSocketClients, 32, 1, 256);
+  const maxChatSessionLeasesPerOwner = boundedInteger(options.maxChatSessionLeasesPerOwner, 16, 1, 128);
+  const maxChatSessionLeasesPerProfile = boundedInteger(
+    options.maxChatSessionLeasesPerProfile,
+    8,
+    1,
+    maxChatSessionLeasesPerOwner,
+  );
+  const maxChatSessionLeasesTotal = boundedInteger(
+    options.maxChatSessionLeasesTotal,
+    256,
+    maxChatSessionLeasesPerOwner,
+    4_096,
+  );
   const effectiveDesktopOrigins = options.desktopOrigins ?? DEFAULT_OFFICE_ORIGINS;
   const desktopCapability = options.desktopCapability;
   const originAllowlist = new Set(makeOriginAllowlist([...(options.allowedOrigins ?? DEFAULT_OFFICE_ORIGINS), ...effectiveDesktopOrigins]));
@@ -121,6 +174,9 @@ export function createOfficeServer(options: OfficeServerOptions = {}): OfficeSer
   const staticWeb = options.staticWebRoot === undefined ? undefined : new StaticWebAssets(options.staticWebRoot);
   const teamsStore = options.teamsStore ?? new OfficeTeamsStore(
     options.teamsPath ?? brandStatePath("teams.json"),
+  );
+  const chatModelPreferences = new OfficeChatModelPreferencesStore(
+    options.chatModelPreferencesPath ?? brandStatePath("chat-model-preferences.json"),
   );
   let publishAudit = (_record: OfficeAuditRecord): void => {};
   const remotePrivilegedEnabled = options.remotePrivilegedEnabled === true;
@@ -144,6 +200,7 @@ export function createOfficeServer(options: OfficeServerOptions = {}): OfficeSer
   }
 
   let sequence = 0;
+  let closeFlight: Promise<void> | undefined;
   const websocketServer = new WebSocketServer({
     noServer: true,
     maxPayload: maxJsonBytes,
@@ -152,7 +209,7 @@ export function createOfficeServer(options: OfficeServerOptions = {}): OfficeSer
   });
   const chatWebSocketServer = new WebSocketServer({
     noServer: true,
-    maxPayload: maxJsonBytes,
+    maxPayload: maxChatJsonBytes,
     perMessageDeflate: false,
     clientTracking: true,
   });
@@ -162,13 +219,17 @@ export function createOfficeServer(options: OfficeServerOptions = {}): OfficeSer
   const chatSocketSessions = new WeakMap<WebSocket, import("./office-auth.js").OfficeAuthSession>();
   const chatSocketAuthGuards = new WeakMap<WebSocket, ChatSocketAuthGuard>();
   const chatDeviceLimiter = new ChatDeviceRateLimiter();
-  const chatSessionCoordinator = new ChatSessionCoordinator();
+  const chatSessionCoordinator = new ChatSessionCoordinator({
+    maxLeasesPerOwner: maxChatSessionLeasesPerOwner,
+    maxLeasesPerProfile: maxChatSessionLeasesPerProfile,
+    maxLeasesTotal: maxChatSessionLeasesTotal,
+  });
   const tokenUsage = options.tokenUsagePath === undefined
     ? undefined
     : new TokenUsageStore(options.tokenUsagePath);
   const chatUpstreamHub = runtimeSource === undefined
     ? undefined
-    : new ChatUpstreamHub(runtimeSource, chatSessionCoordinator, maxJsonBytes, {
+    : new ChatUpstreamHub(runtimeSource, chatSessionCoordinator, maxChatJsonBytes, {
       ...(tokenUsage === undefined ? {} : { usage: tokenUsage }),
     });
   const usageTelemetry = new UsageTelemetryStore({
@@ -394,8 +455,9 @@ export function createOfficeServer(options: OfficeServerOptions = {}): OfficeSer
         return;
       }
       // Secret transfer deposit is desktop-only and does not need Hermes settings.
-      const isSecretDeposit = requestUrl.pathname === "/api/v1/secret-transfers";
-      if (!isSecretDeposit && (runtimeSource?.settings === undefined || runtimeSource.globalSettings === undefined)) {
+      const isStandaloneStudioSetting = requestUrl.pathname === "/api/v1/secret-transfers"
+        || requestUrl.pathname === "/api/v1/settings/chat-model-preferences";
+      if (!isStandaloneStudioSetting && (runtimeSource?.settings === undefined || runtimeSource.globalSettings === undefined)) {
         request.resume();
         writeError(response, 503, "runtime_unavailable", "Hermes settings are unavailable.", maxJsonBytes);
         return;
@@ -414,10 +476,11 @@ export function createOfficeServer(options: OfficeServerOptions = {}): OfficeSer
               ...(runtimeSource.projects === undefined ? {} : { projects: runtimeSource.projects() }),
             }),
           secretTransfers,
+          chatModelPreferences,
           // Server-derived privileged-owner session (never client headers).
           privilegedOwnerSession: auth.allowsPrivilegedSettings(access.session),
         },
-        maxJsonBytes,
+        maxSettingsJsonBytes,
       );
       if (!request.readableEnded) request.resume();
       writeJson(response, result.status, result.body, maxResponseJsonBytes, result.headers ?? {});
@@ -470,6 +533,33 @@ export function createOfficeServer(options: OfficeServerOptions = {}): OfficeSer
       writeJson(response, 202, hostApps.installObsidian(), maxResponseJsonBytes, { "Cache-Control": "no-store" });
       return;
     }
+    if (requestUrl.pathname === "/api/v1/host/fs/open") {
+      if (request.method !== "POST") {
+        if (requestHasBody(request)) request.resume();
+        writeError(response, 405, "bad_request", "Method not allowed.", maxJsonBytes, { Allow: "POST" });
+        return;
+      }
+      const fileAccess = auth.authorizeOperation(request, "host-fs.open", true);
+      if (!fileAccess.allowed) {
+        request.resume();
+        writeAuthorizationError(response, fileAccess.reason, maxJsonBytes);
+        return;
+      }
+      try {
+        const action = await readHostFileAction(request, maxJsonBytes);
+        await performHostFileAction(action.path, action.action);
+        writeJson(response, 200, { ok: true }, maxResponseJsonBytes, { "Cache-Control": "no-store" });
+      } catch (error) {
+        if (!request.readableEnded) request.resume();
+        if (error instanceof HostFileActionError) {
+          const code = error.code === "not_found" ? "not_found" : error.code === "bad_request" ? "bad_request" : "internal_error";
+          writeError(response, error.status, code, error.message, maxJsonBytes);
+        } else {
+          writeError(response, 500, "internal_error", "The local file action failed.", maxJsonBytes);
+        }
+      }
+      return;
+    }
     if (requestUrl.pathname === "/api/v1/host/hermes-agent/update") {
       if (request.method !== "POST") {
         writeError(response, 405, "bad_request", "Method not allowed.", maxJsonBytes, { Allow: "POST" });
@@ -486,6 +576,89 @@ export function createOfficeServer(options: OfficeServerOptions = {}): OfficeSer
         return;
       }
       writeJson(response, 202, hermesAgentUpdate.startUpdate(), maxResponseJsonBytes, { "Cache-Control": "no-store" });
+      return;
+    }
+    if (requestUrl.pathname === "/api/v1/host/hermes-agent/check") {
+      if (request.method !== "POST") {
+        writeError(response, 405, "bad_request", "Method not allowed.", maxJsonBytes, { Allow: "POST" });
+        return;
+      }
+      if (requestHasBody(request)) {
+        request.resume();
+        writeError(response, 413, "bad_request", "Hermes Agent check requests do not accept a body.", maxJsonBytes);
+        return;
+      }
+      const checkAccess = auth.authorizeOperation(request, "hermes-agent.update", true);
+      if (!checkAccess.allowed) {
+        writeAuthorizationError(response, checkAccess.reason, maxJsonBytes);
+        return;
+      }
+      writeJson(response, 200, await hermesAgentUpdate.refresh({ force: true }), maxResponseJsonBytes, { "Cache-Control": "no-store" });
+      return;
+    }
+
+    if (isModelsHttpPath(requestUrl.pathname)) {
+      const refresh = request.method === "POST" && requestUrl.pathname === OFFICE_MODELS_REFRESH_PATH;
+      const localCliSync = request.method === "POST" && requestUrl.pathname === OFFICE_MODELS_LOCAL_CLI_SYNC_PATH;
+      const access = auth.authorizeOperation(
+        request,
+        localCliSync ? "local-model-providers.sync" : refresh ? "chat.message.send" : "state.read",
+        refresh || localCliSync,
+      );
+      if (!access.allowed) {
+        request.resume();
+        writeAuthorizationError(response, access.reason, maxJsonBytes);
+        return;
+      }
+      if (requestHasBody(request)) {
+        request.resume();
+        writeError(response, 413, "bad_request", "Model catalog requests do not accept a body.", maxJsonBytes);
+        return;
+      }
+      const result = await routeModelsHttp(
+        request,
+        requestUrl,
+        runtimeSource?.models === undefined ? undefined : runtimeSource.models(),
+      );
+      writeJson(response, result.status, result.body, maxResponseJsonBytes, result.headers ?? {});
+      return;
+    }
+
+    if (isProfilesHttpPath(requestUrl.pathname)) {
+      const access = auth.authorizeOperation(request, profilesOperation(request.method), isProfilesMutation(request.method));
+      if (!access.allowed) { request.resume(); writeAuthorizationError(response, access.reason, maxJsonBytes); return; }
+      const acceptsBody = request.method === "POST" && requestUrl.pathname === "/api/v1/profiles";
+      if (!acceptsBody && requestHasBody(request)) {
+        request.resume();
+        response.setHeader("Connection", "close");
+        writeError(response, 413, "bad_request", "This profiles request does not accept a body.", maxJsonBytes);
+        return;
+      }
+      await handleProfilesHttp(request, response, requestUrl, runtimeSource, maxJsonBytes, maxResponseJsonBytes);
+      return;
+    }
+
+    if (isSessionResourcePath(requestUrl.pathname)) {
+      const isBulkDelete = requestUrl.pathname === SESSION_BULK_DELETE_PATH;
+      const acceptsBody = isBulkDelete && request.method === "POST";
+      if (!acceptsBody && requestHasBody(request)) {
+        request.resume();
+        response.setHeader("Connection", "close");
+        writeError(response, 413, "bad_request", "This session request does not accept a body.", maxJsonBytes);
+        return;
+      }
+      const expectedMethod = isBulkDelete ? "POST" : "DELETE";
+      if (request.method !== expectedMethod) {
+        if (requestHasBody(request)) request.resume();
+        writeError(response, 405, "bad_request", `Only ${expectedMethod} is supported for this session route.`, maxJsonBytes, { Allow: expectedMethod });
+        return;
+      }
+      const deleteAccess = auth.authorizeOperation(request, "chat.session.archive", true);
+      if (!deleteAccess.allowed) {
+        writeAuthorizationError(response, deleteAccess.reason, maxJsonBytes);
+        return;
+      }
+      await handleSessionDelete(request, response, requestUrl, runtimeSource, maxJsonBytes, maxResponseJsonBytes);
       return;
     }
 
@@ -604,9 +777,7 @@ export function createOfficeServer(options: OfficeServerOptions = {}): OfficeSer
       return;
     }
     if (requestUrl.pathname === "/api/v1/host/hermes-agent") {
-      const force = requestUrl.searchParams.get("force") === "1";
-      const status = await hermesAgentUpdate.refresh({ force });
-      writeJson(response, 200, status, maxResponseJsonBytes, { "Cache-Control": "no-store" });
+      writeJson(response, 200, hermesAgentUpdate.status(), maxResponseJsonBytes, { "Cache-Control": "no-store" });
       return;
     }
 
@@ -643,8 +814,10 @@ export function createOfficeServer(options: OfficeServerOptions = {}): OfficeSer
         return;
       }
       const daysRaw = requestUrl.searchParams.get("days");
-      const days = daysRaw === null || daysRaw === "" ? 30 : Number.parseInt(daysRaw, 10);
-      if (!Number.isFinite(days) || days < 1 || days > 90) {
+      const days = daysRaw === null || daysRaw === ""
+        ? 30
+        : /^\d+$/.test(daysRaw) ? Number(daysRaw) : Number.NaN;
+      if (!Number.isInteger(days) || days < 1 || days > 90) {
         writeError(response, 400, "bad_request", "days must be an integer from 1 to 90.", maxJsonBytes);
         return;
       }
@@ -654,42 +827,6 @@ export function createOfficeServer(options: OfficeServerOptions = {}): OfficeSer
       } catch {
         writeError(response, 500, "internal_error", "Usage statistics are unavailable.", maxJsonBytes);
       }
-      return;
-    }
-
-    if (isModelsHttpPath(requestUrl.pathname)) {
-      const result = await routeModelsHttp(
-        request,
-        requestUrl,
-        runtimeSource?.models === undefined ? undefined : runtimeSource.models(),
-      );
-      writeJson(response, result.status, result.body, maxResponseJsonBytes, result.headers ?? {});
-      return;
-    }
-
-    if (isProfilesHttpPath(requestUrl.pathname)) {
-      const access = auth.authorizeOperation(request, profilesOperation(request.method), isProfilesMutation(request.method));
-      if (!access.allowed) { request.resume(); writeAuthorizationError(response, access.reason, maxJsonBytes); return; }
-      await handleProfilesHttp(request, response, requestUrl, runtimeSource, maxJsonBytes, maxResponseJsonBytes);
-      return;
-    }
-
-    if (isSessionResourcePath(requestUrl.pathname)) {
-      if (request.method !== "DELETE") {
-        writeError(response, 405, "bad_request", "Only DELETE is supported for this session route.", maxJsonBytes, { Allow: "DELETE" });
-        return;
-      }
-      if (requestHasBody(request)) {
-        request.resume();
-        writeError(response, 413, "bad_request", "DELETE request bodies are not accepted.", maxJsonBytes);
-        return;
-      }
-      const deleteAccess = auth.authorizeOperation(request, "chat.session.archive", true);
-      if (!deleteAccess.allowed) {
-        writeAuthorizationError(response, deleteAccess.reason, maxJsonBytes);
-        return;
-      }
-      await handleSessionDelete(response, requestUrl, runtimeSource, maxJsonBytes, maxResponseJsonBytes);
       return;
     }
 
@@ -805,7 +942,7 @@ export function createOfficeServer(options: OfficeServerOptions = {}): OfficeSer
     const authGuard = chatSocketAuthGuards.get(client);
     if (officeSession === undefined || authGuard === undefined) { client.close(1008, "Studio session unavailable"); return; }
     handleOfficeChatConnection(client, {
-      auth, officeSession, runtimeSource, maxJsonBytes, deviceLimiter: chatDeviceLimiter, sessionCoordinator: chatSessionCoordinator, chatHub: chatUpstreamHub,
+      auth, officeSession, runtimeSource, maxJsonBytes: maxChatJsonBytes, deviceLimiter: chatDeviceLimiter, sessionCoordinator: chatSessionCoordinator, chatHub: chatUpstreamHub,
       usageTelemetry,
       sessionIsActive: authGuard.isActive, invalidationSignal: authGuard.signal,
     });
@@ -831,29 +968,34 @@ export function createOfficeServer(options: OfficeServerOptions = {}): OfficeSer
         });
       }),
     close: () => {
+      if (closeFlight !== undefined) return closeFlight;
       unsubscribeRuntimeStatus?.();
-      hostApps.close();
-      hermesAgentUpdate.close();
+      const persistenceClose = Promise.allSettled([
+        tokenUsage?.flush().catch(() => undefined),
+        usageTelemetry.flush().catch(() => undefined),
+        auth.flushRegistryWrites(),
+      ]).then(() => undefined);
+      const hostManagerClose = Promise.allSettled([
+        hostApps.close(),
+        hermesAgentUpdate.close(),
+      ]).then(() => undefined);
       const runtimeClose = runtimeSource?.close();
-      const serverClose = new Promise<void>((resolve, reject) => {
-        for (const client of websocketServer.clients) {
-          client.close(1001, "Server shutting down");
-        }
-        for (const client of chatWebSocketServer.clients) client.close(1001, "Server shutting down");
-        websocketServer.close(() => {
-          chatWebSocketServer.close(() => {
-            httpServer.close((error) => {
-              if (error) { reject(error); return; }
-              resolve();
-            });
-          });
-        });
-      }).then(async () => {
-        await chatUpstreamHub?.close();
-        await tokenUsage?.flush().catch(() => undefined);
-        await auth.flushRegistryWrites();
+      const transportClose = Promise.all([
+        closeWebSocketServer(websocketServer, TRANSPORT_CLOSE_GRACE_MS),
+        closeWebSocketServer(chatWebSocketServer, TRANSPORT_CLOSE_GRACE_MS),
+        closeHttpServer(httpServer, TRANSPORT_CLOSE_GRACE_MS),
+      ]).then(() => undefined);
+      const flight = Promise.allSettled([
+        transportClose,
+        settleBestEffort(chatUpstreamHub?.close(), SHUTDOWN_PERSISTENCE_GRACE_MS),
+        settleBestEffort(persistenceClose, SHUTDOWN_PERSISTENCE_GRACE_MS),
+        settleBestEffort(hostManagerClose, SHUTDOWN_MANAGER_GRACE_MS),
+        settleBestEffort(runtimeClose, SHUTDOWN_RUNTIME_GRACE_MS),
+      ]).then(() => {
+        secretTransfers.clear();
       });
-      return Promise.all([serverClose, runtimeClose]).then(() => undefined);
+      closeFlight = flight;
+      return flight;
     },
     broadcast: <T>(topic: EventTopic, payload: T, aggregateId?: string): boolean => {
       const event = makeEvent(++sequence, topic, payload, aggregateId);
@@ -864,6 +1006,61 @@ export function createOfficeServer(options: OfficeServerOptions = {}): OfficeSer
       return sent;
     },
   };
+}
+
+function settleBestEffort(operation: Promise<unknown> | undefined, timeoutMs: number): Promise<void> {
+  if (operation === undefined) return Promise.resolve();
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve();
+    };
+    const timer = setTimeout(finish, timeoutMs);
+    operation.then(finish, finish);
+  });
+}
+
+function closeWebSocketServer(server: WebSocketServer, graceMs: number): Promise<void> {
+  for (const client of server.clients) client.close(1001, "Server shutting down");
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(forceTimer);
+      clearTimeout(settlementTimer);
+      resolve();
+    };
+    const forceTimer = setTimeout(() => {
+      for (const client of server.clients) client.terminate();
+    }, graceMs);
+    const settlementTimer = setTimeout(finish, graceMs + 250);
+    try { server.close(finish); } catch { finish(); }
+  });
+}
+
+function closeHttpServer(server: HttpServer, graceMs: number): Promise<void> {
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(forceTimer);
+      clearTimeout(settlementTimer);
+      resolve();
+    };
+    const forceTimer = setTimeout(() => server.closeAllConnections(), graceMs);
+    const settlementTimer = setTimeout(finish, graceMs + 250);
+    try {
+      server.close(() => finish());
+      server.closeIdleConnections();
+    } catch {
+      finish();
+    }
+  });
 }
 
 class TokenUsageHttpInputError extends Error {}

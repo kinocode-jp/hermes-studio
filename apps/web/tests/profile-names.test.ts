@@ -12,6 +12,7 @@ Object.defineProperty(globalThis, "localStorage", { value: storage, configurable
 
 const {
   ensurePokemonDisplayNames,
+  displayProfileReferences,
   forgetProfileDisplayName,
   profileDisplayName,
   profileSecondaryName,
@@ -64,6 +65,39 @@ test("default profile accepts embedded displayName overlays", () => {
   assert.equal(
     profileSecondaryName({ id: "default", name: "default", displayName: "Main desk" }),
     "default",
+  );
+});
+
+test("common profile names require an explicit @ reference in prose", () => {
+  const profiles = [{ id: "default", name: "default", displayName: "受付" }];
+  assert.equal(displayProfileReferences("Use the default value.", profiles), "Use the default value.");
+  assert.equal(displayProfileReferences("Ask @default next.", profiles), "Ask 受付（default） next.");
+});
+
+test("profile reference display preserves copy-sensitive paths, URLs, and filenames", () => {
+  const profiles = [{ id: "haunter", name: "haunter", displayName: "ゴースト" }];
+  assert.equal(
+    displayProfileReferences(
+      "Ask haunter. Read /profiles/haunter/config, haunter.md, and https://haunter.example/@haunter.",
+      profiles,
+    ),
+    "Ask ゴースト（haunter）. Read /profiles/haunter/config, haunter.md, and https://haunter.example/@haunter.",
+  );
+});
+
+test("profile reference display is single-pass when one alias names another profile", () => {
+  const profiles = [
+    { id: "alpha", name: "alpha", displayName: "beta" },
+    { id: "beta", name: "beta", displayName: "gamma" },
+  ];
+  assert.equal(displayProfileReferences("Ask alpha.", profiles), "Ask beta（alpha）.");
+});
+
+test("already formatted references stay single when the canonical name is emphasized", () => {
+  const profiles = [{ id: "haunter", name: "haunter", displayName: "ゴースト" }];
+  assert.equal(
+    displayProfileReferences("ゴースト（**haunter**）", profiles),
+    "ゴースト（**haunter**）",
   );
 });
 

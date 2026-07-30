@@ -33,7 +33,12 @@ test("Office Server settings API requires authentication and CSRF on writes", as
     settings: () => settings,
     globalSettings: () => global,
   };
-  const server = createOfficeServer({ port: 0, runtimeSource: runtime, allowedOrigins: ["http://localhost:4173"] });
+  const server = createOfficeServer({
+    port: 0,
+    runtimeSource: runtime,
+    allowedOrigins: ["http://localhost:4173"],
+    chatModelPreferencesPath: join(directory, "chat-model-preferences.json"),
+  });
   const address = await server.listen();
   t.after(() => server.close());
   const origin = `http://127.0.0.1:${address.port}`;
@@ -46,6 +51,39 @@ test("Office Server settings API requires authentication and CSRF on writes", as
   assert.equal(bootstrap.status, 200);
   const session = await bootstrap.json() as { csrfToken: string };
   const cookie = (bootstrap.headers.get("set-cookie") ?? "").split(";")[0]!;
+
+  const emptyModelPreferences = await fetch(`${origin}/api/v1/settings/chat-model-preferences`, {
+    headers: { Origin: browserOrigin, Cookie: cookie },
+  });
+  assert.equal(emptyModelPreferences.status, 200);
+  assert.equal((await emptyModelPreferences.json() as { revision: number }).revision, 0);
+
+  const modelDocument = {
+    main: { provider: "openai-codex", model: "gpt-5.6-luna", reasoningEffort: "high" },
+    sub: { provider: "", model: "", reasoningEffort: "" },
+    presets: [],
+  };
+  const modelPreferencesWithoutCsrf = await fetch(`${origin}/api/v1/settings/chat-model-preferences`, {
+    method: "PUT",
+    headers: { Origin: browserOrigin, Cookie: cookie, "Content-Type": "application/json" },
+    body: JSON.stringify({ expectedRevision: 0, document: modelDocument }),
+  });
+  assert.equal(modelPreferencesWithoutCsrf.status, 403);
+
+  const savedModelPreferences = await fetch(`${origin}/api/v1/settings/chat-model-preferences`, {
+    method: "PUT",
+    headers: { Origin: browserOrigin, Cookie: cookie, "Content-Type": "application/json", "X-CSRF-Token": session.csrfToken },
+    body: JSON.stringify({ expectedRevision: 0, document: modelDocument }),
+  });
+  assert.equal(savedModelPreferences.status, 200);
+  assert.equal((await savedModelPreferences.json() as { revision: number }).revision, 1);
+
+  const staleModelPreferences = await fetch(`${origin}/api/v1/settings/chat-model-preferences`, {
+    method: "PUT",
+    headers: { Origin: browserOrigin, Cookie: cookie, "Content-Type": "application/json", "X-CSRF-Token": session.csrfToken },
+    body: JSON.stringify({ expectedRevision: 0, document: modelDocument }),
+  });
+  assert.equal(staleModelPreferences.status, 409);
 
   const readable = await fetch(`${origin}/api/v1/profiles/coder/memory`, {
     headers: { Origin: browserOrigin, Cookie: cookie },
@@ -133,6 +171,8 @@ test("raw memory file GETs map to memory.update and are denied without that auth
   assert.equal(settingsOperation("GET", "/api/v1/profiles/coder/secrets"), "privileged-config.read");
   assert.equal(settingsOperation("POST", "/api/v1/profiles/coder/secrets"), "secret.write");
   assert.equal(settingsOperation("POST", "/api/v1/secret-transfers"), "secret.write");
+  assert.equal(settingsOperation("GET", "/api/v1/settings/chat-model-preferences"), "state.read");
+  assert.equal(settingsOperation("PUT", "/api/v1/settings/chat-model-preferences"), "chat-model-preferences.update");
   // Official Hermes Projects: reads stay on state.read; bindings change the
   // profile workspace and share the profile.update manager/step-up boundary.
   assert.equal(settingsOperation("GET", "/api/v1/profiles/coder/projects"), "state.read");
@@ -145,6 +185,10 @@ test("raw memory file GETs map to memory.update and are denied without that auth
   assert.equal(OPERATION_POLICIES["memory.update"].boundary, "step-up-required");
   assert.equal(OPERATION_POLICIES["profile-config.update"].minimumTier, "manager");
   assert.equal(OPERATION_POLICIES["profile-config.update"].boundary, "step-up-required");
+  assert.equal(OPERATION_POLICIES["chat-model-preferences.update"].minimumTier, "operator");
+  assert.equal(OPERATION_POLICIES["chat-model-preferences.update"].boundary, "remote-safe");
+  assert.equal(OPERATION_POLICIES["local-model-providers.sync"].minimumTier, "operator");
+  assert.equal(OPERATION_POLICIES["local-model-providers.sync"].boundary, "remote-safe");
   for (const operation of ["team.create", "team.update", "team.delete"] as const) {
     assert.equal(OPERATION_POLICIES[operation].minimumTier, "manager");
     assert.equal(OPERATION_POLICIES[operation].boundary, "step-up-required");
@@ -283,14 +327,15 @@ function makeSettingsAdapter(
     listSkills: async () => skills,
     setSkillEnabled: async () => undefined,
     getSkillContent: async (_profile, name) => ({ name, content: "", redacted: false, revision: REVISION }),
-    updateSkillContent: async () => undefined,
+    updateSkillContent: async (_profile, name, content) => ({ name, content, redacted: false, revision: REVISION }),
     getMemoryStatus: async () => memory(),
     setMemoryProvider: async (_profile, provider, expected) => {
       if (expected !== getProvider()) throw new Error("conflict");
       setProvider(provider);
+      return memory();
     },
     getMemoryProviderConfig: async (_profile, name) => ({ name, label: name, fields: [], revision: REVISION }),
-    updateMemoryProviderConfig: async () => undefined,
+    updateMemoryProviderConfig: async (_profile, name) => ({ name, label: name, fields: [], revision: REVISION }),
     getBuiltinMemoryFiles: async (profile) => {
       onFilesRead?.();
       return emptyFiles(profile);
@@ -298,9 +343,10 @@ function makeSettingsAdapter(
     updateBuiltinMemoryFile: async () => { throw new Error("must not be called"); },
     resetBuiltinMemory: async (profile, target) => {
       resetCalls.push({ profile, target });
+      return { files: emptyFiles(profile), status: memory() };
     },
     getProfileSoul: async (profile) => ({ ...soul, profile }),
-    updateProfileSoul: async () => undefined,
+    updateProfileSoul: async (profile, content) => ({ ...soul, profile, content }),
     getProfileConfigSchema: async (profile) => ({
       profile,
       categories: ["general"],

@@ -89,11 +89,254 @@ test("shared hub preserves native targets, merges unseen aliases, and routes onl
   hermes.emit({ type: "message.delta", sessionId: "live-main", payload: { text: "still A" } });
   assert.equal(a.events("live-main").at(-1)?.payload?.text, "still A");
 
+  hermes.emit({
+    type: "message.start",
+    sessionId: "live-main",
+    payload: { eventId: "upstream-event", messageId: "correlated-reply" },
+  });
+  hermes.emit({ type: "tool.start", sessionId: "live-main", payload: { name: "First" } });
+  hermes.emit({ type: "tool.start", sessionId: "live-main", payload: { name: "Second" } });
+  hermes.emit({ type: "tool.complete", sessionId: "live-main", payload: { name: "First", summary: "first done" } });
+  hermes.emit({ type: "tool.complete", sessionId: "live-main", payload: { name: "Second", summary: "second done" } });
+  hermes.emit({ type: "message.complete", sessionId: "live-main", payload: { messageId: "correlated-reply", text: "done" } });
+  const correlated = a.events("live-main").slice(-6);
+  assert.equal(typeof correlated[0]?.payload?.eventId, "string");
+  assert.notEqual(correlated[0]?.payload?.eventId, "upstream-event", "upstream ids cannot bypass Office correlation");
+  assert.equal(correlated[0]?.payload?.upstreamEventId, "upstream-event");
+  assert.equal(typeof correlated[0]?.payload?.eventSequence, "number");
+  assert.equal(typeof correlated[0]?.payload?.correlationEpoch, "string");
+  assert.equal(correlated[0]?.payload?.runId, correlated[5]?.payload?.runId);
+  assert.equal(correlated[0]?.payload?.runSequence, correlated[5]?.payload?.runSequence);
+  assert.notEqual(correlated[1]?.payload?.toolOccurrenceId, correlated[2]?.payload?.toolOccurrenceId);
+  assert.equal(correlated[1]?.payload?.toolOccurrenceId, correlated[3]?.payload?.toolOccurrenceId);
+  assert.equal(correlated[2]?.payload?.toolOccurrenceId, correlated[4]?.payload?.toolOccurrenceId);
+  const completedRunId = correlated[5]?.payload?.runId;
+  hermes.emit({
+    type: "message.delta",
+    sessionId: "live-main",
+    payload: { messageId: "correlated-reply", text: "unknown completed-source frame" },
+  });
+  assert.equal(
+    a.events("live-main").at(-1)?.payload?.status,
+    "resync_required",
+    "an unseen frame cannot reuse the source id of a completed run",
+  );
+  hermes.emit({ type: "message.start", sessionId: "live-main", payload: {} });
+  hermes.emit({ type: "message.complete", sessionId: "live-main", payload: { text: "anonymous history" } });
+  hermes.emit({ type: "message.delta", sessionId: "live-main", payload: { text: "unknown anonymous idle frame" } });
+  assert.equal(
+    a.events("live-main").at(-1)?.payload?.status,
+    "resync_required",
+    "an unseen id-less frame cannot be assigned to the most recent anonymous completed run",
+  );
+  hermes.emit({ type: "message.start", sessionId: "live-main", payload: { messageId: "correlated-reply" } });
+  assert.equal(a.events("live-main").at(-1)?.payload?.runId, completedRunId, "a delayed start reuses its terminal run id");
+  a.rpc(31, "prompt.submit", { session_id: "live-main", text: "new run" });
+  await settle();
+  hermes.emit({ type: "message.delta", sessionId: "live-main", payload: { messageId: "correlated-reply", text: "delayed old delta" } });
+  assert.equal(a.events("live-main").at(-1)?.payload?.status, "resync_required", "a delayed delta cannot claim a prepared run");
+  hermes.emit({ type: "message.start", sessionId: "live-main", payload: { messageId: "correlated-reply-new" } });
+  assert.notEqual(a.events("live-main").at(-1)?.payload?.runId, completedRunId, "an accepted prompt reserves a fresh run id");
+  hermes.emit({ type: "message.delta", sessionId: "live-main", payload: { text: "delayed anonymous delta" } });
+  assert.equal(
+    a.events("live-main").at(-1)?.payload?.status,
+    "resync_required",
+    "an id-less frame cannot join an observed run after anonymous completed history exists",
+  );
+  hermes.emit({ type: "tool.start", sessionId: "live-main", payload: { name: "First" } });
+  assert.equal(
+    a.events("live-main").at(-1)?.payload?.status,
+    "resync_required",
+    "a completed anonymous tool start cannot be replayed into an observed run",
+  );
+  hermes.emit({
+    type: "tool.progress",
+    sessionId: "live-main",
+    payload: { name: "DelayedAnonymous", status: "late progress" },
+  });
+  assert.equal(
+    a.events("live-main").at(-1)?.payload?.status,
+    "resync_required",
+    "an unmatched anonymous frame cannot establish a new occurrence after anonymous history exists",
+  );
+  hermes.emit({ type: "tool.start", sessionId: "live-main", payload: { toolId: "explicit-tool", name: "Shell" } });
+  hermes.emit({ type: "tool.complete", sessionId: "live-main", payload: { toolId: "explicit-tool", name: "Shell", summary: "done" } });
+  const completedToolEvent = a.events("live-main").at(-1)!;
+  hermes.emit({ type: "tool.progress", sessionId: "live-main", payload: { toolId: "explicit-tool", name: "Shell", status: "unexpected new frame" } });
+  assert.equal(
+    a.events("live-main").at(-1)?.payload?.status,
+    "resync_required",
+    "an unseen frame cannot reuse the id of a completed occurrence",
+  );
+  hermes.emit({ type: "tool.start", sessionId: "live-main", payload: { toolId: "repeat-1", name: "Repeat" } });
+  const firstRepeatedToolStart = a.events("live-main").at(-1)!;
+  hermes.emit({ type: "tool.complete", sessionId: "live-main", payload: { toolId: "repeat-1", name: "Repeat", summary: "first repeat done" } });
+  hermes.emit({ type: "tool.start", sessionId: "live-main", payload: { toolId: "repeat-2", name: "Repeat" } });
+  const secondRepeatedToolStart = a.events("live-main").at(-1)!;
+  assert.notEqual(
+    firstRepeatedToolStart.payload?.toolOccurrenceId,
+    secondRepeatedToolStart.payload?.toolOccurrenceId,
+    "sequential same-name tools with stable call ids remain distinct valid occurrences",
+  );
+  assert.notEqual(secondRepeatedToolStart.payload?.status, "resync_required");
+  hermes.emit({ type: "tool.complete", sessionId: "live-main", payload: { toolId: "repeat-2", name: "Repeat", summary: "second repeat done" } });
+  hermes.emit({
+    type: "tool.start",
+    sessionId: "live-main",
+    payload: { toolId: "phase-call-1", toolIds: ["phase-call-1", "phase-shared"], name: "Phased" },
+  });
+  const firstPhaseStart = a.events("live-main").at(-1)!;
+  hermes.emit({
+    type: "tool.progress",
+    sessionId: "live-main",
+    payload: { toolId: "phase-shared", toolIds: ["phase-shared"], name: "Phased", status: "working" },
+  });
+  assert.equal(
+    a.events("live-main").at(-1)?.payload?.toolOccurrenceId,
+    firstPhaseStart.payload?.toolOccurrenceId,
+    "a later phase may identify the same tool through a secondary alias",
+  );
+  hermes.emit({
+    type: "tool.complete",
+    sessionId: "live-main",
+    payload: { toolId: "phase-shared", toolIds: ["phase-shared"], name: "Phased", summary: "phase one done" },
+  });
+  assert.equal(a.events("live-main").at(-1)?.payload?.toolOccurrenceId, firstPhaseStart.payload?.toolOccurrenceId);
+  hermes.emit({
+    type: "tool.start",
+    sessionId: "live-main",
+    payload: { toolId: "phase-call-2", toolIds: ["phase-call-2", "phase-shared"], name: "Phased" },
+  });
+  const secondPhaseStart = a.events("live-main").at(-1)!;
+  assert.notEqual(secondPhaseStart.payload?.toolOccurrenceId, firstPhaseStart.payload?.toolOccurrenceId);
+  hermes.emit({
+    type: "tool.complete",
+    sessionId: "live-main",
+    payload: { toolId: "phase-shared", toolIds: ["phase-shared"], name: "Phased", summary: "phase two done" },
+  });
+  assert.equal(
+    a.events("live-main").at(-1)?.payload?.toolOccurrenceId,
+    secondPhaseStart.payload?.toolOccurrenceId,
+    "an open occurrence wins over a completed call that shares only a secondary alias",
+  );
+  hermes.emit({ type: "tool.start", sessionId: "live-main", payload: { toolId: "unlinked-open", name: "Unlinked" } });
+  hermes.emit({
+    type: "tool.progress",
+    sessionId: "live-main",
+    payload: { toolId: "unlinked-new", name: "Unlinked", status: "working" },
+  });
+  assert.equal(
+    a.events("live-main").at(-1)?.payload?.status,
+    "resync_required",
+    "a new stable id cannot be joined to an open occurrence by name alone",
+  );
+  hermes.emit({
+    type: "tool.start",
+    sessionId: "live-main",
+    payload: { toolId: "collision-old", toolIds: ["collision-old", "collision-shared"], name: "Collision" },
+  });
+  hermes.emit({
+    type: "tool.complete",
+    sessionId: "live-main",
+    payload: { toolId: "collision-shared", toolIds: ["collision-shared"], name: "Collision", summary: "old done" },
+  });
+  hermes.emit({ type: "tool.start", sessionId: "live-main", payload: { toolId: "collision-new" } });
+  hermes.emit({
+    type: "tool.complete",
+    sessionId: "live-main",
+    payload: { toolId: "collision-shared", toolIds: ["collision-shared"], name: "Collision", summary: "ambiguous done" },
+  });
+  assert.equal(
+    a.events("live-main").at(-1)?.payload?.status,
+    "resync_required",
+    "a completed alias cannot claim an active occurrence whose start omitted its name",
+  );
+  hermes.emit({ type: "tool.start", sessionId: "live-main", payload: { toolId: "duplicate-start", name: "Duplicate" } });
+  hermes.emit({ type: "tool.start", sessionId: "live-main", payload: { toolId: "duplicate-start", name: "Duplicate" } });
+  assert.equal(
+    a.events("live-main").at(-1)?.payload?.status,
+    "resync_required",
+    "a repeated stable-id start fails closed because a concurrent reused id is indistinguishable from replay",
+  );
+  hermes.emit({ type: "tool.start", sessionId: "live-main", payload: { name: "AnonymousAlpha" } });
+  hermes.emit({ type: "tool.start", sessionId: "live-main", payload: { name: "AnonymousBeta" } });
+  hermes.emit({ type: "tool.progress", sessionId: "live-main", payload: { status: "unknown anonymous target" } });
+  assert.equal(
+    a.events("live-main").at(-1)?.payload?.status,
+    "resync_required",
+    "a nameless anonymous frame cannot select among multiple open occurrences",
+  );
+  hermes.emit({ type: "tool.start", sessionId: "live-main", payload: { name: "TrulyAnonymous" } });
+  hermes.emit({ type: "tool.complete", sessionId: "live-main", payload: { name: "TrulyAnonymous", summary: "anonymous done" } });
+  hermes.emit({ type: "tool.start", sessionId: "live-main", payload: { name: "TrulyAnonymous" } });
+  assert.equal(
+    a.events("live-main").at(-1)?.payload?.status,
+    "resync_required",
+    "an identical anonymous start fails closed when no stable call id can disambiguate it",
+  );
+  hermes.emit({ type: "message.complete", sessionId: "live-main", payload: { messageId: "correlated-reply-new", text: "new done" } });
+  a.rpc(32, "prompt.submit", { session_id: "live-main", text: "another run" });
+  await settle();
+  hermes.emit({ type: "tool.complete", sessionId: "live-main", payload: { toolId: "explicit-tool", name: "Shell", summary: "done" } });
+  const delayedToolEvent = a.events("live-main").at(-1)!;
+  assert.equal(delayedToolEvent.payload?.toolOccurrenceId, completedToolEvent.payload?.toolOccurrenceId);
+  assert.equal(delayedToolEvent.payload?.runId, completedToolEvent.payload?.runId);
+  hermes.emit({ type: "tool.start", sessionId: "live-main", payload: { toolId: "explicit-tool", name: "Shell" } });
+  assert.equal(a.events("live-main").at(-1)?.payload?.status, "resync_required", "a reused tool id with old and new candidates fails closed");
+
   b.rpc(23, "session.resume", { session_id: "profile-collision", profile: "reviewer" });
   await settle();
   assert.equal(b.errorCode(23), -32006, "cross-profile native live collisions stay with the existing owner");
   assert.equal(a.closed, undefined);
   assert.equal(b.closed, undefined);
+
+  hermes.emit({ type: "message.start", sessionId: "live-b", payload: { messageId: "message-shared" } });
+  hermes.emit({ type: "message.complete", sessionId: "live-b", payload: { messageId: "message-shared", text: "old alias run" } });
+  b.rpc(41, "prompt.submit", { session_id: "live-b", text: "message alias run" });
+  await settle();
+  assert.equal(b.errorCode(41), undefined);
+  hermes.emit({
+    type: "message.start",
+    sessionId: "live-b",
+    payload: { messageId: "message-call-2", messageIds: ["message-call-2", "message-shared"] },
+  });
+  const aliasedMessageStart = b.events("live-b").at(-1)!;
+  hermes.emit({ type: "message.delta", sessionId: "live-b", payload: { messageId: "message-shared", text: "aliased delta" } });
+  assert.equal(b.events("live-b").at(-1)?.payload?.runId, aliasedMessageStart.payload?.runId);
+  assert.equal(
+    b.events("live-b").at(-1)?.payload?.messageOccurrenceId,
+    aliasedMessageStart.payload?.messageOccurrenceId,
+  );
+  assert.notEqual(b.events("live-b").at(-1)?.payload?.status, "resync_required");
+  hermes.emit({
+    type: "message.complete",
+    sessionId: "live-b",
+    payload: { messageId: "message-call-2", messageIds: ["message-call-2", "message-shared"], text: "alias run done" },
+  });
+
+  b.rpc(42, "prompt.submit", { session_id: "live-b", text: "disjoint start run" });
+  await settle();
+  assert.equal(b.errorCode(42), undefined);
+  hermes.emit({ type: "message.start", sessionId: "live-b", payload: { messageId: "message-start-a" } });
+  hermes.emit({ type: "message.start", sessionId: "live-b", payload: { messageId: "message-start-b" } });
+  assert.equal(
+    b.events("live-b").at(-1)?.payload?.status,
+    "resync_required",
+    "a disjoint second message start cannot join the active run",
+  );
+  hermes.emit({ type: "message.complete", sessionId: "live-b", payload: { messageId: "message-start-a", text: "first start done" } });
+
+  hermes.emit({ type: "message.start", sessionId: "live-b", payload: {} });
+  b.rpc(40, "prompt.submit", { session_id: "live-b", text: "replace anonymous run" });
+  await settle();
+  assert.equal(b.errorCode(40), undefined);
+  hermes.emit({ type: "message.start", sessionId: "live-b", payload: { messageId: "live-b-next" } });
+  hermes.emit({ type: "message.delta", sessionId: "live-b", payload: { text: "delayed abandoned anonymous delta" } });
+  assert.equal(
+    b.events("live-b").at(-1)?.payload?.status,
+    "resync_required",
+    "replacing an unfinished anonymous run preserves its history fence",
+  );
 
   hermes.emit({
     type: "approval.request", sessionId: "live-b",
@@ -112,8 +355,39 @@ test("shared hub preserves native targets, merges unseen aliases, and routes onl
   assert.ok(hermes.sessionCloseRequests.includes("live-created-1"));
   assert.equal(hermes.isLive("live-b"), false);
   assert.equal(hermes.isLive("live-main"), true);
-  hermes.emit({ type: "message.delta", sessionId: "live-main", payload: { text: "A survives B" } });
+  hermes.emit({ type: "message.start", sessionId: "live-main", payload: { messageId: "third-source" } });
+  hermes.emit({ type: "message.delta", sessionId: "live-main", payload: { messageId: "third-source", text: "A survives B" } });
   assert.equal(a.events("live-main").at(-1)?.payload?.text, "A survives B");
+  hermes.emit({ type: "message.start", sessionId: "live-main", payload: {} });
+  hermes.emit({ type: "message.complete", sessionId: "live-main", payload: { messageId: "third-source", text: "third done" } });
+  hermes.emit({ type: "message.complete", sessionId: "live-main", payload: { messageId: "correlated-reply", text: "done" } });
+  assert.equal(
+    a.events("live-main").at(-1)?.payload?.runId,
+    completedRunId,
+    "a terminal replay remains correlated after multiple later runs",
+  );
+  a.rpc(33, "prompt.submit", { session_id: "live-main", text: "ambiguous reused source" });
+  await settle();
+  hermes.emit({ type: "message.start", sessionId: "live-main", payload: {} });
+  assert.equal(a.events("live-main").at(-1)?.payload?.status, "resync_required", "an id-less start fails closed when an older id-less start exists");
+  hermes.emit({ type: "message.start", sessionId: "live-main", payload: { messageId: "third-source" } });
+  assert.equal(a.events("live-main").at(-1)?.payload?.status, "resync_required", "a reused source during an unobserved prompt run fails closed");
+  hermes.emit({ type: "tool.start", sessionId: "live-main", payload: { name: "Same" } });
+  hermes.emit({ type: "tool.start", sessionId: "live-main", payload: { name: "Same" } });
+  assert.equal(a.events("live-main").at(-1)?.payload?.status, "resync_required");
+  hermes.emit({ type: "message.start", sessionId: "live-main", payload: { messageId: "retention-bootstrap" } });
+  hermes.emit({ type: "message.complete", sessionId: "live-main", payload: { messageId: "retention-bootstrap", text: "bootstrap done" } });
+  for (let index = 0; index < 70; index += 1) {
+    const messageId = `retention-${index}`;
+    hermes.emit({ type: "message.start", sessionId: "live-main", payload: { messageId } });
+    hermes.emit({ type: "message.complete", sessionId: "live-main", payload: { messageId, text: `done-${index}` } });
+  }
+  hermes.emit({ type: "message.start", sessionId: "live-main", payload: { messageId: "retention-0" } });
+  assert.equal(
+    a.events("live-main").at(-1)?.payload?.status,
+    "resync_required",
+    "the replay fence remains fail-closed after the recent completed-run window evicts an occurrence",
+  );
 });
 
 test("a duplicate live close failure resets the shared generation and terminalizes existing owners", async () => {

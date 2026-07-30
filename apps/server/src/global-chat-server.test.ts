@@ -6,7 +6,7 @@ import type { HermesChatInternalRequestOptions, HermesChatRequest } from "./herm
 import { createDemoRuntimeStatus, createDemoSnapshot } from "./demo-state.js";
 import { createOfficeServer } from "./server.js";
 
-test("Office Server seeds only session.create with trusted global context", async (t) => {
+test("Office Server seeds session.create and reinforces follow-ups on every prompt", async (t) => {
   const captured: Array<{ request: HermesChatRequest; internal?: HermesChatInternalRequestOptions }> = [];
   let contextReads = 0;
   const runtime = {
@@ -28,7 +28,7 @@ test("Office Server seeds only session.create with trusted global context", asyn
           if (request.method === "session.resume") {
             return { method: request.method, value: { liveSessionId: "live-resumed", storedSessionId: String(request.params?.session_id), running: false, status: "idle" } };
           }
-          return { method: request.method, value: { status: "ok" } };
+          return { method: request.method, value: { status: request.method === "prompt.submit" ? "streaming" : "ok" } };
         },
       }),
     }),
@@ -49,12 +49,15 @@ test("Office Server seeds only session.create with trusted global context", asyn
   await waitForMethod(websocket, "office.ready");
   websocket.send(JSON.stringify({ jsonrpc: "2.0", id: 1, method: "session.create", params: { profile: "coder" } }));
   await waitForId(websocket, 1);
-  websocket.send(JSON.stringify({ jsonrpc: "2.0", id: 2, method: "session.resume", params: { profile: "coder", session_id: "stored-1" } }));
+  websocket.send(JSON.stringify({ jsonrpc: "2.0", id: 2, method: "prompt.submit", params: { session_id: "live-created", text: "質問です" } }));
   await waitForId(websocket, 2);
+  websocket.send(JSON.stringify({ jsonrpc: "2.0", id: 3, method: "session.resume", params: { profile: "coder", session_id: "stored-1" } }));
+  await waitForId(websocket, 3);
 
   assert.equal(contextReads, 1);
   assert.deepEqual(captured[0]?.internal, { sessionCreateSystemSeed: "Office-only shared context" });
-  assert.equal(captured[1]?.internal, undefined);
+  assert.deepEqual(captured[1]?.internal, { studioFollowUpTurn: true });
+  assert.equal(captured[2]?.internal, undefined);
   websocket.close();
 });
 

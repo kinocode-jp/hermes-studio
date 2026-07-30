@@ -3,11 +3,13 @@ import test from "node:test";
 import type { ChatSession, WorkTask } from "../src/domain.ts";
 import {
   buildCardAskSeedPrompt,
+  buildCardSeededUserPrompt,
   CARD_SEED_MAX_CHARS,
   cardAskSeedInputFromTask,
   findCardAskSession,
   sessionNeedsCardSeed,
 } from "../src/kanban-ask.ts";
+import { CHAT_PROMPT_MAX_UTF8_BYTES } from "@hermes-studio/protocol";
 import { chatSessionTitle, setLocale } from "../src/i18n.ts";
 
 test("buildCardAskSeedPrompt includes card identity and truncates huge bodies", () => {
@@ -48,6 +50,15 @@ test("buildCardAskSeedPrompt falls back to summary then empty body label", () =>
   assert.match(empty, /本文なし/);
 });
 
+test("card context validates the exact final chat prompt", () => {
+  setLocale("en");
+  assert.equal(buildCardSeededUserPrompt("card", "question"), "card\n\n--- Question ---\nquestion");
+  assert.deepEqual(
+    buildCardSeededUserPrompt("card context", "x".repeat(CHAT_PROMPT_MAX_UTF8_BYTES)),
+    { error: "payload-too-large" },
+  );
+});
+
 test("findCardAskSession reuses only matching card and assignee", () => {
   const sessions: ChatSession[] = [
     baseSession({ id: "s1", profileId: "coder", sourceCardId: "t_1" }),
@@ -76,7 +87,16 @@ test("sessionNeedsCardSeed is one-shot and empty-transcript only", () => {
   assert.equal(sessionNeedsCardSeed({
     ...pending,
     operationEvidence: [{ id: "o1", kind: "prompt", body: "hi", at: "12:00", state: "pending" }],
-  }), false);
+  }), true, "RPC evidence does not consume card context before a prompt is accepted");
+  assert.equal(sessionNeedsCardSeed({
+    ...pending,
+    operationEvidence: [{ id: "o2", kind: "prompt", body: "hi", at: "12:00", state: "rejected" }],
+  }), true, "an explicitly rejected first attempt keeps card context retryable");
+  assert.equal(sessionNeedsCardSeed({
+    ...pending,
+    messages: [{ id: "slash", from: "tool", body: "model unavailable", at: "12:00", status: "complete" }],
+    operationEvidence: [{ id: "slash-op", kind: "prompt", body: "/model unavailable", at: "12:00", state: "rejected" }],
+  }), true, "slash evidence and local tool output do not consume the first card question context");
   assert.equal(sessionNeedsCardSeed(baseSession({ id: "plain", profileId: "coder" })), false);
 });
 
@@ -119,6 +139,23 @@ test("kanban board exposes ask-assignee control", async () => {
   assert.match(source, /askAssigneeAboutTask/);
   assert.match(source, /kanban\.askAssignee/);
   assert.match(source, /task-ask-assignee/);
+});
+
+test("only workspace-owned chat panes activate the dashboard on pointer down", async () => {
+  const fs = await import("node:fs/promises");
+  const [pane, workspace, dashboard, kanban, profileModal] = await Promise.all([
+    fs.readFile(new URL("../src/components/chat-pane.tsx", import.meta.url), "utf8"),
+    fs.readFile(new URL("../src/components/chat-workspace.tsx", import.meta.url), "utf8"),
+    fs.readFile(new URL("../src/components/dashboard-view.tsx", import.meta.url), "utf8"),
+    fs.readFile(new URL("../src/components/kanban-board.tsx", import.meta.url), "utf8"),
+    fs.readFile(new URL("../src/components/profile-chat-modal.tsx", import.meta.url), "utf8"),
+  ]);
+  assert.match(pane, /activateWorkspaceOnPointerDown = false/);
+  assert.match(pane, /if \(activateWorkspaceOnPointerDown && activeSessionId\.value !== session\.id\) openSession\(session\.id\)/);
+  assert.match(workspace, /<ChatPane[^>]*activateWorkspaceOnPointerDown/);
+  assert.match(dashboard, /<ChatPane[^>]*activateWorkspaceOnPointerDown/);
+  assert.doesNotMatch(kanban, /<ChatPane[^>]*activateWorkspaceOnPointerDown/);
+  assert.doesNotMatch(profileModal, /<ChatPane[^>]*activateWorkspaceOnPointerDown/);
 });
 
 test("kanban empty columns collapse by default and manual override wins", async () => {

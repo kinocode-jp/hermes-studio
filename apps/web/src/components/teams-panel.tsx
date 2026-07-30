@@ -7,11 +7,13 @@ import {
   isGlobalContextWithinBudget,
 } from "@hermes-studio/protocol";
 import { localizeRuntimeMessage, t } from "../i18n";
-import { appModalSizes, createModalResizeHandlers, getAppModalSize, shouldIgnoreModalOutsideClose } from "../app-modal-layout";
+import { appModalSizes, createModalResizeHandlers, getAppModalSize } from "../app-modal-layout";
 import { profileDisplayName } from "../profile-names";
 import { profileList } from "../store";
 import { InfoTip } from "./info-tip";
 import { CloseIcon, EditIcon, PlusIcon, RefreshIcon, SaveIcon, TrashIcon } from "./icons";
+import { useMobileOverlay } from "./use-mobile-overlay";
+import { useModalOutsideClose } from "./use-modal-outside-close";
 import {
   createTeam,
   deleteTeam,
@@ -109,17 +111,25 @@ export function TeamsPanel({ hideTitle = false }: { hideTitle?: boolean } = {}) 
     setEditor(team.id);
   };
 
-    const _teamsModalSizes = appModalSizes.value;
+  const _teamsModalSizes = appModalSizes.value;
   const teamsModalSize = getAppModalSize("teams-editor");
   const teamsResize = useMemo(() => createModalResizeHandlers("teams-editor"), []);
   useEffect(() => () => teamsResize.dispose(), [teamsResize]);
 
   const closeEditor = () => {
+    if (busy) return;
     setEditor(null);
     setFormError(null);
     setConfirmDeleteId(null);
     setSettingsDraft(null);
   };
+  const outsideClose = useModalOutsideClose(closeEditor);
+  const editorOverlay = useMobileOverlay<HTMLFormElement>({
+    kind: "modal",
+    open: editor !== null,
+    onClose: closeEditor,
+    viewport: "(min-width: 0px)",
+  });
 
   const toggleMember = (profileId: string) => {
     setDraft((current) => {
@@ -316,19 +326,21 @@ export function TeamsPanel({ hideTitle = false }: { hideTitle?: boolean } = {}) 
       </div>
 
       {editor !== null && (
-        <div class="teams-editor-backdrop" role="presentation" onClick={() => { if (!shouldIgnoreModalOutsideClose()) closeEditor(); }}>
+        <div class="teams-editor-backdrop" role="presentation" {...outsideClose}>
           <form
+            ref={editorOverlay.ref}
             class="teams-editor"
             role="dialog"
             aria-modal="true"
             aria-labelledby="teams-editor-title"
+            tabIndex={-1}
             style={{ width: `${teamsModalSize.width}px`, height: `${teamsModalSize.height}px` }}
             onClick={(event) => event.stopPropagation()}
             onSubmit={(event) => void submit(event)}
           >
             <header>
               <h2 id="teams-editor-title">{editor === "create" ? t("teams.createTitle") : t("teams.editTitle")}</h2>
-              <button type="button" class="mobile-close" onClick={closeEditor} aria-label={t("common.close")} title={t("common.close")}><CloseIcon /></button>
+              <button type="button" class="mobile-close" disabled={busy} onClick={closeEditor} aria-label={t("common.close")} title={t("common.close")}><CloseIcon /></button>
             </header>
             <label>
               <span>{t("teams.field.name")}</span>
@@ -337,6 +349,7 @@ export function TeamsPanel({ hideTitle = false }: { hideTitle?: boolean } = {}) 
                 maxLength={64}
                 required
                 autoFocus
+                data-mobile-overlay-initial-focus
                 disabled={busy}
                 onInput={(event) => setDraft((current) => ({ ...current, name: event.currentTarget.value }))}
               />

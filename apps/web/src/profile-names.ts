@@ -86,6 +86,83 @@ export function profileSecondaryName(profile: ProfileNameSource): string {
   return alias && alias !== profile.name ? profile.name : "";
 }
 
+/**
+ * Render profile identifiers found in agent output as a human-readable label
+ * while retaining the canonical Hermes profile name for unambiguous reference.
+ * Code spans are deliberately preserved: commands and paths must remain
+ * copyable verbatim.
+ */
+export function displayProfileReferences(text: string, profiles: readonly ProfileNameSource[]): string {
+  if (!text || profiles.length === 0) return text;
+  const references = profiles.flatMap((profile) => {
+    const canonical = profile.name.trim() || profile.id.trim();
+    const display = profileDisplayName(profile).trim();
+    if (!canonical || !display || display === canonical) return [];
+    return [
+      { identifier: profile.id.trim(), canonical, display },
+      ...(profile.name.trim() !== profile.id.trim() ? [{ identifier: profile.name.trim(), canonical, display }] : []),
+    ];
+  }).filter((reference) => reference.identifier.length > 0)
+    .sort((left, right) => right.identifier.length - left.identifier.length);
+  if (references.length === 0) return text;
+
+  const byIdentifier = new Map<string, (typeof references)[number]>();
+  for (const reference of references) {
+    const key = reference.identifier.toLowerCase();
+    if (!byIdentifier.has(key)) byIdentifier.set(key, reference);
+  }
+  const allIdentifiers = [...byIdentifier.values()].map((reference) => escapeRegExp(reference.identifier));
+  const bareIdentifiers = [...byIdentifier.values()]
+    .filter((reference) => !referenceNeedsSigil(reference.identifier))
+    .map((reference) => escapeRegExp(reference.identifier));
+  const alternatives = [
+    `@(?:${allIdentifiers.join("|")})(?![\\p{L}\\p{N}_-])`,
+    ...(bareIdentifiers.length === 0
+      ? []
+      : [`(?<![\\p{L}\\p{N}_@-])(?:${bareIdentifiers.join("|")})(?![\\p{L}\\p{N}_-])`]),
+  ];
+  const matcher = new RegExp(alternatives.join("|"), "giu");
+
+  // Keep fenced and inline code untouched so that copied commands stay valid.
+  return text.split(/(```[\s\S]*?```|`[^`\n]*`)/g).map((part) => {
+    if (part.startsWith("`")) return part;
+    return part.replace(matcher, (matched, offset: number, source: string) => {
+      const identifier = matched.startsWith("@") ? matched.slice(1) : matched;
+      const reference = byIdentifier.get(identifier.toLowerCase());
+      if (!reference || isCopySensitiveReference(source, offset, matched.length)) return matched;
+      const before = source.slice(0, offset);
+      const after = source.slice(offset + matched.length);
+      // Do not expand an already formatted "表示名（profile-name）" reference.
+      const visibleBefore = before.replace(/[*_~]+$/u, "");
+      const visibleAfter = after.replace(/^[*_~]+/u, "");
+      if (visibleBefore.endsWith(`${reference.display}（`) && visibleAfter.startsWith("）")) return matched;
+      return `${reference.display}（${reference.canonical}）`;
+    });
+  }).join("");
+}
+
+function referenceNeedsSigil(identifier: string): boolean {
+  return identifier.length <= 2
+    || /^(?:a|an|as|at|default|i|in|is|it|no|of|on|or|the|to)$/i.test(identifier);
+}
+
+function isCopySensitiveReference(source: string, offset: number, length: number): boolean {
+  let start = offset;
+  let end = offset + length;
+  const delimiter = /[\s()[\]{}"'`<>]/u;
+  while (start > 0 && !delimiter.test(source[start - 1]!)) start -= 1;
+  while (end < source.length && !delimiter.test(source[end]!)) end += 1;
+  const token = source.slice(start, end);
+  if (/[\\/=?&#%]/u.test(token)) return true;
+  if (/(?:^|[\p{L}\p{N}_-])\.[\p{L}\p{N}_-]/u.test(token)) return true;
+  if (/:[\\/\d]/u.test(token) || /[\p{L}\p{N}_-]:[\p{L}\p{N}_-]/u.test(token)) return true;
+  return token.startsWith("~");
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
 export function setProfileDisplayName(profileId: string, name: string): void {
   const key = profileId.trim();
   if (!key) return;

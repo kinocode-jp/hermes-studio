@@ -54,7 +54,7 @@ export class OfficeSessionUnavailableError extends Error {
 
 export const REMOTE_PROXY_CONFIGURATION_MESSAGE = "Studio Serverのtrusted HTTPS proxyまたは転送ヘッダー設定を修正してから再接続してください。端末の再認証は不要です。";
 export class OfficeHttpError extends Error {
-  constructor(readonly status: number) {
+  constructor(readonly status: number, readonly code?: string) {
     super(`Studio Server returned HTTP ${status}.`);
     this.name = "OfficeHttpError";
   }

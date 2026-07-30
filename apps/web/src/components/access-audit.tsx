@@ -16,7 +16,10 @@ const operationLabels: Partial<Record<AccessAuditEntry["operation"], Translation
   "auth.device": "audit.operation.device",
   "auth.logout": "audit.operation.logout",
   "audit.read": "audit.operation.read",
+  "chat-model-preferences.update": "audit.operation.chatModelPreferences",
+  "local-model-providers.sync": "audit.operation.localModelProviders",
   "host-app.install": "audit.operation.hostAppInstall",
+  "host-fs.open": "audit.operation.hostFileOpen",
   "obsidian.vault.read": "audit.operation.obsidianVaultRead",
 };
 

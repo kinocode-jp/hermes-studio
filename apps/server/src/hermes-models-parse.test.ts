@@ -1,11 +1,126 @@
 import assert from "node:assert/strict";
+import { createServer } from "node:http";
+import type { AddressInfo } from "node:net";
 import { test } from "node:test";
 import {
+  createHermesModelsAdapter,
+  extractOpenCodexProviders,
   extractLiveModels,
   extractProviders,
   extractReasoningEfforts,
+  HermesModelsError,
   mergeProviderExtracts,
 } from "./hermes-models.js";
+
+test("OpenCodex discovery keeps bare Codex models and namespaced CLI providers", () => {
+  const providers = extractOpenCodexProviders({
+    data: [
+      { id: "gpt-5.6-luna", owned_by: "openai" },
+      { id: "anthropic/claude-sonnet-5", owned_by: "anthropic" },
+      { id: "kimi/kimi-k2.7-code", owned_by: "kimi" },
+      { id: "disabled/model", owned_by: "disabled" },
+      { id: "api_key=not-a-model", owned_by: "openai" },
+    ],
+  }, [
+    { name: "openai", disabled: false },
+    { name: "anthropic", disabled: false },
+    { name: "kimi", disabled: false },
+    { name: "disabled", disabled: true },
+  ], 100, 20);
+
+  assert.deepEqual(providers, [
+    {
+      endpointId: "local-cli-openai",
+      name: "OpenAI Codex · OpenCodex CLI",
+      baseUrl: "http://127.0.0.1:10100/v1",
+      models: ["gpt-5.6-luna"],
+    },
+    {
+      endpointId: "local-cli-anthropic",
+      name: "Anthropic / Claude · OpenCodex CLI",
+      baseUrl: "http://127.0.0.1:10100/v1",
+      models: ["anthropic/claude-sonnet-5"],
+    },
+    {
+      endpointId: "local-cli-kimi",
+      name: "Kimi Code · OpenCodex CLI",
+      baseUrl: "http://127.0.0.1:10100/v1",
+      models: ["kimi/kimi-k2.7-code"],
+    },
+  ]);
+});
+
+test("OpenCodex discovery falls back to model namespace when owned_by is absent", () => {
+  const providers = extractOpenCodexProviders({
+    data: [
+      { id: "xai/grok-4.5" },
+      { id: "gpt-5.6-terra" },
+    ],
+  }, undefined, 100, 20);
+  assert.deepEqual(providers.map((provider) => [provider.endpointId, provider.models]), [
+    ["local-cli-xai", ["xai/grok-4.5"]],
+    ["local-cli-openai", ["gpt-5.6-terra"]],
+  ]);
+});
+
+test("catalog deadline includes backend acquisition and releases a late lease", async () => {
+  let released = 0;
+  const adapter = createHermesModelsAdapter({
+    timeoutMs: 250,
+    resolveProfileBackend: async () => await new Promise((resolve) => {
+      setTimeout(() => resolve({
+        baseUrl: "http://127.0.0.1:9",
+        sessionToken: "x".repeat(32),
+        release: () => { released += 1; },
+      }), 325);
+    }),
+  });
+
+  await assert.rejects(
+    adapter.loadLiveCatalog("default"),
+    (error: unknown) => error instanceof HermesModelsError && error.code === "timed_out",
+  );
+  await new Promise((resolve) => setTimeout(resolve, 125));
+  assert.equal(released, 1);
+});
+
+test("an explicit model refresh surfaces malformed success instead of returning stale live models", async (t) => {
+  const server = createServer((request, response) => {
+    if (request.method === "POST" && request.url === "/api/models/refresh") {
+      response.writeHead(200, { "Content-Type": "application/json" }).end("not-json");
+      return;
+    }
+    response.setHeader("Content-Type", "application/json");
+    if (request.url === "/api/model/info") {
+      response.end(JSON.stringify({ provider: "openai", model: "gpt-safe" }));
+      return;
+    }
+    if (request.url === "/api/models") {
+      response.end(JSON.stringify({ provider: "openai", providers: [{ id: "openai", label: "OpenAI", active: true }] }));
+      return;
+    }
+    if (request.url === "/api/models/live?provider=openai") {
+      response.end(JSON.stringify({ models: ["gpt-safe"] }));
+      return;
+    }
+    response.writeHead(404).end();
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => server.close());
+  const address = server.address() as AddressInfo;
+  const adapter = createHermesModelsAdapter({
+    resolveProfileBackend: async () => ({
+      baseUrl: `http://127.0.0.1:${address.port}`,
+      sessionToken: "x".repeat(32),
+      release: () => undefined,
+    }),
+  });
+
+  await assert.rejects(
+    adapter.loadLiveCatalog("default", "openai", { forceRefresh: true, allowRefresh: true }),
+    (error: unknown) => error instanceof HermesModelsError && error.code === "rejected",
+  );
+});
 
 test("extractProviders reads session_visit-style and options-style payloads", () => {
   const sessionVisit = extractProviders({
@@ -75,6 +190,21 @@ test("extractProviders omits explicitly unconfigured or disabled rows unless act
   assert.equal(result.providers.find((item) => item.id === "disabled"), undefined);
   assert.equal(result.providers.find((item) => item.id === "unauth"), undefined);
   assert.equal(result.providers.find((item) => item.id === "active-unconfigured")?.active, true);
+});
+
+test("extractProviders accepts public provider ids containing token vocabulary", () => {
+  const result = extractProviders({
+    providers: [
+      { id: "alibaba-token-plan", label: "Alibaba Token Plan", configured: true },
+      { id: "tencent-tokenhub", label: "Tencent TokenHub", configured: true },
+      { id: "google-antigravity", label: "Google Antigravity", configured: true },
+    ],
+  }, 50);
+  assert.deepEqual(result.providers.map((item) => item.id), [
+    "alibaba-token-plan",
+    "tencent-tokenhub",
+    "google-antigravity",
+  ]);
 });
 
 test("mergeProviderExtracts prefers listed fallback catalogs without dropping active", () => {

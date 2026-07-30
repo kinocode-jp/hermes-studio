@@ -14,13 +14,10 @@ declare global {
 }
 
 // The desktop shell returns a capability only when it started and owns the
-// Studio Server child. When the WebView opens an already-running compatible
-// Studio on loopback (same UI as a browser), `desktop_owned` is false and the
-// client uses normal local cookie authentication instead of the capability
-// bridge. A fresh IPC call revalidates the owned listener before each HTTP or
-// WebSocket send that requires the capability; the root capability is never
-// cached in this module or an Studio session. Invalid non-null capability
-// values are rejected rather than silently falling back.
+// Studio Server child. A fresh IPC call revalidates the owned listener before
+// each HTTP or WebSocket send that requires the capability; the root capability
+// is never cached in this module or a Studio session. Invalid or unavailable
+// desktop ownership is rejected rather than silently falling back to cookies.
 
 export function isTauriAssetLocation(value: Pick<Location, "protocol" | "hostname">): boolean {
   return value.protocol === "tauri:" || value.hostname === "tauri.localhost";
@@ -52,9 +49,9 @@ export function desktopCapability(): Promise<string | undefined> {
 
 /**
  * True only when this shell currently owns a proven Studio Server child.
- * Returns false (does not throw) when the bridge reports unowned — so an
- * attached existing loopback Studio can fall through to local browser auth.
- * Throws when the bridge is required but missing/invalid, or when IPC fails.
+ * A bridge-backed origin must fail closed when it reports unowned; normal
+ * loopback browser locations return false before invoking the bridge and keep
+ * their cookie-auth path.
  */
 export async function desktopOwnershipIsAuthenticated(): Promise<boolean> {
   if (!shouldUseDesktopCapability(location, window.__TAURI_INTERNALS__ !== undefined)) return false;
@@ -62,7 +59,8 @@ export async function desktopOwnershipIsAuthenticated(): Promise<boolean> {
   if (typeof invoke !== "function") throw new Error("Hermes Studio desktop bridge is unavailable.");
   const value = await invoke<boolean>("desktop_owned");
   if (typeof value !== "boolean") throw new Error("Hermes Studio desktop ownership response is invalid.");
-  return value;
+  if (!value) throw new Error("Hermes Studio does not own an authenticated desktop server.");
+  return true;
 }
 
 export async function createAuthenticatedOfficeWebSocket(url: string, desktopRequired = false): Promise<WebSocket> {

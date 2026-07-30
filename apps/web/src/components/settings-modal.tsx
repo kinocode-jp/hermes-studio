@@ -11,6 +11,7 @@ import type { SettingsTab } from "../domain";
 import { appModalSizes, createModalResizeHandlers, getAppModalSize, shouldIgnoreModalOutsideClose } from "../app-modal-layout";
 import { LiveSettings } from "./live-settings";
 import { useMobileOverlay } from "./use-mobile-overlay";
+import { useModalOutsideClose } from "./use-modal-outside-close";
 import { CloseIcon } from "./icons";
 import { persistUiNavPreferences } from "../ui-nav-prefs";
 
@@ -27,6 +28,7 @@ export function SettingsModal() {
   const modalSize = getAppModalSize("app-settings");
   const resize = useMemo(() => createModalResizeHandlers("app-settings"), []);
   useEffect(() => () => resize.dispose(), [resize]);
+  const outsideClose = useModalOutsideClose(closeSettingsModal);
   if (!open) return null;
 
   const setTab = (next: SettingsTab) => {
@@ -44,14 +46,7 @@ export function SettingsModal() {
       class="profile-settings-modal-layer settings-modal-layer"
       data-modal-affordance="true"
       role="presentation"
-      onPointerDown={(event) => {
-        if (shouldIgnoreModalOutsideClose()) return;
-        if (event.target === event.currentTarget) closeSettingsModal();
-      }}
-      onClick={(event) => {
-        if (shouldIgnoreModalOutsideClose()) return;
-        if (event.target === event.currentTarget) closeSettingsModal();
-      }}
+      {...outsideClose}
     >
       <button
         class="profile-settings-modal-scrim"
@@ -67,6 +62,7 @@ export function SettingsModal() {
         role="dialog"
         aria-modal="true"
         aria-labelledby="settings-modal-title"
+        aria-describedby="settings-modal-description"
         tabIndex={-1}
         style={{ width: `${modalSize.width}px`, height: `${modalSize.height}px` }}
         onPointerDown={(event) => event.stopPropagation()}
@@ -76,8 +72,9 @@ export function SettingsModal() {
           <div class="profile-settings-modal-identity">
             <div class="profile-settings-modal-copy">
               <div class="profile-settings-modal-title-row">
-                <h2 id="settings-modal-title">{t("nav.settings")}</h2>
+                <h2 id="settings-modal-title">{t("settings.modalTitle")}</h2>
               </div>
+              <p id="settings-modal-description" class="settings-modal-description">{t("settings.modalLead")}</p>
             </div>
           </div>
           <button

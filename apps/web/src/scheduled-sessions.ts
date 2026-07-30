@@ -90,13 +90,11 @@ export function scheduledSessionsToPrune(
 ): ChatSession[] {
   if (groupKey) {
     const keep = getScheduledKeepCount(groupKey, keepCount);
-    if (keep <= 0) return [];
     const group = scheduledSessionGroups(sessions).find((item) => item.key === groupKey);
     return group ? group.sessions.slice(keep) : [];
   }
   return scheduledSessionGroups(sessions).flatMap((group) => {
     const keep = getScheduledKeepCount(group.key, keepCount);
-    if (keep <= 0) return [];
     return group.sessions.slice(keep);
   });
 }

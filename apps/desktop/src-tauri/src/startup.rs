@@ -71,6 +71,7 @@ pub(crate) enum StartupNoticeKind {
     ExistingWebUiTimeout,
     OwnedManagedRuntimeUnavailable,
     OwnedBundledResourceUnavailable,
+    OwnedRemoteConfigurationUnavailable,
     OwnedChildLaunchFailed,
     OwnedServerReadinessFailed,
     InternalStateUnavailable,
@@ -98,6 +99,7 @@ impl StartupFailure {
         self
     }
 
+    #[cfg(test)]
     pub(crate) fn with_log_path(mut self, path: PathBuf) -> Self {
         self.log_path = Some(path);
         self
@@ -159,6 +161,9 @@ impl StartupNoticeKind {
             Self::OwnedBundledResourceUnavailable => {
                 "The desktop launcher could not locate the bundled Office server resources required to start its own server."
             }
+            Self::OwnedRemoteConfigurationUnavailable => {
+                "The desktop launcher could not safely save or load its remote-access configuration from macOS Keychain."
+            }
             Self::OwnedChildLaunchFailed => {
                 "The desktop launcher found its runtime and resources, but could not launch its Office server process."
             }
@@ -219,6 +224,11 @@ impl StartupNoticeKind {
                 "Reinstall Hermes Studio from a complete application bundle so its server resources are restored.",
                 "If this is a development checkout, run `npm install` and ensure apps/desktop/src-tauri/resources/server/hermes-studio-server.mjs exists after `npm run build:desktop-assets`.",
             ],
+            Self::OwnedRemoteConfigurationUnavailable => &[
+                "Unlock the login keychain, then start Hermes Studio again and allow access if macOS asks.",
+                "To replace the saved configuration, quit Hermes Studio and run `npm run start:tailnet:desktop` again with the intended enrollment token.",
+                "Inspect the diagnostic detail below; Hermes Studio does not fall back to an unverified saved remote configuration.",
+            ],
             Self::OwnedChildLaunchFailed => &[
                 "Confirm the managed runtime and installed Hermes Studio bundle are readable and allowed to launch processes.",
                 "Open the diagnostic log listed below for the spawn error, then restart Hermes Studio.",
@@ -242,6 +252,7 @@ impl StartupNoticeKind {
 pub(crate) enum OwnedServerLaunchError {
     ManagedRuntimeUnavailable { detail: String },
     BundledResourceUnavailable { detail: String },
+    RemoteConfigurationUnavailable { detail: String },
     ChildLaunchFailed { detail: String },
 }
 
@@ -250,6 +261,7 @@ impl OwnedServerLaunchError {
         match self {
             Self::ManagedRuntimeUnavailable { detail }
             | Self::BundledResourceUnavailable { detail }
+            | Self::RemoteConfigurationUnavailable { detail }
             | Self::ChildLaunchFailed { detail } => detail,
         }
     }
@@ -263,6 +275,9 @@ impl From<OwnedServerLaunchError> for StartupFailure {
             }
             OwnedServerLaunchError::BundledResourceUnavailable { .. } => {
                 StartupNoticeKind::OwnedBundledResourceUnavailable
+            }
+            OwnedServerLaunchError::RemoteConfigurationUnavailable { .. } => {
+                StartupNoticeKind::OwnedRemoteConfigurationUnavailable
             }
             OwnedServerLaunchError::ChildLaunchFailed { .. } => {
                 StartupNoticeKind::OwnedChildLaunchFailed
@@ -280,6 +295,9 @@ impl From<OwnedServerLaunchError> for StartupNoticeKind {
             }
             OwnedServerLaunchError::BundledResourceUnavailable { .. } => {
                 Self::OwnedBundledResourceUnavailable
+            }
+            OwnedServerLaunchError::RemoteConfigurationUnavailable { .. } => {
+                Self::OwnedRemoteConfigurationUnavailable
             }
             OwnedServerLaunchError::ChildLaunchFailed { .. } => Self::OwnedChildLaunchFailed,
         }

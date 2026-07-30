@@ -326,7 +326,7 @@
   .office-seg { justify-self: end; }
 }
 
-@media (max-width: 767px) {
+@media (max-width: 768px) {
   /* Grow with content so main-stage owns vertical scroll; scene still gets a real floor height. */
   .office-wrap {
     height: auto;

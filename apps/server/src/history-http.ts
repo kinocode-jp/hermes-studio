@@ -67,7 +67,8 @@ export async function fetchOfficeHistoryPage(
   const history = fetchLimit === 0
     ? emptyHistory(cursor.sessionId, profile, fetchOffset)
     : await chat.fetchHistory({ sessionId: cursor.sessionId, profile, limit: fetchLimit, offset: fetchOffset });
-  if (history.pagination.offset !== fetchOffset || history.pagination.limit !== fetchLimit
+  if (history.sessionId !== cursor.sessionId || history.profile !== profile
+    || history.pagination.offset !== fetchOffset || history.pagination.limit !== fetchLimit
     || !Number.isSafeInteger(history.pagination.returned) || history.pagination.returned !== fetchLimit
     || !Number.isSafeInteger(history.pagination.normalizedReturned) || history.pagination.normalizedReturned < 0
     || !Number.isSafeInteger(history.pagination.dropped) || history.pagination.dropped < 0

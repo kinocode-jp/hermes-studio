@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { chmodSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -27,7 +27,7 @@ test("local executable validation canonicalizes links and rejects unsafe modes",
     const link = join(directory, "brew-link");
     writeFileSync(executable, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
     symlinkSync(executable, link);
-    assert.equal(validatedLocalExecutable(link), executable);
+    assert.equal(validatedLocalExecutable(link), realpathSync(executable));
 
     chmodSync(executable, 0o777);
     assert.equal(validatedLocalExecutable(link), undefined);

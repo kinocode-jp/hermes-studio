@@ -56,6 +56,31 @@ RPC, and public multi-user administration.
 > and it deliberately does not retry automatically because doing so could apply
 > the same instruction twice.
 
+### Live session capacity
+
+Hermes Studio keeps one managed runtime for the `default` profile while allowing
+multiple independent chat sessions to use it. Live attachments are bounded so a
+burst cannot exhaust the host; when the limit is full, additional sessions show
+**Waiting for a run slot** and retry in FIFO order. One initial prompt can be
+submitted while a session is waiting and is sent only after that session owns a
+live slot. The pending prompt is held by the current Studio client, so closing or
+reloading that client cancels it instead of risking an automatic duplicate send.
+
+The defaults are 16 live sessions per Office owner, 8 per profile, and 256 for
+the server. Operators can tune them without changing source:
+
+```bash
+HERMES_STUDIO_CHAT_SESSION_LEASES_PER_OWNER=32 \
+HERMES_STUDIO_CHAT_SESSION_LEASES_PER_PROFILE=16 \
+HERMES_STUDIO_CHAT_SESSION_LEASES_TOTAL=512 \
+npm start
+```
+
+These are live-resource limits, not stored-conversation limits. A literal
+unlimited live-process setting is intentionally not provided; queueing preserves
+requests while keeping file descriptors, memory, sockets, and model-provider
+load bounded.
+
 ## Repository layout
 
 ```text
@@ -152,13 +177,22 @@ export HERMES_STUDIO_REMOTE_TOKEN='replace-with-a-random-32+-character-token'
 npm run start:tailnet
 ```
 
-That command discovers the host MagicDNS name, sets the single canonical
+To launch the installed macOS desktop app and have its single owned Office
+Server serve both the desktop WebView and Tailnet browsers, quit the app fully
+and use `npm run start:tailnet:desktop` with the same token environment. This
+avoids running a second Office Server or moving the desktop app to another port.
+The first integrated launch stores the validated remote configuration in macOS
+Keychain; subsequent Finder or Dock launches restore it automatically. Use
+`npm run forget:tailnet:desktop` to make future icon launches local-only.
+
+Both launch modes discover the host MagicDNS name, set the single canonical
 `https://…ts.net` origin (rejecting any pre-existing remote origin that
 differs; valid loopback origins may remain), defaults trusted proxy hops to
 `1`, creates persistent private Tailscale Serve to
 `http://127.0.0.1:4317` only when empty or already exact (never overwriting a
 different Serve config; no `--yes`—Tailscale may prompt for HTTPS consent),
-and starts the production Office launcher after a production asset preflight.
+and start the selected production or packaged-desktop target after its asset
+preflight.
 It does **not** enable Funnel, bind Office to a LAN address, or publish a
 second URL.
 
@@ -249,10 +283,11 @@ private-network proxy such as Tailscale Serve in front of it. Configure one
 unique random, one-time enrollment token of at least 32 characters, one exact
 HTTPS origin, and the exact number of trusted loopback proxy hops. The supported
 operator path for a private Tailscale tailnet (including phones) is
-`npm run start:tailnet`, which discovers the MagicDNS name, enforces the
+`npm run start:tailnet` (or `npm run start:tailnet:desktop` for the installed
+macOS app), which discovers the MagicDNS name, enforces the
 single canonical HTTPS origin, defaults trusted proxy hops to `1`, configures
 persistent private Serve only when empty or already exact, and starts
-production Office—without Funnel, LAN binding, or a second URL. See
+the selected Office owner—without Funnel, LAN binding, or a second URL. See
 [`docs/TAILSCALE.md`](docs/TAILSCALE.md). The
 **Desktop Host Administration** panel in the Tauri desktop UI shows the live
 status, configured origins, and registered devices; it appears only for the owner

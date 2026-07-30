@@ -8,13 +8,17 @@ import {
 import { HermesSettingsError } from "./hermes-settings.js";
 
 export const OFFICE_MODELS_PATH = "/api/v1/models";
+export const OFFICE_MODELS_REFRESH_PATH = "/api/v1/models/refresh";
+export const OFFICE_MODELS_LOCAL_CLI_SYNC_PATH = "/api/v1/models/local-cli/sync";
 
 const NO_STORE_HEADERS = { "Cache-Control": "no-store" } as const;
 
 export type ModelsHttpResult = { status: number; body: unknown; headers?: Record<string, string> };
 
 export function isModelsHttpPath(pathname: string): boolean {
-  return pathname === OFFICE_MODELS_PATH;
+  return pathname === OFFICE_MODELS_PATH
+    || pathname === OFFICE_MODELS_REFRESH_PATH
+    || pathname === OFFICE_MODELS_LOCAL_CLI_SYNC_PATH;
 }
 
 /**
@@ -26,20 +30,21 @@ export async function routeModelsHttp(
   requestUrl: URL,
   adapter: HermesModelsAdapter | undefined,
 ): Promise<ModelsHttpResult> {
-  if (request.method !== "GET") {
+  const refresh = request.method === "POST" && requestUrl.pathname === OFFICE_MODELS_REFRESH_PATH;
+  const localCliSync = request.method === "POST" && requestUrl.pathname === OFFICE_MODELS_LOCAL_CLI_SYNC_PATH;
+  if (!(request.method === "GET" && requestUrl.pathname === OFFICE_MODELS_PATH) && !refresh && !localCliSync) {
     return {
       status: 405,
       body: failureBody("bad_request", "Method is not allowed."),
-      headers: { Allow: "GET", ...NO_STORE_HEADERS },
+      headers: { Allow: requestUrl.pathname === OFFICE_MODELS_PATH ? "GET" : "POST", ...NO_STORE_HEADERS },
     };
   }
 
-  const allowed = new Set(["profile", "provider", "fresh"]);
+  const allowed = new Set(["profile", "provider"]);
   if (
     [...requestUrl.searchParams.keys()].some((key) => !allowed.has(key))
     || requestUrl.searchParams.getAll("profile").length !== 1
     || requestUrl.searchParams.getAll("provider").length > 1
-    || requestUrl.searchParams.getAll("fresh").length > 1
   ) {
     return { status: 400, body: failureBody("bad_request", "Model catalog query is invalid."), headers: { ...NO_STORE_HEADERS } };
   }
@@ -54,12 +59,6 @@ export async function routeModelsHttp(
     return { status: 400, body: failureBody("bad_request", "Provider name is invalid."), headers: { ...NO_STORE_HEADERS } };
   }
 
-  const freshParam = requestUrl.searchParams.get("fresh");
-  if (freshParam !== null && freshParam !== "1" && freshParam !== "true") {
-    return { status: 400, body: failureBody("bad_request", "Model catalog query is invalid."), headers: { ...NO_STORE_HEADERS } };
-  }
-  const forceRefresh = freshParam === "1" || freshParam === "true";
-
   if (adapter === undefined) {
     return {
       status: 503,
@@ -69,10 +68,11 @@ export async function routeModelsHttp(
   }
 
   try {
+    if (localCliSync) await adapter.syncLocalCliProviders(profile);
     const catalog = await adapter.loadLiveCatalog(
       profile,
       providerParam === null ? undefined : providerParam,
-      { forceRefresh },
+      { forceRefresh: refresh, allowRefresh: refresh },
     );
     return { status: 200, body: publicCatalog(catalog), headers: { ...NO_STORE_HEADERS } };
   } catch (error) {
@@ -98,6 +98,8 @@ function publicCatalog(catalog: LiveModelsCatalog): LiveModelsCatalog {
       active: item.active === true,
     })),
     provider: catalog.provider,
+    defaultProvider: catalog.defaultProvider,
+    defaultModel: catalog.defaultModel,
     models: catalog.models.map((model) => ({
       id: model.id,
       label: model.label,

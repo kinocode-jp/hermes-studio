@@ -4,12 +4,8 @@ import {
   CHAT_MODEL_FIXED_OPTIONS,
   CHAT_MODEL_MANUAL_PROVIDER,
   ChatModelCatalogError,
-  chatModelName,
-  chatModelProvider,
-  chatModelReasoningEffort,
   fetchLiveChatModels,
   isManualChatModelProvider,
-  modelSlashCommand,
   resolvedCreateModelPrefs,
   resolvedReasoningEffortForCreate,
   setChatModelSelection,
@@ -17,7 +13,7 @@ import {
   type LiveChatModelOption,
   type LiveChatProviderOption,
 } from "../chat-model-prefs";
-import { applySessionModelPrefs, sendMessage } from "../store";
+import { cancelSessionModelChange, stageSessionModelChange } from "../store";
 
 type ModelsState = "idle" | "loading" | "ready" | "error";
 type OpenMenu = "provider" | "model" | "effort" | null;
@@ -31,8 +27,9 @@ export function ComposerModelPickers({
   sessionId,
   sessionProvider,
   sessionModel,
+  sessionReasoningEffort,
   canSend,
-  onQueued,
+  onQueued: _onQueued,
   onOpenAdvanced,
   onInteract,
 }: {
@@ -40,9 +37,10 @@ export function ComposerModelPickers({
   sessionId: string;
   sessionProvider?: string | undefined;
   sessionModel?: string | undefined;
+  sessionReasoningEffort?: string | undefined;
   canSend: boolean;
   onQueued: () => void;
-  onOpenAdvanced: () => void;
+  onOpenAdvanced: (providerHint?: string) => void;
   onInteract?: () => void;
 }) {
   const [open, setOpen] = useState<OpenMenu>(null);
@@ -50,14 +48,20 @@ export function ComposerModelPickers({
   const [liveModels, setLiveModels] = useState<LiveChatModelOption[]>([]);
   const [modelsState, setModelsState] = useState<ModelsState>("idle");
   const [error, setError] = useState<string | undefined>(undefined);
+  const [defaultProvider, setDefaultProvider] = useState("");
+  const [defaultModel, setDefaultModel] = useState("");
+  const [pickerProvider, setPickerProvider] = useState(sessionProvider ?? "");
   const rootRef = useRef<HTMLDivElement>(null);
   const generationRef = useRef(0);
 
-  const prefProvider = chatModelProvider.value;
-  const prefModel = chatModelName.value;
-  const displayProvider = displayProviderLabel(sessionProvider, prefProvider, liveProviders);
-  const displayModel = displayModelLabel(sessionModel, prefModel, liveModels);
-  const displayEffort = chatModelReasoningEffort.value || t("chat.model.reasoning.default");
+  const actualProvider = sessionProvider ?? "";
+  const actualModel = sessionModel ?? "";
+  const actualEffort = sessionReasoningEffort ?? "";
+  const prefProvider = open === "model" ? pickerProvider : actualProvider;
+  const prefModel = prefProvider === actualProvider ? actualModel : "";
+  const displayProvider = displayProviderLabel(sessionProvider, defaultProvider, liveProviders);
+  const displayModel = displayModelLabel(sessionModel, defaultModel, liveModels);
+  const displayEffort = actualEffort || t("chat.model.reasoning.default");
 
   useEffect(() => {
     if (!open) return;
@@ -75,10 +79,17 @@ export function ComposerModelPickers({
       window.removeEventListener("keydown", onKey);
     };
   }, [open]);
+  useEffect(() => {
+    if (!canSend) setOpen(null);
+  }, [canSend]);
+
+  useEffect(() => {
+    if (open !== "model") setPickerProvider(actualProvider);
+  }, [actualProvider, open, sessionId]);
 
   useEffect(() => {
     // Warm the catalog when the composer mounts so first open is fast.
-    void loadCatalog(preferredProviderScope(prefProvider), false);
+    void loadCatalog(preferredProviderScope(actualProvider), false);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [profileId]);
 
@@ -86,11 +97,16 @@ export function ComposerModelPickers({
     const generation = ++generationRef.current;
     setModelsState("loading");
     setError(undefined);
+    // A provider-scoped list must never remain selectable while the next
+    // provider is loading.
+    setLiveModels([]);
     try {
       const catalog = await fetchLiveChatModels(profileId, providerScope, { forceRefresh });
       if (generation !== generationRef.current) return;
       setLiveProviders(catalog.providers);
       setLiveModels(catalog.models);
+      setDefaultProvider(catalog.defaultProvider);
+      setDefaultModel(catalog.defaultModel);
       setModelsState("ready");
     } catch (reason) {
       if (generation !== generationRef.current) return;
@@ -104,28 +120,33 @@ export function ComposerModelPickers({
   function applyMain(provider: string, model: string, effort: string): void {
     const efforts = reasoningEffortsFor(liveModels, provider, model, modelsState);
     const createPrefs = resolvedCreateModelPrefs({ provider, model, reasoningEffort: effort }, efforts);
-    applySessionModelPrefs(sessionId, createPrefs.provider, createPrefs.model, createPrefs.reasoningEffort);
-    const command = modelSlashCommand({ provider, model, reasoningEffort: createPrefs.reasoningEffort });
-    if (command && canSend) sendMessage(sessionId, command);
-    else if (command && !canSend) onQueued();
+    // Deferred apply: the /model command is sent with the next outbound prompt.
+    stageSessionModelChange(sessionId, createPrefs.provider, createPrefs.model, createPrefs.reasoningEffort);
   }
 
   function pickProvider(value: string): void {
     if (value === "default") {
       setChatModelSelection("", "", "");
-      applySessionModelPrefs(sessionId, "", "", "");
+      if (defaultModel) {
+        setPickerProvider(defaultProvider);
+        applyMain(defaultProvider, defaultModel, "");
+      } else {
+        // Without an authoritative configured target, keep the current Hermes
+        // model instead of pretending that clearing local prefs reset it.
+        cancelSessionModelChange(sessionId);
+      }
       setOpen(null);
-      void loadCatalog(undefined, false);
+      void loadCatalog(preferredProviderScope(defaultProvider), false);
       return;
     }
     if (value === CHAT_MODEL_MANUAL_PROVIDER) {
       // Free-form entry lives in the advanced panel.
-      setChatModelSelection(CHAT_MODEL_MANUAL_PROVIDER, prefModel || "", "");
+      setPickerProvider(CHAT_MODEL_MANUAL_PROVIDER);
       setOpen(null);
-      onOpenAdvanced();
+      onOpenAdvanced(CHAT_MODEL_MANUAL_PROVIDER);
       return;
     }
-    setChatModelSelection(value, "", "");
+    setPickerProvider(value);
     setOpen("model");
     void loadCatalog(value, false);
   }
@@ -134,19 +155,20 @@ export function ComposerModelPickers({
     if (!value) return;
     if (value === "__manual__") {
       setOpen(null);
-      onOpenAdvanced();
+      onOpenAdvanced(prefProvider || undefined);
       return;
     }
     const provider = prefProvider && !isManualChatModelProvider(prefProvider) ? prefProvider : "";
     if (!provider) {
       // Model without provider: treat as free-form via advanced panel.
       setOpen(null);
-      onOpenAdvanced();
+      onOpenAdvanced(CHAT_MODEL_MANUAL_PROVIDER);
       return;
     }
+    if (modelsState !== "ready" || !liveModels.some((option) => option.id === value)) return;
     const efforts = reasoningEffortsFor(liveModels, provider, value, modelsState);
     const effort = resolvedReasoningEffortForCreate(
-      { provider, model: value, reasoningEffort: chatModelReasoningEffort.value },
+      { provider, model: value, reasoningEffort: actualEffort },
       efforts,
     ) ?? "";
     setChatModelSelection(provider, value, effort);
@@ -155,8 +177,16 @@ export function ComposerModelPickers({
   }
 
   async function openMenu(next: Exclude<OpenMenu, null>): Promise<void> {
-    setOpen((current) => (current === next ? null : next));
-    const scope = preferredProviderScope(prefProvider);
+    if (open === next) {
+      setOpen(null);
+      return;
+    }
+    const provider = next === "model"
+      ? actualProvider || defaultProvider || liveProviders.find((item) => item.active)?.id || ""
+      : actualProvider;
+    if (next === "model") setPickerProvider(provider);
+    setOpen(next);
+    const scope = preferredProviderScope(provider);
     if (modelsState === "idle" || modelsState === "error" || (next === "model" && scope)) {
       await loadCatalog(scope, false);
     }
@@ -166,6 +196,22 @@ export function ComposerModelPickers({
   const providerInLiveList = liveProviders.some((item) => item.id === retainedProvider);
   const modelInLiveList = liveModels.some((item) => item.id === prefModel);
   const showRetainedModel = Boolean(prefModel) && !modelInLiveList && !isManualChatModelProvider(prefProvider);
+  const selectableEfforts = reasoningEffortsFor(liveModels, actualProvider, actualModel, modelsState) ?? [];
+  const canPickEffort = canSend && (actualEffort !== "" || selectableEfforts.length > 0);
+
+  function pickEffort(value: string): void {
+    const provider = actualProvider && !isManualChatModelProvider(actualProvider) ? actualProvider : "";
+    const model = actualModel;
+    const effort = value === ""
+      ? ""
+      : resolvedReasoningEffortForCreate(
+        { provider, model, reasoningEffort: value },
+        selectableEfforts,
+      ) ?? "";
+    setChatModelSelection(provider, model, effort);
+    if (provider && model) applyMain(provider, model, effort);
+    setOpen(null);
+  }
 
   return (
     <div class="composer-model-pickers" ref={rootRef}>
@@ -173,6 +219,7 @@ export function ComposerModelPickers({
         <button
           type="button"
           class={`composer-model-chip ${open === "provider" ? "is-open" : ""}`}
+          disabled={!canSend}
           aria-haspopup="listbox"
           aria-expanded={open === "provider"}
           aria-label={t("chat.model.picker.providerAria", { name: displayProvider })}
@@ -185,6 +232,7 @@ export function ComposerModelPickers({
         <button
           type="button"
           class={`composer-model-chip ${open === "model" ? "is-open" : ""}`}
+          disabled={!canSend}
           aria-haspopup="listbox"
           aria-expanded={open === "model"}
           aria-label={t("chat.model.picker.modelAria", { name: displayModel })}
@@ -197,6 +245,7 @@ export function ComposerModelPickers({
         <button
           type="button"
           class={`composer-model-chip composer-model-chip--effort ${open === "effort" ? "is-open" : ""}`}
+          disabled={!canPickEffort}
           aria-haspopup="listbox"
           aria-expanded={open === "effort"}
           aria-label={`${t("chat.reasoning")}: ${displayEffort}`}
@@ -215,8 +264,9 @@ export function ComposerModelPickers({
           <button
             type="button"
             role="option"
-            aria-selected={!prefProvider}
-            class={!prefProvider ? "is-selected" : undefined}
+            disabled={modelsState === "loading" && !defaultModel}
+            aria-selected={!actualProvider}
+            class={!actualProvider ? "is-selected" : undefined}
             onClick={() => pickProvider("default")}
           >
             {t(CHAT_MODEL_FIXED_OPTIONS[0].labelKey)}
@@ -226,8 +276,8 @@ export function ComposerModelPickers({
               key={option.id}
               type="button"
               role="option"
-              aria-selected={prefProvider === option.id}
-              class={prefProvider === option.id ? "is-selected" : undefined}
+              aria-selected={actualProvider === option.id}
+              class={actualProvider === option.id ? "is-selected" : undefined}
               onClick={() => pickProvider(option.id)}
             >
               {option.active ? t("chat.model.providerActive", { label: option.label }) : option.label}
@@ -237,8 +287,8 @@ export function ComposerModelPickers({
             <button
               type="button"
               role="option"
-              aria-selected={prefProvider === retainedProvider}
-              class={prefProvider === retainedProvider ? "is-selected" : undefined}
+              aria-selected={actualProvider === retainedProvider}
+              class={actualProvider === retainedProvider ? "is-selected" : undefined}
               onClick={() => pickProvider(retainedProvider)}
             >
               {retainedProvider}
@@ -247,8 +297,8 @@ export function ComposerModelPickers({
           <button
             type="button"
             role="option"
-            aria-selected={isManualChatModelProvider(prefProvider)}
-            class={isManualChatModelProvider(prefProvider) ? "is-selected" : undefined}
+            aria-selected={isManualChatModelProvider(actualProvider)}
+            class={isManualChatModelProvider(actualProvider) ? "is-selected" : undefined}
             onClick={() => pickProvider(CHAT_MODEL_MANUAL_PROVIDER)}
           >
             {t(CHAT_MODEL_FIXED_OPTIONS[1].labelKey)}
@@ -258,7 +308,7 @@ export function ComposerModelPickers({
             class="composer-model-menu-advanced"
             onClick={() => {
               setOpen(null);
-              onOpenAdvanced();
+              onOpenAdvanced(prefProvider || undefined);
             }}
           >
             {t("chat.model.advanced")}
@@ -280,6 +330,7 @@ export function ComposerModelPickers({
               role="option"
               aria-selected={prefModel === option.id}
               class={prefModel === option.id ? "is-selected" : undefined}
+              disabled={modelsState !== "ready"}
               onClick={() => pickModel(option.id)}
             >
               {option.label}
@@ -304,7 +355,7 @@ export function ComposerModelPickers({
             class="composer-model-menu-advanced"
             onClick={() => {
               setOpen(null);
-              onOpenAdvanced();
+              onOpenAdvanced(prefProvider || undefined);
             }}
           >
             {t("chat.model.advanced")}
@@ -314,22 +365,23 @@ export function ComposerModelPickers({
 
       {open === "effort" && (
         <div class="composer-model-menu" role="listbox" aria-label={t("chat.reasoning")}>
-          {REASONING_EFFORT_VALUES.map((value) => (
+          <button
+            type="button"
+            role="option"
+            aria-selected={actualEffort === ""}
+            class={actualEffort === "" ? "is-selected" : undefined}
+            onClick={() => pickEffort("")}
+          >
+            {t("chat.model.reasoning.default")}
+          </button>
+          {REASONING_EFFORT_VALUES.filter((value) => selectableEfforts.includes(value)).map((value) => (
             <button
               key={value}
               type="button"
               role="option"
-              aria-selected={chatModelReasoningEffort.value === value}
-              class={chatModelReasoningEffort.value === value ? "is-selected" : undefined}
-              onClick={() => {
-                const provider = prefProvider && !isManualChatModelProvider(prefProvider) ? prefProvider : "";
-                const model = prefModel || "";
-                setChatModelSelection(provider, model, value);
-                if (provider && model && canSend) {
-                  applySessionModelPrefs(sessionId, provider, model, value);
-                }
-                setOpen(null);
-              }}
+              aria-selected={actualEffort === value}
+              class={actualEffort === value ? "is-selected" : undefined}
+              onClick={() => pickEffort(value)}
             >
               {t(`chat.model.reasoning.${value}` as TranslationKey)}
             </button>

@@ -10,7 +10,7 @@ import { locale, localizeRuntimeMessage, setLocale, t } from "./i18n";
 import { SettingsIcon } from "./components/icons";
 import { sidebarWidth } from "./sidebar-layout";
 import { officeAccess, officeConnection, openSessionIds, closeSettingsModal, openSettingsModal, retryOfficeServer, settingsModalOpen, settingsTab, workspaceSessionDropPreview } from "./store";
-import { addDashboardPanel } from "./dashboard-actions";
+import { activateDashboardContainingPanel } from "./dashboard-actions";
 
 export function App() {
   if (officeAccess.value.state !== "authenticated") return <DeviceLogin />;
@@ -27,8 +27,8 @@ export function App() {
       style={{ "--sidebar-width": `${sidebarWidth.value}px` }}
     >
       <header class="topbar" data-mobile-route-chrome>
-        <a class="brand" href="#" aria-label={t("app.home")} title={t("app.home")} onClick={(event) => { event.preventDefault(); addDashboardPanel("studio"); }}>
-          <span class="brand-mark" aria-hidden="true">H</span>
+        <a class="brand" href="#" aria-label={t("app.home")} title={t("app.home")} onClick={(event) => { event.preventDefault(); activateDashboardContainingPanel("studio"); }}>
+          <img class="brand-mark" src="/hermes-studio-icon.png" alt="" aria-hidden="true" />
         </a>
         <div
           class={`runtime-status runtime-${connection.state}`}

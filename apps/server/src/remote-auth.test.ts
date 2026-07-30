@@ -189,6 +189,8 @@ test("one-time enrollment creates a revocable remote operator device without exp
       authentication: "device-cookie",
     });
     assert.equal(access.allowedOperations.includes("chat.session.create"), true);
+    assert.equal(access.allowedOperations.includes("chat-model-preferences.update"), true);
+    assert.equal(access.allowedOperations.includes("local-model-providers.sync"), true);
     assert.equal(access.allowedOperations.includes("global-settings.update"), false);
 
     assert.equal((await fetch(`${base}/api/v1/auth/logout`, {

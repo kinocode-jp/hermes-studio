@@ -147,16 +147,19 @@ test("contradictory totals combine safely with invalid and duplicate rows within
 test("missing timestamps use a stable unknown sentinel and preserve cursor generations", async () => {
   const fields = [
     { id: "missing", profile: "profile-0" },
+    { id: "null-optional", profile: "profile-0", started_at: null, last_active: null, ended_at: null },
     { id: "epoch", profile: "profile-0", started_at: 0, last_active: 0 },
     { id: "mixed", profile: "profile-0", last_active: 0 },
   ];
   const mapped = await collectHermesInventory(requester([profile()], fields));
   assert.equal(mapped.sessions[0]?.createdAt, UNKNOWN_INVENTORY_TIMESTAMP);
   assert.equal(mapped.sessions[0]?.updatedAt, UNKNOWN_INVENTORY_TIMESTAMP);
-  assert.equal(mapped.sessions[1]?.createdAt, "1970-01-01T00:00:00.000Z");
-  assert.equal(mapped.sessions[1]?.updatedAt, "1970-01-01T00:00:00.000Z");
-  assert.equal(mapped.sessions[2]?.createdAt, UNKNOWN_INVENTORY_TIMESTAMP);
+  assert.equal(mapped.sessions[1]?.createdAt, UNKNOWN_INVENTORY_TIMESTAMP);
+  assert.equal(mapped.sessions[1]?.updatedAt, UNKNOWN_INVENTORY_TIMESTAMP);
+  assert.equal(mapped.sessions[2]?.createdAt, "1970-01-01T00:00:00.000Z");
   assert.equal(mapped.sessions[2]?.updatedAt, "1970-01-01T00:00:00.000Z");
+  assert.equal(mapped.sessions[3]?.createdAt, UNKNOWN_INVENTORY_TIMESTAMP);
+  assert.equal(mapped.sessions[3]?.updatedAt, "1970-01-01T00:00:00.000Z");
 
   const rows = Array.from({ length: 101 }, (_, index) => ({ id: `missing-${index}`, profile: "profile-0" }));
   const firstInventory = await collectHermesInventory(requester([profile()], rows));
@@ -167,6 +170,23 @@ test("missing timestamps use a stable unknown sentinel and preserve cursor gener
   const second = cache.replace(secondInventory);
   assert.equal(second.metadata.sessions.nextCursor, first.metadata.sessions.nextCursor);
   assert.deepEqual(cache.page("sessions", first.metadata.sessions.nextCursor!, 100).sessions.map((item) => item.id), ["missing-100"]);
+});
+
+test("delegated profile conversations expose only bounded public provenance", async () => {
+  const delegated = {
+    ...session("delegated-session", 1),
+    conversation_kind: "delegated",
+    delegation_task_id: "t_profile_work_1",
+    delegated_by_profile: "default",
+  };
+  const direct = { ...session("direct-session", 2), conversation_kind: "direct" };
+  const inventory = await collectHermesInventory(requester([profile()], [delegated, direct]));
+
+  assert.equal(inventory.sessions[0]?.conversationKind, "delegated");
+  assert.equal(inventory.sessions[0]?.delegationTaskId, "t_profile_work_1");
+  assert.equal(inventory.sessions[0]?.delegatedByProfileId, "default");
+  assert.equal(inventory.sessions[1]?.conversationKind, undefined);
+  assert.equal(inventory.sessions[1]?.delegationTaskId, undefined);
 });
 
 test("session inventory redacts Hermes secrets before bounding browser display text", async () => {

@@ -36,6 +36,8 @@ export interface ProfileAgentBehaviorDto {
 
 export interface OfficeAgentBehaviorUpdate {
   expectedRevision: number;
+  /** Revision of the global shared-candidate collection. */
+  expectedSharedRevision?: number;
   subagentMode?: SubagentMode;
   preferredSubagent?: string;
   preferredCandidateIds?: string[];
@@ -48,11 +50,13 @@ export interface OfficeAgentBehaviorStoreOptions {
 }
 
 export interface OfficeAgentBehaviorFileState {
+  sharedRevision: number;
   sharedCandidates: SharedSubagentCandidate[];
   profiles: Record<string, Omit<ProfileAgentBehaviorDto, "profile">>;
 }
 
 export interface AgentBehaviorSnapshot {
+  sharedRevision: number;
   sharedCandidates: SharedSubagentCandidate[];
   profile: ProfileAgentBehaviorDto;
 }
@@ -78,6 +82,7 @@ export class OfficeAgentBehaviorStore {
     const name = requiredProfile(profile);
     const state = await this.#readStateUnsafe();
     return {
+      sharedRevision: state.sharedRevision,
       sharedCandidates: state.sharedCandidates,
       profile: materialize(name, state.profiles[name], state.sharedCandidates),
     };
@@ -94,22 +99,33 @@ export class OfficeAgentBehaviorStore {
       const sharedCandidates = input.sharedCandidates !== undefined
         ? validateSharedCandidates(input.sharedCandidates)
         : state.sharedCandidates;
+      const sharedCandidatesChanged = !sharedCandidatesEqual(sharedCandidates, state.sharedCandidates);
+      if (sharedCandidatesChanged
+        && (!Number.isInteger(input.expectedSharedRevision)
+          || input.expectedSharedRevision !== state.sharedRevision)) {
+        throw new HermesSettingsError("conflict", "Shared subagent candidates changed; refresh before saving.");
+      }
       const preferredCandidateIds = input.preferredCandidateIds !== undefined
         ? validatePreferredCandidateIds(input.preferredCandidateIds, sharedCandidates)
         : sanitizePreferredCandidateIds(current.preferredCandidateIds, sharedCandidates);
-      const preferredSubagent = input.preferredSubagent !== undefined
-        ? validatePreferredSubagent(input.preferredSubagent)
-        : derivePreferredSubagentLabel(preferredCandidateIds, sharedCandidates, current.preferredSubagent);
+      const usesSharedCandidateSelection = input.preferredCandidateIds !== undefined
+        || current.preferredCandidateIds.length > 0;
+      const preferredSubagent = usesSharedCandidateSelection
+        ? derivePreferredSubagentLabel(preferredCandidateIds, sharedCandidates, "")
+        : input.preferredSubagent !== undefined
+          ? validatePreferredSubagent(input.preferredSubagent)
+          : current.preferredSubagent;
+      const updatedAt = new Date().toISOString();
       const next: ProfileAgentBehaviorDto = {
         profile: name,
         revision: current.revision + 1,
         subagentMode: input.subagentMode ?? current.subagentMode,
         preferredSubagent,
         preferredCandidateIds,
-        updatedAt: new Date().toISOString(),
+        updatedAt,
       };
       validateBehavior(next, sharedCandidates);
-      const profiles = {
+      let profiles = {
         ...state.profiles,
         [name]: {
           revision: next.revision,
@@ -119,8 +135,16 @@ export class OfficeAgentBehaviorStore {
           updatedAt: next.updatedAt,
         },
       };
-      await this.#writeState({ sharedCandidates, profiles });
-      return { sharedCandidates, profile: next };
+      if (sharedCandidatesChanged) {
+        profiles = normalizeProfileCandidateSelections(profiles, sharedCandidates, updatedAt);
+      }
+      const sharedRevision = state.sharedRevision + (sharedCandidatesChanged ? 1 : 0);
+      await this.#writeState({ sharedRevision, sharedCandidates, profiles });
+      return {
+        sharedRevision,
+        sharedCandidates,
+        profile: materialize(name, profiles[name], sharedCandidates),
+      };
     });
   }
 
@@ -138,7 +162,7 @@ export class OfficeAgentBehaviorStore {
       const text = await readFile(this.#filePath, "utf8");
       return validateFileState(JSON.parse(text) as unknown);
     } catch (error) {
-      if (isNodeError(error, "ENOENT")) return { sharedCandidates: [], profiles: {} };
+      if (isNodeError(error, "ENOENT")) return { sharedRevision: 0, sharedCandidates: [], profiles: {} };
       if (error instanceof HermesSettingsError) throw error;
       throw new HermesSettingsError("rejected", "Agent behavior settings could not be read.");
     }
@@ -154,6 +178,27 @@ export class OfficeAgentBehaviorStore {
     this.#queue = result.then(() => undefined, () => undefined);
     return await result;
   }
+}
+
+/** Stable Studio contract: default is the front door; Profiles own specialist work. */
+export function studioDefaultProfileOrchestrationInstruction(): string {
+  return [
+    "Hermes Studio profile contract:",
+    "- You are the default profile: the user's front desk and coordinator, not the default specialist worker.",
+    "- Answer simple general questions directly. For concrete specialist work, select an existing suitable profile and delegate through the shared Kanban with kanban_create. Do not use delegate_task as a substitute for a cross-profile handoff.",
+    "- Give the assignee a self-contained brief with background, goal, scope, constraints, deliverables, acceptance criteria, and required collaboration. Use dependency links for ordered work.",
+    "- The assigned profile's Kanban worker conversation is a separate durable conversation in that profile. Keep it separate from this default conversation.",
+    "- When the subscribed completion or block notification returns here, inspect the task result and report the responsible profile, result, evidence, and unresolved decisions to the user.",
+    "- Never import or continue an earlier chat merely because it exists. A new Studio chat is isolated. Read another saved conversation only when the user explicitly selects, links, or asks for it.",
+  ].join("\n");
+}
+
+/** Keep generic subagent automation out of the default Profile/Kanban front door. */
+export function studioProfileAgentBehaviorInstruction(
+  profile: string,
+  instruction: string | undefined,
+): string | undefined {
+  return profile === "default" ? undefined : instruction;
 }
 
 /** Pure helper: system seed text when mode is auto; empty preferred name is omitted. */
@@ -179,6 +224,57 @@ export function buildSubagentSessionInstruction(
   const preferred = behavior.preferredSubagent.trim();
   if (preferred === "") return "Use subagents proactively.";
   return `Use subagents proactively. Preferred subagent: ${preferred}.`;
+}
+
+/** Instruction so agents author three Studio follow-up chips after each reply. */
+export function studioFollowUpSessionInstruction(): string {
+  return [
+    "When you finish a user-facing reply (not a pure tool-only step), append exactly this footer so Hermes Studio can show three likely follow-up messages:",
+    "",
+    "<studio-followups>",
+    "- concrete next question or action 1",
+    "- concrete next question or action 2",
+    "- concrete next question or action 3",
+    "</studio-followups>",
+    "",
+    "Footer rules:",
+    "- Use the same language as the reply (Japanese when the user wrote Japanese).",
+    "- Infer what the user is most likely to want to ask or request after reading THIS reply.",
+    "- Each line must be a natural, short message the user can send as-is (3-80 characters).",
+    "- Continue the user's actual intent: after choices, offer comparison/recommendation/deeper inspection; after completed work, offer review/refinement/use; after research, offer a concrete drill-down.",
+    "- Make all three lines materially different and specific to details in THIS reply.",
+    "- Never use meta templates such as 'next step', 'what should I ask', 'tell me more', or Japanese equivalents like '次の一手' and '次に何をすべき'.",
+    "- Do not wrap the footer in code fences, and put it only at the very end of the reply.",
+    "- Omit the footer when there is no user-visible answer yet.",
+  ].join("\n");
+}
+
+const STUDIO_FOLLOW_UP_TURN_INSTRUCTION = [
+  "[System: Hermes Studio response format: End this user-facing reply with exactly three likely next user messages in this footer:",
+  "<studio-followups>",
+  "- message 1",
+  "- message 2",
+  "- message 3",
+  "</studio-followups>",
+  "Use the user's language. Each message must be short, natural, specific, materially different, and directly sendable. Do not quote or mechanically rephrase headings or bullets. Avoid generic phrases such as 'tell me more', 'next step', '次の一手', and 'もう少し詳しく説明して'. Omit the footer only when there is no user-visible answer.]",
+].join("\n");
+
+/**
+ * Per-turn reinforcement for resumed or legacy sessions whose create-time
+ * Studio seed was absent or was not persisted by Hermes.
+ */
+export function studioFollowUpTurnInstruction(): string {
+  return STUDIO_FOLLOW_UP_TURN_INSTRUCTION;
+}
+
+export function appendStudioFollowUpTurnInstruction(text: string): string {
+  return `${text}\n\n${STUDIO_FOLLOW_UP_TURN_INSTRUCTION}`;
+}
+
+/** Remove the exact trusted suffix before returning durable history to Studio. */
+export function stripStudioFollowUpTurnInstruction(text: string): string {
+  const suffix = `\n\n${STUDIO_FOLLOW_UP_TURN_INSTRUCTION}`;
+  return text.endsWith(suffix) ? text.slice(0, -suffix.length) : text;
 }
 
 /** Join trusted Office system seeds for a new chat; returns undefined when empty. */
@@ -229,6 +325,10 @@ function defaultBehavior(profile: string): ProfileAgentBehaviorDto {
 
 function validateFileState(value: unknown): OfficeAgentBehaviorFileState {
   if (!isRecord(value) || !isRecord(value.profiles)) throw invalid("Agent behavior store is invalid.");
+  const sharedRevision = value.sharedRevision === undefined ? 0 : value.sharedRevision;
+  if (typeof sharedRevision !== "number" || !Number.isInteger(sharedRevision) || sharedRevision < 0) {
+    throw invalid("Shared subagent candidate revision is invalid.");
+  }
   const sharedCandidates = Array.isArray(value.sharedCandidates)
     ? validateSharedCandidates(value.sharedCandidates)
     : [];
@@ -252,7 +352,7 @@ function validateFileState(value: unknown): OfficeAgentBehaviorFileState {
       updatedAt: dto.updatedAt,
     };
   }
-  return { sharedCandidates, profiles };
+  return { sharedRevision, sharedCandidates, profiles };
 }
 
 function validateBehavior(
@@ -308,6 +408,59 @@ function validateSharedCandidates(value: unknown): SharedSubagentCandidate[] {
     });
   }
   return candidates;
+}
+
+function sharedCandidatesEqual(
+  left: readonly SharedSubagentCandidate[],
+  right: readonly SharedSubagentCandidate[],
+): boolean {
+  return left.length === right.length && left.every((candidate, index) => {
+    const other = right[index];
+    return other !== undefined
+      && candidate.id === other.id
+      && candidate.label === other.label
+      && candidate.provider === other.provider
+      && candidate.model === other.model
+      && candidate.reasoningEffort === other.reasoningEffort
+      && candidate.enabled === other.enabled;
+  });
+}
+
+function normalizeProfileCandidateSelections(
+  profiles: OfficeAgentBehaviorFileState["profiles"],
+  sharedCandidates: readonly SharedSubagentCandidate[],
+  updatedAt: string,
+): OfficeAgentBehaviorFileState["profiles"] {
+  let normalized = profiles;
+  for (const [profile, value] of Object.entries(profiles)) {
+    // An empty id list may be a legacy free-form preference. Preserve it; only
+    // records that opted into shared candidate ids are owned by this migration.
+    if (value.preferredCandidateIds.length === 0) continue;
+    const preferredCandidateIds = sanitizePreferredCandidateIds(
+      value.preferredCandidateIds,
+      sharedCandidates,
+    );
+    const preferredSubagent = derivePreferredSubagentLabel(
+      preferredCandidateIds,
+      sharedCandidates,
+      "",
+    );
+    if (sameStrings(value.preferredCandidateIds, preferredCandidateIds)
+      && value.preferredSubagent === preferredSubagent) continue;
+    if (normalized === profiles) normalized = { ...profiles };
+    normalized[profile] = {
+      ...value,
+      revision: value.revision + 1,
+      preferredSubagent,
+      preferredCandidateIds,
+      updatedAt,
+    };
+  }
+  return normalized;
+}
+
+function sameStrings(left: readonly string[], right: readonly string[]): boolean {
+  return left.length === right.length && left.every((value, index) => value === right[index]);
 }
 
 function validatePreferredCandidateIds(

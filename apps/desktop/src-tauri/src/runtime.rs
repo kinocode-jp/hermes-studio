@@ -104,19 +104,6 @@ pub(crate) fn resolve_repo_root() -> Result<PathBuf, Box<dyn std::error::Error>>
     Err("Could not locate the Hermes Studio repository root. Ensure the working directory is inside the repository.".into())
 }
 
-pub(crate) fn find_compatible_executable(
-    override_name: &str,
-    candidates: &[PathBuf],
-    version_is_compatible: fn(&str) -> bool,
-) -> Result<Option<PathBuf>, String> {
-    find_compatible_executable_with_override(
-        override_name,
-        env::var_os(override_name).filter(|value| !value.is_empty()),
-        candidates,
-        version_is_compatible,
-    )
-}
-
 fn find_compatible_executable_branded(
     suffix: &str,
     candidates: &[PathBuf],
@@ -142,7 +129,7 @@ fn find_compatible_executable_with_override(
         let executable = validated_local_executable(&path).ok_or_else(|| {
             format!("{override_name} must identify an eligible absolute executable")
         })?;
-        let version = run_version_command(&executable)?;
+        let version = run_version_command(&executable, version_is_compatible)?;
         if !version_is_compatible(&version) {
             return Err(format!("{override_name} has an unsupported version"));
         }
@@ -152,7 +139,7 @@ fn find_compatible_executable_with_override(
         let Some(executable) = validated_local_executable(path) else {
             continue;
         };
-        let Ok(version) = run_version_command(&executable) else {
+        let Ok(version) = run_version_command(&executable, version_is_compatible) else {
             continue;
         };
         if version_is_compatible(&version) {
@@ -190,11 +177,26 @@ pub(crate) fn validated_local_executable(path: &Path) -> Option<PathBuf> {
     Some(canonical)
 }
 
-pub(crate) fn run_version_command(path: &Path) -> Result<String, String> {
+pub(crate) fn run_version_command(
+    path: &Path,
+    version_is_compatible: fn(&str) -> bool,
+) -> Result<String, String> {
+    run_version_command_with_timeout(path, VERSION_TIMEOUT, version_is_compatible)
+}
+
+pub(crate) fn run_version_command_with_timeout(
+    path: &Path,
+    timeout: Duration,
+    version_is_compatible: fn(&str) -> bool,
+) -> Result<String, String> {
     let mut command = Command::new(path);
     command
         .arg("--version")
         .env_clear()
+        // Hermes Agent prints its version before performing a best-effort update
+        // check. Flush those lines even when stdout is a pipe so the bounded
+        // launcher probe can use them if that network check outlives the probe.
+        .env("PYTHONUNBUFFERED", "1")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -204,18 +206,21 @@ pub(crate) fn run_version_command(path: &Path) -> Result<String, String> {
     let stderr = child.stderr.take().ok_or_else(|| "runtime version output unavailable".to_owned())?;
     let stdout_reader = thread::spawn(move || read_limited(stdout));
     let stderr_reader = thread::spawn(move || read_limited(stderr));
-    let status = wait_for_bounded_child(&mut child, VERSION_TIMEOUT)
-        .map_err(|_| "runtime version probe failed".to_owned())?
-        .ok_or_else(|| "runtime version probe timed out".to_owned())?;
+    let status = wait_for_bounded_child(&mut child, timeout)
+        .map_err(|_| "runtime version probe failed".to_owned())?;
     let stdout = stdout_reader.join().map_err(|_| "runtime version probe failed".to_owned())??;
     let stderr = stderr_reader.join().map_err(|_| "runtime version probe failed".to_owned())??;
-    if !status.success() {
+    if status.is_some_and(|status| !status.success()) {
         return Err("runtime version probe failed".to_owned());
     }
     let output = if stdout.is_empty() { stderr } else { stdout };
-    String::from_utf8(output)
+    let output = String::from_utf8(output)
         .map(|value| value.trim().to_owned())
-        .map_err(|_| "runtime version output is not UTF-8".to_owned())
+        .map_err(|_| "runtime version output is not UTF-8".to_owned())?;
+    if status.is_none() && !version_is_compatible(&output) {
+        return Err("runtime version probe timed out".to_owned());
+    }
+    Ok(output)
 }
 
 /// Wait for a short-lived helper process and reap it. A timed-out helper is
@@ -297,9 +302,8 @@ pub(crate) fn inherit_safe_environment(command: &mut Command) {
     }
 }
 
-/// Office remote-device configuration is only meaningful to the Office server
-/// child. Preserve it across env_clear so a host owner can launch remote
-/// access without putting tokens in the browser or source files.
+/// Office host configuration is only meaningful to the Office server child.
+/// Preserve it across env_clear without forwarding it to Hermes runtimes.
 pub(crate) fn inherit_office_remote_environment(
     command: &mut Command,
     lookup: impl Fn(&str) -> Option<OsString>,
@@ -310,6 +314,9 @@ pub(crate) fn inherit_office_remote_environment(
         "ALLOWED_ORIGINS",
         "TRUSTED_PROXY_HOPS",
         "REMOTE_PRIVILEGED",
+        "CHAT_SESSION_LEASES_PER_OWNER",
+        "CHAT_SESSION_LEASES_PER_PROFILE",
+        "CHAT_SESSION_LEASES_TOTAL",
     ] {
         if let Some(value) = brand_env_lookup(suffix, &lookup) {
             command.env(format!("HERMES_STUDIO_{suffix}"), value);
@@ -350,30 +357,45 @@ fn push_version_manager_nodes(home: &Path, values: &mut Vec<PathBuf>) {
             .collect::<Vec<_>>();
         version_dirs.sort();
         version_dirs.reverse();
-        for dir in version_dirs.into_iter().take(8) {
+        for dir in version_dirs {
             values.push(dir.join("bin/node"));
         }
     }
     // fnm
     let fnm_root = home.join(".local/share/fnm/node-versions");
     if let Ok(entries) = std::fs::read_dir(&fnm_root) {
-        for entry in entries.flatten().take(12) {
-            let path = entry.path();
-            let name = path.file_name().and_then(|value| value.to_str()).unwrap_or("");
-            if name.contains("v22") || name.starts_with("22.") {
-                values.push(path.join("installation/bin/node"));
-            }
+        let mut version_dirs = entries
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|value| value.to_str())
+                    .map(|name| name.strip_prefix('v').unwrap_or(name))
+                    .is_some_and(|name| name.starts_with("22."))
+            })
+            .collect::<Vec<_>>();
+        version_dirs.sort();
+        version_dirs.reverse();
+        for path in version_dirs {
+            values.push(path.join("installation/bin/node"));
         }
     }
     // asdf
     let asdf_root = home.join(".asdf/installs/nodejs");
     if let Ok(entries) = std::fs::read_dir(&asdf_root) {
-        for entry in entries.flatten().take(12) {
-            let path = entry.path();
-            let name = path.file_name().and_then(|value| value.to_str()).unwrap_or("");
-            if name.starts_with("22.") {
-                values.push(path.join("bin/node"));
-            }
+        let mut version_dirs = entries
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|value| value.to_str())
+                    .is_some_and(|name| name.starts_with("22."))
+            })
+            .collect::<Vec<_>>();
+        version_dirs.sort();
+        version_dirs.reverse();
+        for path in version_dirs {
+            values.push(path.join("bin/node"));
         }
     }
 }

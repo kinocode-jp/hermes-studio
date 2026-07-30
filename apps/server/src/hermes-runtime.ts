@@ -122,43 +122,59 @@ export function normalizeBaseUrl(raw: string): URL {
 export async function probeHermesCli(
   executable: string | undefined,
   timeoutMs = DEFAULT_TIMEOUT_MS,
+  signal?: AbortSignal,
 ): Promise<HermesCliHealth> {
   if (executable === undefined || executable.trim() === "") {
     return { state: "not_configured" };
   }
   if (executable.includes("\0")) return { state: "unavailable" };
+  if (signal?.aborted === true) return { state: "unavailable" };
 
   const boundedTimeout = boundedInteger(timeoutMs, DEFAULT_TIMEOUT_MS, 100, 15_000);
 
   return await new Promise((resolve) => {
     let settled = false;
     let output = "";
-    const finish = (result: HermesCliHealth): void => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      resolve(result);
-    };
     const child = spawn(executable, ["--version"], {
       shell: false,
       stdio: ["ignore", "pipe", "pipe"],
       windowsHide: true,
       env: createVersionProbeEnvironment(),
     });
+    const finish = (result: HermesCliHealth, stopChild = false): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", abort);
+      child.stdout.off("data", capture);
+      child.stderr.off("data", capture);
+      child.off("error", onError);
+      child.off("close", onClose);
+      if (stopChild && child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+      resolve(result);
+    };
     const timer = setTimeout(() => {
       child.kill("SIGKILL");
       finish({ state: "unavailable" });
     }, boundedTimeout);
     timer.unref();
+    function abort(): void {
+      child.kill("SIGKILL");
+      finish({ state: "unavailable" });
+    }
 
     const capture = (chunk: Buffer): void => {
       if (output.length >= MAX_CLI_OUTPUT_BYTES) return;
       output += chunk.toString("utf8", 0, MAX_CLI_OUTPUT_BYTES - output.length);
+      const match = /^Hermes Agent v([^\s]+)/m.exec(output);
+      if (match?.[1] !== undefined) {
+        finish(isRecognizedHermesVersion(match[1])
+          ? { state: "available", version: match[1] }
+          : { state: "unavailable" }, true);
+      }
     };
-    child.stdout.on("data", capture);
-    child.stderr.on("data", capture);
-    child.on("error", () => finish({ state: "unavailable" }));
-    child.on("close", (code) => {
+    const onError = (): void => finish({ state: "unavailable" });
+    const onClose = (code: number | null): void => {
       if (code !== 0) {
         finish({ state: "unavailable" });
         return;
@@ -171,7 +187,13 @@ export async function probeHermesCli(
       finish(isRecognizedHermesVersion(match[1])
         ? { state: "available", version: match[1] }
         : { state: "unavailable" });
-    });
+    };
+    child.stdout.on("data", capture);
+    child.stderr.on("data", capture);
+    child.on("error", onError);
+    child.on("close", onClose);
+    signal?.addEventListener("abort", abort, { once: true });
+    if (signal?.aborted === true) abort();
   });
 }
 

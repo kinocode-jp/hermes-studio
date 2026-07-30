@@ -1,5 +1,9 @@
 import { WebSocket } from "ws";
-import { HermesSettingsError, type HermesProfileBackendAccess } from "./hermes-settings.js";
+import {
+  HermesSettingsError,
+  type HermesProfileBackendAccess,
+  type HermesProfileBackendResolveOptions,
+} from "./hermes-settings.js";
 
 /**
  * Per-profile Hermes Projects (named workspaces binding folders/repos).
@@ -62,7 +66,7 @@ export interface HermesProjectsAdapter {
 
 export interface HermesProjectsAdapterOptions {
   /** Must resolve a process whose HERMES_HOME is the requested profile. */
-  resolveProfileBackend(profile: string): Promise<HermesProfileBackendAccess>;
+  resolveProfileBackend(profile: string, options?: HermesProfileBackendResolveOptions): Promise<HermesProfileBackendAccess>;
   timeoutMs?: number;
 }
 
@@ -77,15 +81,28 @@ const E_PROJECTS = 5061;
 export function createHermesProjectsAdapter(options: HermesProjectsAdapterOptions): HermesProjectsAdapter {
   const timeoutMs = boundedTimeout(options.timeoutMs);
 
-  async function call<T>(profile: string, method: string, params: Record<string, unknown>): Promise<T> {
+  async function call<T>(
+    profile: string,
+    method: string,
+    params: Record<string, unknown>,
+    decode: (value: unknown) => T,
+  ): Promise<T> {
+    const deadlineMs = Date.now() + timeoutMs;
+    const mutation = method !== "projects.list";
     let backend: HermesProfileBackendAccess;
     try {
-      backend = await options.resolveProfileBackend(profile);
+      backend = await resolveProfileBackendBeforeDeadline(profile, options.resolveProfileBackend, deadlineMs);
     } catch (error) {
       throw asProjectsError(error);
     }
     try {
-      return await gatewayCall<T>(backend, method, params, timeoutMs);
+      const value = await gatewayCall<unknown>(backend, method, params, deadlineMs, mutation);
+      try {
+        return decode(value);
+      } catch (error) {
+        if (mutation) throw commitUnconfirmed();
+        throw error;
+      }
     } catch (error) {
       throw asProjectsError(error);
     } finally {
@@ -95,7 +112,7 @@ export function createHermesProjectsAdapter(options: HermesProjectsAdapterOption
 
   return {
     async listProjects(profile) {
-      return validateSnapshot(await call(profile, "projects.list", {}));
+      return await call(profile, "projects.list", {}, validateSnapshot);
     },
     async createProject(profile, input) {
       const params: Record<string, unknown> = { name: input.name };
@@ -103,25 +120,27 @@ export function createHermesProjectsAdapter(options: HermesProjectsAdapterOption
         params.folders = [input.path];
         if (input.isPrimary === true) params.primary_path = input.path;
       }
-      const value = await call(profile, "projects.create", params);
-      return { project: validateNullableProject(value) };
+      return await call(profile, "projects.create", params, (value) => ({ project: validateNullableProject(value) }));
     },
     async updateProject(profile, projectId, patch) {
-      const value = await call(profile, "projects.update", { id: projectId, name: patch.name });
-      return { project: validateProject(unwrapRecord(value).project) };
+      return await call(profile, "projects.update", { id: projectId, name: patch.name }, (value) => ({
+        project: validateProject(unwrapRecord(value).project),
+      }));
     },
     async deleteProject(profile, projectId) {
-      return validateSnapshot(await call(profile, "projects.delete", { id: projectId }));
+      return await call(profile, "projects.delete", { id: projectId }, validateSnapshot);
     },
     async addFolder(profile, projectId, input) {
       const params: Record<string, unknown> = { id: projectId, path: input.path, is_primary: input.isPrimary === true };
       if (input.label !== undefined && input.label.trim() !== "") params.label = input.label;
-      const value = await call(profile, "projects.add_folder", params);
-      return { project: validateProject(unwrapRecord(value).project) };
+      return await call(profile, "projects.add_folder", params, (value) => ({
+        project: validateProject(unwrapRecord(value).project),
+      }));
     },
     async removeFolder(profile, projectId, path) {
-      const value = await call(profile, "projects.remove_folder", { id: projectId, path });
-      return { project: validateProject(unwrapRecord(value).project) };
+      return await call(profile, "projects.remove_folder", { id: projectId, path }, (value) => ({
+        project: validateProject(unwrapRecord(value).project),
+      }));
     },
   };
 }
@@ -136,7 +155,8 @@ async function gatewayCall<T>(
   backend: HermesProfileBackendAccess,
   method: string,
   params: Record<string, unknown>,
-  timeoutMs: number,
+  deadlineMs: number,
+  mutation: boolean,
 ): Promise<T> {
   const url = new URL("/api/ws", backend.baseUrl);
   url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
@@ -147,18 +167,23 @@ async function gatewayCall<T>(
     let socket: WebSocket | undefined;
     let settled = false;
     let opened = false;
+    let dispatched = false;
     let inboundBytes = 0;
+    let timer: ReturnType<typeof setTimeout> | undefined;
 
     const finish = (error: HermesSettingsError | null, value?: T): void => {
       if (settled) return;
       settled = true;
-      clearTimeout(timer);
+      if (timer !== undefined) clearTimeout(timer);
       try { socket?.close(); } catch { /* closing a dead socket is best-effort */ }
       if (error !== null) reject(error);
       else resolve(value as T);
     };
 
     const fail = (error: HermesSettingsError): void => finish(error);
+    const failTransport = (fallback: HermesSettingsError): void => {
+      fail(mutation && dispatched ? commitUnconfirmed() : fallback);
+    };
 
     const handleFrame = (frame: unknown): void => {
       if (!isRecord(frame)) return;
@@ -170,9 +195,15 @@ async function gatewayCall<T>(
       finish(null, frame.result as T);
     };
 
-    const timer = setTimeout(() => {
+    const remainingMs = deadlineMs - Date.now();
+    if (remainingMs <= 0) {
       fail(new HermesSettingsError("timed_out", "Hermes projects request timed out."));
-    }, timeoutMs);
+      return;
+    }
+    timer = setTimeout(() => {
+      failTransport(new HermesSettingsError("timed_out", "Hermes projects request timed out."));
+    }, remainingMs);
+    timer.unref();
 
     try {
       socket = new WebSocket(url);
@@ -184,16 +215,17 @@ async function gatewayCall<T>(
     socket.on("open", () => {
       opened = true;
       try {
+        dispatched = true;
         socket?.send(JSON.stringify({ jsonrpc: "2.0", id: requestId, method, params }));
       } catch {
-        fail(new HermesSettingsError("rejected", "Hermes projects request could not be sent."));
+        failTransport(new HermesSettingsError("rejected", "Hermes projects request could not be sent."));
       }
     });
     socket.on("message", (data: unknown) => {
       const text = typeof data === "string" ? data : String(data);
       inboundBytes += Buffer.byteLength(text);
       if (inboundBytes > MAX_INBOUND_BYTES) {
-        fail(new HermesSettingsError("response_too_large", "Hermes projects response is too large."));
+        failTransport(new HermesSettingsError("response_too_large", "Hermes projects response is too large."));
         return;
       }
       for (const line of text.split("\n")) {
@@ -210,11 +242,11 @@ async function gatewayCall<T>(
       }
     });
     socket.on("error", () => {
-      fail(new HermesSettingsError("rejected", "Hermes projects socket failed."));
+      failTransport(new HermesSettingsError("rejected", "Hermes projects socket failed."));
     });
     socket.on("close", () => {
       if (!settled) {
-        fail(new HermesSettingsError("rejected", opened
+        failTransport(new HermesSettingsError("rejected", opened
           ? "Hermes projects socket closed before a response arrived."
           : "Hermes projects socket was refused."));
       }
@@ -222,20 +254,53 @@ async function gatewayCall<T>(
   });
 }
 
+async function resolveProfileBackendBeforeDeadline(
+  profile: string,
+  resolveProfileBackend: HermesProjectsAdapterOptions["resolveProfileBackend"],
+  deadlineMs: number,
+): Promise<HermesProfileBackendAccess> {
+  const remainingMs = deadlineMs - Date.now();
+  if (remainingMs <= 0) throw projectsTimedOut();
+  const timeoutError = projectsTimedOut();
+  let expired = false;
+  const acquisition = resolveProfileBackend(profile, { deadlineMs }).then((lease) => {
+    if (!expired) return lease;
+    lease.release();
+    throw timeoutError;
+  });
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(() => {
+      expired = true;
+      reject(timeoutError);
+    }, remainingMs);
+    timer.unref();
+  });
+  try {
+    return await Promise.race([acquisition, timeout]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}
+
 function mapGatewayError(error: Record<string, unknown>): HermesSettingsError {
-  const message = typeof error.message === "string" && error.message.trim() !== ""
-    ? error.message
-    : "Hermes projects request was rejected.";
   const code = typeof error.code === "number" ? error.code : E_PROJECTS;
-  if (code === E_NO_PROJECT) return new HermesSettingsError("not_found", message);
-  if (code === E_PROJECT_ARG) return new HermesSettingsError("invalid_request", message);
-  return new HermesSettingsError("rejected", message);
+  if (code === E_NO_PROJECT) return new HermesSettingsError("not_found", "Hermes project was not found.");
+  if (code === E_PROJECT_ARG) return new HermesSettingsError("invalid_request", "Hermes projects request is invalid.");
+  return new HermesSettingsError("rejected", "Hermes projects request was rejected.");
 }
 
 function asProjectsError(error: unknown): HermesSettingsError {
   if (error instanceof HermesSettingsError) return error;
-  const message = error instanceof Error ? error.message : String(error);
-  return new HermesSettingsError("rejected", message);
+  return new HermesSettingsError("rejected", "Hermes projects are unavailable.");
+}
+
+function commitUnconfirmed(): HermesSettingsError {
+  return new HermesSettingsError("commit_unconfirmed", "Hermes may have committed this project change; refresh before retrying.");
+}
+
+function projectsTimedOut(): HermesSettingsError {
+  return new HermesSettingsError("timed_out", "Hermes projects request timed out.");
 }
 
 function boundedTimeout(value: number | undefined): number {

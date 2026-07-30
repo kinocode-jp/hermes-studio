@@ -53,10 +53,12 @@ export function HostApps({ permitted, vaultAccess }: { permitted: boolean; vault
   }, [reload]);
 
   useEffect(() => {
-    if (status?.phase !== "installing") return;
+    const waitingForInstallerSettlement = status?.phase === "installing"
+      || (status?.phase === "failed" && status.canInstall === false);
+    if (!waitingForInstallerSettlement) return;
     const timer = globalThis.setInterval(() => void reload(false), 1_500);
     return () => globalThis.clearInterval(timer);
-  }, [reload, status?.phase]);
+  }, [reload, status?.canInstall, status?.phase]);
 
   const beginInstall = useCallback(async () => {
     if (!permitted || status?.canInstall !== true || status.phase === "installing") return;

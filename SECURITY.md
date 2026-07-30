@@ -30,8 +30,9 @@ response or remediation SLA is promised for this experimental project.
 The current supported trust model is one trusted operator on one machine. Keep
 Hermes and Hermes Studio bound to loopback. Remote access is experimental and
 should only be placed behind an authenticated HTTPS private-network proxy used
-by that same trusted operator (for Tailscale, `npm run start:tailnet` and
-[`docs/TAILSCALE.md`](docs/TAILSCALE.md)). Direct public-internet exposure,
+by that same trusted operator. For Tailscale, use `npm run start:tailnet`, or
+`npm run start:tailnet:desktop` for the installed macOS app; see
+[`docs/TAILSCALE.md`](docs/TAILSCALE.md). Direct public-internet exposure,
 Tailscale Funnel, and untrusted multi-user/tenant deployments are unsupported.
 
 The implementation status and known limitations are documented in

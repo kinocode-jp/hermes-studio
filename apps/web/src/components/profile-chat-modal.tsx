@@ -10,12 +10,18 @@ import {
   ensureSessionConnection,
   MAX_PROFILE_CHAT_MODAL_PANES,
   openMobileWorkspace,
+  officeConnection,
   openProfileSettingsModal,
   openSession,
   profileChatModalId,
+  profileChatModalActivePaneId,
   profileChatModalPaneIds,
   profileList,
   removeProfileChatModalPane,
+  replaceProfileChatModalPane,
+  moveProfileChatModalPane,
+  selectProfileChatModalSession,
+  setProfileChatModalActivePane,
   sessions,
   setProfileChatModalPanes,
 } from "../store";
@@ -24,7 +30,7 @@ import { ChatPane } from "./chat-pane";
 import { CharacterPortrait } from "./character-portrait";
 import { StatusPill } from "./status-pill";
 import { TeamBadges } from "./team-badges";
-import { ChatIcon, CloseIcon, SettingsIcon } from "./icons";
+import { ChatIcon, CloseIcon, SettingsIcon, TrashIcon } from "./icons";
 import { chatSessionTitle, localizeRuntimeMessage, officeRuntimeMessage, t } from "../i18n";
 import { profileDisplayName } from "../profile-names";
 import { loadProfileSoul, SettingsApiError } from "../settings-api";
@@ -36,15 +42,43 @@ import {
 import { markAppModalResizeEnd, markAppModalResizeStart, shouldIgnoreModalOutsideClose } from "../app-modal-layout";
 import { isScheduledSessionHidden } from "../scheduled-sessions";
 import { ProfileContextMenu, useProfileContextMenu } from "./profile-context-menu";
+import { useModalOutsideClose } from "./use-modal-outside-close";
+import { useMobileOverlay } from "./use-mobile-overlay";
+import { DASHBOARD_SESSION_DRAG_TYPE, paneDropTargetAt } from "../dashboard-drag";
+import { SessionDeleteDialog } from "./session-delete-dialog";
 
 const INITIAL_SESSION_COUNT = 10;
+const MODAL_SESSION_DRAG_THRESHOLD_PX = 7;
+
+type ModalDropTarget =
+  | { mode: "insert"; index: number; anchorSessionId?: string; edge?: "before" | "after" }
+  | { mode: "replace"; index: number; sessionId: string };
+
+type ModalSessionPointerDrag = {
+  pointerId: number;
+  sessionId: string;
+  startX: number;
+  startY: number;
+  active: boolean;
+  sourceElement: HTMLElement;
+};
 
 export function ProfileChatModal() {
   const profileId = profileChatModalId.value;
-  if (!profileId) return null;
+  const profile = profileId ? profileList.value.find((item: Profile) => item.id === profileId) : undefined;
+  if (!profileId || !profile) return null;
+  return <OpenProfileChatModal profileId={profileId} profile={profile} />;
+}
 
-  const profile = profileList.value.find((item: Profile) => item.id === profileId);
-  if (!profile) return null;
+function OpenProfileChatModal({ profileId, profile }: { profileId: string; profile: Profile }) {
+  const overlay = useMobileOverlay<HTMLElement>({
+    kind: "modal",
+    open: true,
+    onClose: closeProfileChatModal,
+    viewport: "(min-width: 0px)",
+  });
+
+  const outsideClose = useModalOutsideClose(closeProfileChatModal);
 
   const profileSessions = useMemo(
     () => sessions.value
@@ -54,8 +88,7 @@ export function ProfileChatModal() {
         const right = b.updatedAt ?? b.createdAt ?? "";
         return right.localeCompare(left);
       }),
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-    [profileId, sessions.value.length, sessions.value.map((session) => session.id + session.status + (session.updatedAt ?? "")).join("|")],
+    [profileId, sessions.value],
   );
 
   const displayName = profileDisplayName(profile);
@@ -67,8 +100,10 @@ export function ProfileChatModal() {
     openSessionMenu,
   } = useProfileContextMenu();
   const [showAllSessions, setShowAllSessions] = useState(false);
-  const [dropActive, setDropActive] = useState(false);
+  const [sessionDeleteRequestId, setSessionDeleteRequestId] = useState<string | null>(null);
+  const [dropTarget, setDropTarget] = useState<ModalDropTarget | null>(null);
   const [dropNote, setDropNote] = useState<string | null>(null);
+  const [newChatError, setNewChatError] = useState(false);
   const [soulOpen, setSoulOpen] = useState(false);
   const [soulLoading, setSoulLoading] = useState(false);
   const [soulError, setSoulError] = useState<string | null>(null);
@@ -76,8 +111,10 @@ export function ProfileChatModal() {
 
   useEffect(() => {
     setShowAllSessions(false);
-    setDropActive(false);
+    setSessionDeleteRequestId(null);
+    setDropTarget(null);
     setDropNote(null);
+    setNewChatError(false);
     setSoulOpen(false);
     setSoulLoading(false);
     setSoulError(null);
@@ -118,40 +155,196 @@ export function ProfileChatModal() {
   }, [openPaneIds.join("|")]);
 
   const startNewChat = () => {
-    const sessionId = createSession(profile.id);
-    if (!sessionId) return;
-    if (!addProfileChatModalPane(sessionId)) {
-      // If pane slots are full, replace the oldest pane.
-      const current = profileChatModalPaneIds.value;
-      setProfileChatModalPanes([...current.slice(1), sessionId].slice(-MAX_PROFILE_CHAT_MODAL_PANES));
+    const sessionId = createSession(profile.id, { workspace: false });
+    if (!sessionId) {
+      setNewChatError(true);
+      return;
     }
+    setNewChatError(false);
+    if (!addProfileChatModalPane(sessionId)) {
+      // Explicit new-chat adds until full, then replaces the last-active pane.
+      selectProfileChatModalSession(sessionId);
+    }
+  };
+  const canCreateChat = (
+    officeConnection.value.source === "server"
+      && officeConnection.value.runtime === "ready"
+  ) || (
+    officeConnection.value.source === "demo"
+      && officeConnection.value.state === "demo"
+  );
+  useEffect(() => {
+    if (!canCreateChat) return;
+    setNewChatError(false);
+    if (openPaneIds.length > 0) return;
+
+    // The store attempts this synchronously when the modal opens. It can fail
+    // while Hermes is temporarily non-ready, so retry when readiness returns;
+    // the empty modal must never remain a stale manual-recovery state.
+    const sessionId = createSession(profile.id, { workspace: false });
+    if (!sessionId) {
+      setNewChatError(true);
+      return;
+    }
+    if (!addProfileChatModalPane(sessionId)) {
+      selectProfileChatModalSession(sessionId);
+    }
+  }, [canCreateChat, profile.id, openPaneIds.length]);
+
+  const showDropNote = (message: string) => {
+    setDropNote(message);
+    window.setTimeout(() => setDropNote(null), 2200);
+  };
+
+  const placeModalSession = (sessionId: string, target: ModalDropTarget): boolean => {
+    const session = sessions.value.find((item) => item.id === sessionId);
+    if (!session || session.profileId !== profile.id) {
+      showDropNote(t("profile.modalDropWrongProfile"));
+      return false;
+    }
+    const current = profileChatModalPaneIds.value;
+    if (target.mode === "replace") {
+      const replaced = replaceProfileChatModalPane(target.sessionId, sessionId);
+      if (replaced) setDropNote(null);
+      return replaced;
+    }
+    if (current.includes(sessionId)) {
+      moveProfileChatModalPane(sessionId, target.index);
+      setProfileChatModalActivePane(sessionId);
+      setDropNote(null);
+      return true;
+    }
+    if (!addProfileChatModalPane(sessionId, { index: target.index })) {
+      showDropNote(t("profile.modalPaneLimit"));
+      return false;
+    }
+    setDropNote(null);
+    return true;
+  };
+
+  const resolveModalDropTargetAt = (
+    x: number,
+    y: number,
+    body: HTMLElement,
+  ): ModalDropTarget | null => {
+    const detail = body.querySelector<HTMLElement>(".profile-chat-detail-pane");
+    const detailRect = detail?.getBoundingClientRect();
+    if (!detail || !detailRect || x < detailRect.left || x > detailRect.right
+      || y < detailRect.top || y > detailRect.bottom) return null;
+    const panes = [...detail.querySelectorAll<HTMLElement>(".profile-chat-modal-pane")];
+    if (panes.length === 0) return { mode: "insert", index: 0 };
+    const geometry = paneDropTargetAt(
+      x,
+      y,
+      panes.map((pane, index) => {
+        const rect = pane.getBoundingClientRect();
+        return { index, left: rect.left, right: rect.right, top: rect.top, bottom: rect.bottom, width: rect.width };
+      }),
+    );
+    if (geometry?.mode === "replace") {
+      const sessionId = openPaneIds[geometry.index];
+      if (sessionId) return { ...geometry, sessionId };
+    }
+    if (geometry?.mode === "insert") {
+      const anchorSessionId = openPaneIds[geometry.anchorIndex];
+      return {
+        mode: "insert",
+        index: geometry.index,
+        ...(anchorSessionId ? { anchorSessionId, edge: geometry.edge } : {}),
+      };
+    }
+    return null;
   };
 
   const acceptSessionDrop = (event: DragEvent) => {
+    const sessionId = event.dataTransfer?.getData(DASHBOARD_SESSION_DRAG_TYPE);
+    if (!sessionId || !(event.currentTarget instanceof HTMLElement)) return;
     event.preventDefault();
     event.stopPropagation();
-    setDropActive(false);
-    const sessionId = event.dataTransfer?.getData("application/x-hermes-session");
-    if (!sessionId) return;
-    const session = sessions.value.find((item) => item.id === sessionId);
-    if (!session || session.profileId !== profile.id) {
-      setDropNote(t("profile.modalDropWrongProfile"));
-      window.setTimeout(() => setDropNote(null), 2200);
-      return;
-    }
-    if (profileChatModalPaneIds.value.includes(sessionId)) {
-      ensureSessionConnection(sessionId);
-      setDropNote(null);
-      return;
-    }
-    if (profileChatModalPaneIds.value.length >= MAX_PROFILE_CHAT_MODAL_PANES) {
-      setDropNote(t("profile.modalPaneLimit"));
-      window.setTimeout(() => setDropNote(null), 2200);
-      return;
-    }
-    addProfileChatModalPane(sessionId);
-    setDropNote(null);
+    const target = resolveModalDropTargetAt(event.clientX, event.clientY, event.currentTarget);
+    setDropTarget(null);
+    if (target) placeModalSession(sessionId, target);
   };
+
+  const modalBodyRef = useRef<HTMLDivElement>(null);
+  const pointerDragRef = useRef<ModalSessionPointerDrag | null>(null);
+  const suppressedClickRef = useRef<{ sessionId: string; until: number } | null>(null);
+
+  const beginModalSessionPointerDrag = (event: PointerEvent, sessionId: string) => {
+    if (event.button !== 0 || event.altKey || event.metaKey || event.ctrlKey
+      || !(event.currentTarget instanceof HTMLElement)) return;
+    pointerDragRef.current = {
+      pointerId: event.pointerId,
+      sessionId,
+      startX: event.clientX,
+      startY: event.clientY,
+      active: false,
+      sourceElement: event.currentTarget,
+    };
+  };
+
+  const consumeModalSessionClickSuppression = (sessionId: string): boolean => {
+    const suppressed = suppressedClickRef.current;
+    if (!suppressed || suppressed.sessionId !== sessionId || suppressed.until < Date.now()) return false;
+    suppressedClickRef.current = null;
+    return true;
+  };
+
+  useEffect(() => {
+    const clearPointerDrag = () => {
+      pointerDragRef.current?.sourceElement.classList.remove("is-pointer-dragging");
+      pointerDragRef.current = null;
+      setDropTarget(null);
+    };
+    const pointerMove = (event: PointerEvent) => {
+      const drag = pointerDragRef.current;
+      if (!drag || drag.pointerId !== event.pointerId) return;
+      const distance = Math.hypot(event.clientX - drag.startX, event.clientY - drag.startY);
+      if (!drag.active && distance < MODAL_SESSION_DRAG_THRESHOLD_PX) return;
+      if (!drag.active) {
+        drag.active = true;
+        drag.sourceElement.classList.add("is-pointer-dragging");
+      }
+      event.preventDefault();
+      const body = modalBodyRef.current;
+      const rect = body?.getBoundingClientRect();
+      if (!body || !rect || event.clientX < rect.left || event.clientX > rect.right
+        || event.clientY < rect.top || event.clientY > rect.bottom) {
+        setDropTarget(null);
+        return;
+      }
+      setDropTarget(resolveModalDropTargetAt(event.clientX, event.clientY, body));
+    };
+    const finishPointerDrag = (event: PointerEvent, cancelled = false) => {
+      const drag = pointerDragRef.current;
+      if (!drag || drag.pointerId !== event.pointerId) return;
+      if (drag.active && !cancelled) {
+        event.preventDefault();
+        const body = modalBodyRef.current;
+        const rect = body?.getBoundingClientRect();
+        if (body && rect && event.clientX >= rect.left && event.clientX <= rect.right
+          && event.clientY >= rect.top && event.clientY <= rect.bottom) {
+          const target = resolveModalDropTargetAt(event.clientX, event.clientY, body);
+          if (target) placeModalSession(drag.sessionId, target);
+        }
+        suppressedClickRef.current = { sessionId: drag.sessionId, until: Date.now() + 600 };
+      }
+      clearPointerDrag();
+    };
+    const pointerUp = (event: PointerEvent) => finishPointerDrag(event);
+    const pointerCancel = (event: PointerEvent) => finishPointerDrag(event, true);
+    window.addEventListener("pointermove", pointerMove, { passive: false });
+    window.addEventListener("pointerup", pointerUp);
+    window.addEventListener("pointercancel", pointerCancel);
+    window.addEventListener("blur", clearPointerDrag);
+    return () => {
+      window.removeEventListener("pointermove", pointerMove);
+      window.removeEventListener("pointerup", pointerUp);
+      window.removeEventListener("pointercancel", pointerCancel);
+      window.removeEventListener("blur", clearPointerDrag);
+      clearPointerDrag();
+    };
+  }, [profileId, profileSessionIdsKey, openPaneIds.join("|")]);
 
   const openSoulPreview = async () => {
     setSoulOpen(true);
@@ -266,18 +459,16 @@ export function ProfileChatModal() {
     <div
       class="profile-chat-modal-layer"
       data-modal-affordance="true"
-      onPointerDown={(event) => {
-        if (shouldIgnoreModalOutsideClose()) return;
-        if (event.target === event.currentTarget) closeProfileChatModal();
-      }}
-      onClick={(event) => {
-        if (shouldIgnoreModalOutsideClose()) return;
-        if (event.target === event.currentTarget) closeProfileChatModal();
-      }}
+      {...outsideClose}
     >
       <button class="profile-chat-modal-scrim" type="button" aria-label={t("common.close")} onClick={() => { if (!shouldIgnoreModalOutsideClose()) closeProfileChatModal(); }} />
       <section
+        ref={overlay.ref}
         class={`profile-chat-modal ${hasSessions ? "has-sessions" : "is-empty"}`}
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="profile-chat-modal-title"
+        tabIndex={-1}
         style={{
           width: `${modalSize.width}px`,
           height: hasSessions ? `${modalSize.height}px` : undefined,
@@ -288,7 +479,7 @@ export function ProfileChatModal() {
             <CharacterPortrait profileId={profile.id} profileName={displayName} class="character-portrait--modal" decorative />
             <div class="profile-chat-modal-copy">
               <div class="profile-chat-modal-title-row">
-                <h2 title={displayName}>{displayName}</h2>
+                <h2 id="profile-chat-modal-title" title={displayName}>{displayName}</h2>
                 <button
                   type="button"
                   class={`profile-chat-soul-button ${soulOpen ? "is-open" : ""}`}
@@ -318,6 +509,7 @@ export function ProfileChatModal() {
               class="profile-chat-new profile-chat-new--header"
               title={t("profile.newChat")}
               aria-label={t("profile.newChat")}
+              disabled={!canCreateChat}
               onClick={startNewChat}
             >
               <ChatIcon width={18} height={18} />
@@ -337,6 +529,7 @@ export function ProfileChatModal() {
             <button
               type="button"
               class="profile-chat-modal-close"
+              data-mobile-overlay-initial-focus
               aria-label={t("common.close")}
               title={t("common.close")}
               onClick={closeProfileChatModal}
@@ -379,13 +572,20 @@ export function ProfileChatModal() {
         )}
 
         <div
-          class={`profile-chat-modal-body ${hasSessions ? "is-split" : "is-empty-body"} ${dropActive ? "is-drop-target" : ""}`}
+          ref={modalBodyRef}
+          class={`profile-chat-modal-body ${hasSessions ? "is-split" : "is-empty-body"}`}
           onDragOver={(event) => {
+            const types = event.dataTransfer?.types ? [...event.dataTransfer.types] : [];
+            if (!types.includes(DASHBOARD_SESSION_DRAG_TYPE)) return;
             event.preventDefault();
-            setDropActive(true);
+            if (event.dataTransfer) event.dataTransfer.dropEffect = "copy";
+            if (event.currentTarget instanceof HTMLElement) {
+              setDropTarget(resolveModalDropTargetAt(event.clientX, event.clientY, event.currentTarget));
+            }
           }}
           onDragLeave={(event) => {
-            if (event.currentTarget === event.target) setDropActive(false);
+            const next = event.relatedTarget;
+            if (!(next instanceof Node) || !event.currentTarget.contains(next)) setDropTarget(null);
           }}
           onDrop={acceptSessionDrop}
         >
@@ -401,14 +601,19 @@ export function ProfileChatModal() {
                     <SessionListItem
                       key={session.id}
                       session={session}
-                      profileId={profile.id}
                       selected={openPaneIds.includes(session.id)}
+                      active={profileChatModalActivePaneId.value === session.id}
                       onSelect={() => {
-                        if (!addProfileChatModalPane(session.id)) {
-                          setDropNote(t("profile.modalPaneLimit"));
-                          window.setTimeout(() => setDropNote(null), 2200);
+                        if (consumeModalSessionClickSuppression(session.id)) return;
+                        if (openPaneIds.includes(session.id)) {
+                          setProfileChatModalActivePane(session.id);
+                        } else {
+                          selectProfileChatModalSession(session.id);
                         }
+                        setDropNote(null);
                       }}
+                      onDelete={() => setSessionDeleteRequestId(session.id)}
+                      onPointerDown={(event) => beginModalSessionPointerDrag(event, session.id)}
                       onContextMenu={(event) => openSessionMenu(event, session.id, profile.id)}
                     />
                   ))}
@@ -431,24 +636,51 @@ export function ProfileChatModal() {
                     {t("profile.showRecentChats")}
                   </button>
                 )}
-                {dropActive && <p class="profile-chat-drop-hint">{t("profile.modalDropToAddPane")}</p>}
-                {dropNote && <p class="profile-chat-drop-note">{dropNote}</p>}
+                {dropTarget && <p class="profile-chat-drop-hint">{t("profile.modalDropToAddPane")}</p>}
+                {dropNote && <p class="profile-chat-drop-note" role="status" aria-live="polite" aria-atomic="true">{dropNote}</p>}
               </aside>
 
-              <div class={`profile-chat-detail-pane panes-${Math.min(Math.max(openPanes.length, 1), MAX_PROFILE_CHAT_MODAL_PANES)}`}>
+              <div class={`profile-chat-detail-pane panes-${Math.min(Math.max(openPanes.length, 1), MAX_PROFILE_CHAT_MODAL_PANES)} ${dropTarget ? "is-drop-target" : ""}`}>
                 {openPanes.length > 0 ? (
-                  openPanes.map((session) => (
-                    <div class="profile-chat-modal-pane" key={session.id}>
+                  openPanes.map((session, index) => (
+                    <div
+                      class={`profile-chat-modal-pane ${profileChatModalActivePaneId.value === session.id ? "is-active" : ""} ${dropTarget?.mode === "replace" && dropTarget.sessionId === session.id ? "is-drop-replace" : ""} ${dropTarget?.mode === "insert" && (dropTarget.anchorSessionId ? dropTarget.anchorSessionId === session.id && dropTarget.edge === "before" : dropTarget.index === index) ? "has-drop-before" : ""} ${dropTarget?.mode === "insert" && (dropTarget.anchorSessionId ? dropTarget.anchorSessionId === session.id && dropTarget.edge === "after" : dropTarget.index === openPanes.length && index === openPanes.length - 1) ? "has-drop-after" : ""}`}
+                      key={session.id}
+                      data-session-id={session.id}
+                      onPointerDownCapture={() => setProfileChatModalActivePane(session.id)}
+                      onFocusCapture={() => setProfileChatModalActivePane(session.id)}
+                    >
+                      {dropTarget?.mode === "insert" && (dropTarget.anchorSessionId
+                        ? dropTarget.anchorSessionId === session.id && dropTarget.edge === "before"
+                        : dropTarget.index === index) && (
+                        <div class="workspace-drop-line" aria-hidden="true">
+                          <span>{dropTarget.index === 0 ? t("dashboard.dropInsertStart") : t("dashboard.dropInsertBetween")}</span>
+                        </div>
+                      )}
+                      {dropTarget?.mode === "replace" && dropTarget.sessionId === session.id && (
+                        <div class="profile-chat-pane-replace-drop" aria-hidden="true">
+                          <span>{t("profile.modalDropReplace")}</span>
+                          <small>{t("dashboard.dropReplaceHint")}</small>
+                        </div>
+                      )}
                       <ChatPane
                         session={session}
                         profile={profile}
                         onClosePane={() => removeProfileChatModalPane(session.id)}
                       />
+                      {dropTarget?.mode === "insert" && (dropTarget.anchorSessionId
+                        ? dropTarget.anchorSessionId === session.id && dropTarget.edge === "after"
+                        : dropTarget.index === openPanes.length && index === openPanes.length - 1) && (
+                        <div class="workspace-drop-line is-after" aria-hidden="true"><span>{t("dashboard.dropInsertEnd")}</span></div>
+                      )}
                     </div>
                   ))
                 ) : (
                   <div class="profile-chat-empty">
                     <p>{t("profile.modalDropToAddPane")}</p>
+                    {(newChatError || !canCreateChat) && (
+                      <p class="profile-chat-new-error" role="alert">{t("profile.newChatUnavailable")}</p>
+                    )}
                   </div>
                 )}
               </div>
@@ -456,7 +688,10 @@ export function ProfileChatModal() {
           ) : (
             <div class="profile-chat-empty">
               <p>{t("profile.noChats")}</p>
-              <button type="button" class="profile-chat-new" onClick={startNewChat}>
+              {(newChatError || !canCreateChat) && (
+                <p class="profile-chat-new-error" role="alert">{t("profile.newChatUnavailable")}</p>
+              )}
+              <button type="button" class="profile-chat-new" disabled={!canCreateChat} onClick={startNewChat}>
                 {t("profile.newChat")}
               </button>
             </div>
@@ -474,11 +709,18 @@ export function ProfileChatModal() {
           />
         ))}
       </section>
+      {sessionDeleteRequestId && (() => {
+        const session = sessions.value.find((item) => item.id === sessionDeleteRequestId);
+        return session
+          ? <SessionDeleteDialog session={session} onClose={() => setSessionDeleteRequestId(null)} />
+          : null;
+      })()}
       {menu && (
         <ProfileContextMenu
           menu={menu}
           menuRef={menuRef}
           onClose={closeMenu}
+          onDeleteSession={setSessionDeleteRequestId}
           onOpenSession={(sessionId) => {
             openSession(sessionId, { workspace: true });
             openMobileWorkspace();
@@ -493,13 +735,18 @@ export function ProfileChatModal() {
 function SessionListItem({
   session,
   selected,
+  active,
   onSelect,
+  onDelete,
+  onPointerDown,
   onContextMenu,
 }: {
   session: ChatSession;
-  profileId: string;
   selected: boolean;
+  active: boolean;
   onSelect: () => void;
+  onDelete: () => void;
+  onPointerDown: (event: PointerEvent) => void;
   onContextMenu: (event: MouseEvent) => void;
 }) {
   const title = chatSessionTitle(session);
@@ -510,24 +757,34 @@ function SessionListItem({
   const status = session.status === "streaming" ? "working" : session.status === "waiting" ? "waiting" : "idle";
 
   return (
-    <button
-      type="button"
-      class={`profile-chat-session-item ${selected ? "is-selected" : ""}`}
-      draggable
-      onClick={onSelect}
-      onContextMenu={onContextMenu}
-      onDragStart={(event) => {
-        event.dataTransfer?.setData("application/x-hermes-session", session.id);
-        if (event.dataTransfer) event.dataTransfer.effectAllowed = "copy";
-      }}
-      aria-current={selected ? "true" : undefined}
-      title={t("profile.openInWorkspace")}
-    >
-      <span class="profile-chat-session-item-main">
-        <b title={title}>{title}</b>
-        {timeStr && <small>{timeStr}</small>}
-      </span>
-      <StatusPill status={status} />
-    </button>
+    <div class="profile-chat-session-row">
+      <button
+        type="button"
+        class={`profile-chat-session-item ${selected ? "is-selected" : ""} ${active ? "is-active" : ""}`}
+        onClick={onSelect}
+        onPointerDown={onPointerDown}
+        onContextMenu={onContextMenu}
+        aria-pressed={selected}
+        aria-current={active ? "true" : undefined}
+        data-modal-session-id={session.id}
+        title={t("profile.modalClickReplace")}
+      >
+        <span class="profile-chat-session-item-main">
+          <span class="profile-chat-session-title-line">
+            <b title={title}>{title}</b>
+            {session.conversationKind === "delegated" && <em class="delegated-chat-badge">{t("profile.delegatedChat")}</em>}
+          </span>
+          {timeStr && <small>{timeStr}</small>}
+        </span>
+        <StatusPill status={status} />
+      </button>
+      <button
+        type="button"
+        class="profile-chat-session-delete"
+        aria-label={t("chat.sessionDelete")}
+        title={t("chat.sessionDelete")}
+        onClick={onDelete}
+      ><TrashIcon width={15} height={15} /></button>
+    </div>
   );
 }

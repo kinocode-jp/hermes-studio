@@ -4,6 +4,7 @@ import {
   CHAT_MODEL_MANUAL_PROVIDER,
   modelSelectValue,
   modelSlashCommand,
+  matchingChatModelPresetName,
   needsManualModelEntry,
   parseChatModelPrefsDocument,
   parseLiveCatalog,
@@ -134,6 +135,8 @@ test("parseLiveCatalog accepts multi-provider Office payloads with reasoning eff
       { id: "ok", label: "api_key_label" },
     ],
     provider: "openrouter",
+    defaultProvider: "openrouter",
+    defaultModel: "anthropic/claude",
     models: [
       { id: "anthropic/claude", label: "Claude", reasoningEfforts: ["low", "high", "bogus"] },
       { id: "bad", label: 1 },
@@ -143,6 +146,8 @@ test("parseLiveCatalog accepts multi-provider Office payloads with reasoning eff
     refreshedAt: "2026-07-20T00:00:00.000Z",
   }, "coder");
   assert.equal(catalog.provider, "openrouter");
+  assert.equal(catalog.defaultProvider, "openrouter");
+  assert.equal(catalog.defaultModel, "anthropic/claude");
   assert.deepEqual(catalog.providers.map((item) => item.id), ["openrouter", "ollama"]);
   assert.equal(catalog.providers[0]!.active, true);
   assert.deepEqual(catalog.models, [
@@ -313,4 +318,18 @@ test("selecting a preset main drives resolvedCreateModelPrefs and modelSlashComm
     model: "llama3.2",
     reasoningEffort: "low",
   });
+});
+
+test("preset readout is derived from one unambiguous session-local main slot", () => {
+  const session = { provider: "openai", model: "gpt", reasoningEffort: "high" };
+  const preset = {
+    id: "one", name: "One", main: session,
+    sub: { provider: "", model: "", reasoningEffort: "" },
+  };
+  assert.equal(matchingChatModelPresetName([preset], session), "One");
+  assert.equal(matchingChatModelPresetName([preset], { ...session, model: "other" }), undefined);
+  assert.equal(matchingChatModelPresetName([
+    preset,
+    { ...preset, id: "two", name: "Two", sub: { provider: "ollama", model: "sub", reasoningEffort: "low" } },
+  ], session), undefined);
 });

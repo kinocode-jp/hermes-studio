@@ -1,4 +1,4 @@
-import type { HermesProfileBackendAccess } from "./hermes-settings.js";
+import type { HermesProfileBackendAccess, HermesProfileBackendResolveOptions } from "./hermes-settings.js";
 
 const DEFAULT_TIMEOUT_MS = 15_000;
 const DEFAULT_MAX_RESPONSE_BYTES = 2 * 1024 * 1024;
@@ -47,12 +47,15 @@ export interface LiveModelsCatalog {
   providers: LiveProviderOption[];
   /** Selected provider used for the models list (active or requested). */
   provider: string;
+  /** Profile-configured model target used when Studio resets an open chat to Default. */
+  defaultProvider: string;
+  defaultModel: string;
   models: LiveModelOption[];
   refreshedAt: string;
 }
 
 export interface HermesModelsAdapterOptions {
-  resolveProfileBackend(profile: string): Promise<HermesProfileBackendAccess>;
+  resolveProfileBackend(profile: string, options?: HermesProfileBackendResolveOptions): Promise<HermesProfileBackendAccess>;
   timeoutMs?: number;
   maxResponseBytes?: number;
   maxModels?: number;
@@ -63,8 +66,13 @@ export interface HermesModelsAdapter {
   loadLiveCatalog(
     profile: string,
     provider?: string,
-    loadOptions?: { forceRefresh?: boolean },
+    loadOptions?: { forceRefresh?: boolean; allowRefresh?: boolean },
   ): Promise<LiveModelsCatalog>;
+  /**
+   * Import providers exposed by supported local CLI proxies/runtimes into this
+   * Hermes profile as secret-free, fixed-loopback custom endpoints.
+   */
+  syncLocalCliProviders(profile: string): Promise<{ registered: number }>;
 }
 
 export class HermesModelsError extends Error {
@@ -94,22 +102,31 @@ export function createHermesModelsAdapter(options: HermesModelsAdapterOptions): 
   const maxProviders = bounded(options.maxProviders, DEFAULT_MAX_PROVIDERS, 1, 500);
   const flights = new Map<string, Promise<LiveModelsCatalog>>();
   const cache = new Map<string, CatalogCacheEntry>();
+  const refreshGenerations = new Map<string, number>();
+  const activeRefreshes = new Map<string, number>();
 
   return {
     loadLiveCatalog(
       profile: string,
       provider?: string,
-      loadOptions?: { forceRefresh?: boolean },
+      loadOptions?: { forceRefresh?: boolean; allowRefresh?: boolean },
     ): Promise<LiveModelsCatalog> {
       const validProfile = requiredProfile(profile);
       const requested = provider === undefined || provider.trim() === ""
         ? ""
         : requiredProvider(provider);
       const forceRefresh = loadOptions?.forceRefresh === true;
-      const flightKey = `${validProfile}\0${requested}`;
+      // `forceRefresh` is an explicit mutating intent for existing adapter
+      // callers. HTTP viewers never set it; the POST refresh route sets both.
+      const allowRefresh = forceRefresh || loadOptions?.allowRefresh === true;
+      // A read-only viewer must never join a flight whose cache miss can POST
+      // provider refreshes. Likewise, an explicit refresh must not coalesce
+      // onto an older non-refresh flight and silently lose the user action.
+      const flightKey = `${validProfile}\0${requested}\0${allowRefresh ? "refreshable" : "read-only"}\0${forceRefresh ? "fresh" : "cached"}`;
+      const cacheKey = `${validProfile}\0${requested}`;
 
       if (!forceRefresh) {
-        const hit = cache.get(flightKey);
+        const hit = cache.get(cacheKey);
         if (hit !== undefined && hit.expiresAt > Date.now()) {
           return Promise.resolve(hit.catalog);
         }
@@ -117,6 +134,16 @@ export function createHermesModelsAdapter(options: HermesModelsAdapterOptions): 
 
       const existing = flights.get(flightKey);
       if (existing !== undefined) return existing;
+
+      const refreshIntent = allowRefresh;
+      const startedDuringRefresh = (activeRefreshes.get(cacheKey) ?? 0) > 0;
+      const refreshGeneration = refreshIntent
+        ? (refreshGenerations.get(cacheKey) ?? 0) + 1
+        : (refreshGenerations.get(cacheKey) ?? 0);
+      if (refreshIntent) {
+        refreshGenerations.set(cacheKey, refreshGeneration);
+        activeRefreshes.set(cacheKey, (activeRefreshes.get(cacheKey) ?? 0) + 1);
+      }
 
       const flight = loadCatalog(
         validProfile,
@@ -127,19 +154,269 @@ export function createHermesModelsAdapter(options: HermesModelsAdapterOptions): 
         maxModels,
         maxProviders,
         forceRefresh,
+        allowRefresh,
       ).then((catalog) => {
-        cache.set(flightKey, {
-          expiresAt: Date.now() + CATALOG_CACHE_TTL_MS,
-          catalog,
-        });
+        // A read-only flight that overlaps a refresh may have observed the old
+        // catalog. Never let it overwrite the explicit refresh result merely
+        // because its GET completed later.
+        const generationIsCurrent = (refreshGenerations.get(cacheKey) ?? 0) === refreshGeneration;
+        const noRefreshInFlight = (activeRefreshes.get(cacheKey) ?? 0) === 0;
+        if (generationIsCurrent && (refreshIntent || (!startedDuringRefresh && noRefreshInFlight))) {
+          cache.set(cacheKey, {
+            expiresAt: Date.now() + CATALOG_CACHE_TTL_MS,
+            catalog,
+          });
+        }
         return catalog;
       }).finally(() => {
         if (flights.get(flightKey) === flight) flights.delete(flightKey);
+        if (refreshIntent) {
+          const remaining = (activeRefreshes.get(cacheKey) ?? 1) - 1;
+          if (remaining <= 0) activeRefreshes.delete(cacheKey);
+          else activeRefreshes.set(cacheKey, remaining);
+        }
       });
       flights.set(flightKey, flight);
       return flight;
     },
+    async syncLocalCliProviders(profile: string): Promise<{ registered: number }> {
+      const validProfile = requiredProfile(profile);
+      const deadlineMs = Date.now() + timeoutMs;
+      const discovered = await discoverLocalModelProviders(
+        deadlineMs,
+        maxResponseBytes,
+        maxModels,
+        maxProviders,
+      );
+      if (discovered.length === 0) return { registered: 0 };
+
+      const lease = await resolveProfileBackendBeforeDeadline(
+        validProfile,
+        options.resolveProfileBackend,
+        deadlineMs,
+      );
+      try {
+        const client = new ProfileModelsClient(
+          normalizeBackend(lease),
+          deadlineMs,
+          maxResponseBytes,
+        );
+        const current = await client.requestOptional("/api/providers/custom-endpoints", "GET");
+        const existing = extractCustomEndpointSignatures(current);
+        let registered = 0;
+        for (const provider of discovered) {
+          const signature = existing.get(provider.endpointId);
+          // The stable prefix is ours, but never overwrite a hand-written
+          // endpoint that happens to use the same id for another host.
+          if (signature !== undefined && signature.baseUrl !== provider.baseUrl) continue;
+          if (
+            signature !== undefined
+            && provider.models.every((model) => signature.models.includes(model))
+          ) continue;
+          await client.request("/api/providers/custom-endpoints", "POST", {
+            id: provider.endpointId,
+            name: provider.name,
+            base_url: provider.baseUrl,
+            model: provider.models[0],
+            models: provider.models,
+            discover_models: false,
+            make_default: false,
+          });
+          registered += 1;
+        }
+        for (const key of cache.keys()) {
+          if (key.startsWith(`${validProfile}\0`)) cache.delete(key);
+        }
+        return { registered };
+      } finally {
+        lease.release();
+      }
+    },
   };
+}
+
+const OPENCODEX_ORIGIN = "http://127.0.0.1:10100";
+const OPENCODEX_BASE_URL = `${OPENCODEX_ORIGIN}/v1`;
+
+export type LocalModelProvider = {
+  endpointId: string;
+  name: string;
+  baseUrl: string;
+  models: string[];
+};
+
+const LOCAL_OPENAI_RUNTIMES = [
+  { id: "ollama", label: "Ollama", baseUrl: "http://127.0.0.1:11434/v1" },
+  { id: "lm-studio", label: "LM Studio", baseUrl: "http://127.0.0.1:1234/v1" },
+  { id: "vllm", label: "vLLM", baseUrl: "http://127.0.0.1:8000/v1" },
+] as const;
+
+async function discoverLocalModelProviders(
+  deadlineMs: number,
+  maxResponseBytes: number,
+  maxModels: number,
+  maxProviders: number,
+): Promise<LocalModelProvider[]> {
+  const discovered = await Promise.all([
+    discoverOpenCodexProviders(deadlineMs, maxResponseBytes, maxModels, maxProviders),
+    ...LOCAL_OPENAI_RUNTIMES.map(async (runtime) => {
+      const payload = await fetchLocalJson(`${runtime.baseUrl}/models`, deadlineMs, maxResponseBytes, 1_500);
+      const models = extractOpenAiCompatibleModelIds(payload, maxModels);
+      if (models.length === 0) return [];
+      return [{
+        endpointId: `local-runtime-${runtime.id}`,
+        name: `${runtime.label} · Local runtime`,
+        baseUrl: runtime.baseUrl,
+        models,
+      } satisfies LocalModelProvider];
+    }),
+  ]);
+  const unique = new Map<string, LocalModelProvider>();
+  for (const group of discovered) {
+    for (const provider of group) {
+      if (!unique.has(provider.endpointId)) unique.set(provider.endpointId, provider);
+    }
+  }
+  return [...unique.values()].slice(0, maxProviders);
+}
+
+async function discoverOpenCodexProviders(
+  deadlineMs: number,
+  maxResponseBytes: number,
+  maxModels: number,
+  maxProviders: number,
+): Promise<LocalModelProvider[]> {
+  const [modelsPayload, configuredPayload] = await Promise.all([
+    fetchLocalJson(`${OPENCODEX_BASE_URL}/models`, deadlineMs, maxResponseBytes, 3_000),
+    fetchLocalJson(`${OPENCODEX_ORIGIN}/api/providers`, deadlineMs, maxResponseBytes, 3_000),
+  ]);
+  return extractOpenCodexProviders(modelsPayload, configuredPayload, maxModels, maxProviders);
+}
+
+/** Pure, secret-free extraction of providers published by the local OpenCodex proxy. */
+export function extractOpenCodexProviders(
+  modelsPayload: unknown,
+  configuredPayload: unknown,
+  maxModels: number,
+  maxProviders: number,
+): LocalModelProvider[] {
+  if (!isRecord(modelsPayload) || !Array.isArray(modelsPayload.data)) return [];
+  const configured = extractEnabledOpenCodexProviders(configuredPayload, maxProviders);
+  const grouped = new Map<string, string[]>();
+  const rowLimit = Math.max(maxModels, maxModels * maxProviders);
+  for (const row of modelsPayload.data.slice(0, rowLimit)) {
+    if (!isRecord(row)) continue;
+    const model = sanitizeModelId(row.id);
+    if (model === undefined) continue;
+    const slash = model.indexOf("/");
+    const provider = sanitizeProvider(row.owned_by)
+      ?? (slash > 0 ? sanitizeProvider(model.slice(0, slash)) : "openai");
+    if (provider === undefined || (configured !== undefined && !configured.has(provider))) continue;
+    let models = grouped.get(provider);
+    if (models === undefined) {
+      if (grouped.size >= maxProviders) continue;
+      models = [];
+      grouped.set(provider, models);
+    }
+    if (models.length >= maxModels || models.includes(model)) continue;
+    models.push(model);
+  }
+  return [...grouped.entries()].map(([id, models]) => ({
+    endpointId: `local-cli-${id}`,
+    name: `${localCliProviderLabel(id)} · OpenCodex CLI`,
+    baseUrl: OPENCODEX_BASE_URL,
+    models,
+  }));
+}
+
+function extractEnabledOpenCodexProviders(value: unknown, maxProviders: number): Set<string> | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const providers = new Set<string>();
+  for (const row of value.slice(0, maxProviders * 2)) {
+    if (!isRecord(row) || row.disabled === true) continue;
+    const id = sanitizeProvider(row.name ?? row.id);
+    if (id === undefined) continue;
+    providers.add(id);
+    if (providers.size >= maxProviders) break;
+  }
+  return providers;
+}
+
+function extractOpenAiCompatibleModelIds(value: unknown, maxModels: number): string[] {
+  if (!isRecord(value)) return [];
+  const rows = Array.isArray(value.data)
+    ? value.data
+    : Array.isArray(value.models) ? value.models : [];
+  const models: string[] = [];
+  for (const row of rows.slice(0, maxModels * 2)) {
+    const id = sanitizeModelId(isRecord(row) ? row.id ?? row.model ?? row.name : row);
+    if (id === undefined || models.includes(id)) continue;
+    models.push(id);
+    if (models.length >= maxModels) break;
+  }
+  return models;
+}
+
+async function fetchLocalJson(
+  url: string,
+  deadlineMs: number,
+  maxResponseBytes: number,
+  timeoutCapMs: number,
+): Promise<unknown | undefined> {
+  const target = new URL(url);
+  if (target.protocol !== "http:" || !isLoopback(target.hostname) || target.username !== "" || target.password !== "") {
+    return undefined;
+  }
+  const remainingMs = Math.min(timeoutCapMs, deadlineMs - Date.now());
+  if (remainingMs <= 0) return undefined;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), remainingMs);
+  timer.unref();
+  try {
+    const response = await fetch(target, {
+      headers: { Accept: "application/json" },
+      redirect: "error",
+      signal: controller.signal,
+    });
+    if (!response.ok) {
+      await response.body?.cancel().catch(() => undefined);
+      return undefined;
+    }
+    const text = await readBoundedText(response, maxResponseBytes);
+    return JSON.parse(text) as unknown;
+  } catch {
+    return undefined;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function extractCustomEndpointSignatures(
+  value: unknown,
+): Map<string, { baseUrl: string; models: string[] }> {
+  const result = new Map<string, { baseUrl: string; models: string[] }>();
+  if (!isRecord(value) || !Array.isArray(value.endpoints)) return result;
+  for (const row of value.endpoints) {
+    if (!isRecord(row) || typeof row.id !== "string" || typeof row.base_url !== "string") continue;
+    const models = Array.isArray(row.models)
+      ? row.models.flatMap((model) => {
+        const safe = sanitizeModelId(model);
+        return safe === undefined ? [] : [safe];
+      })
+      : [];
+    result.set(row.id, { baseUrl: row.base_url.replace(/\/$/, ""), models });
+  }
+  return result;
+}
+
+function localCliProviderLabel(provider: string): string {
+  if (provider === "openai") return "OpenAI Codex";
+  if (provider === "anthropic") return "Anthropic / Claude";
+  if (provider === "kimi") return "Kimi Code";
+  if (provider === "xai") return "xAI";
+  if (provider === "google-antigravity") return "Google Antigravity";
+  if (provider === "alibaba-token-plan") return "Alibaba Token Plan";
+  return provider.split(/[-_]/).map((part) => part ? `${part[0]!.toUpperCase()}${part.slice(1)}` : "").join(" ");
 }
 
 async function loadCatalog(
@@ -151,16 +428,32 @@ async function loadCatalog(
   maxModels: number,
   maxProviders: number,
   forceRefresh: boolean,
+  allowRefresh: boolean,
 ): Promise<LiveModelsCatalog> {
-  const lease = await resolveProfileBackend(profile);
+  // Include cold profile-process startup and pool-capacity waits in the same
+  // deadline as the catalog probes. This must stay below the Web client's
+  // outer request timeout.
+  const deadlineMs = Date.now() + timeoutMs;
+  const lease = await resolveProfileBackendBeforeDeadline(
+    profile,
+    resolveProfileBackend,
+    deadlineMs,
+  );
   try {
-    const client = new ProfileModelsClient(normalizeBackend(lease), timeoutMs, maxResponseBytes);
-    const { providers, activeProvider } = await loadProviderList(client, maxProviders);
+    const client = new ProfileModelsClient(
+      normalizeBackend(lease),
+      deadlineMs,
+      maxResponseBytes,
+    );
+    const modelInfo = await client.requestOptional("/api/model/info", "GET");
+    const { providers, activeProvider } = await loadProviderList(client, maxProviders, modelInfo);
     const selected = resolveSelectedProvider(requestedProvider, providers, activeProvider);
+    const defaultModel = extractConfiguredModel(modelInfo) ?? "";
+    const defaultProvider = extractActiveProvider(modelInfo) ?? activeProvider;
 
     let models: LiveModelOption[] = [];
     if (selected !== "") {
-      models = await loadModelsForProvider(client, selected, maxModels, forceRefresh);
+      models = await loadModelsForProvider(client, selected, maxModels, forceRefresh, allowRefresh);
     }
 
     return {
@@ -171,6 +464,8 @@ async function loadCatalog(
         active: item.id === activeProvider || item.active,
       })),
       provider: selected,
+      defaultProvider,
+      defaultModel,
       models,
       refreshedAt: new Date().toISOString(),
     };
@@ -179,19 +474,58 @@ async function loadCatalog(
   }
 }
 
+async function resolveProfileBackendBeforeDeadline(
+  profile: string,
+  resolveProfileBackend: HermesModelsAdapterOptions["resolveProfileBackend"],
+  deadlineMs: number,
+): Promise<HermesProfileBackendAccess> {
+  const remainingMs = deadlineMs - Date.now();
+  if (remainingMs <= 0) {
+    throw new HermesModelsError("timed_out", "Hermes model catalog request timed out.");
+  }
+  const timeoutError = new HermesModelsError("timed_out", "Hermes model catalog request timed out.");
+  let timedOut = false;
+  const acquisition = resolveProfileBackend(profile, { deadlineMs }).then((lease) => {
+    if (!timedOut) return lease;
+    // A timed-out pool acquisition cannot be cancelled. Release a lease that
+    // arrives late so it does not pin the profile backend indefinitely.
+    lease.release();
+    throw timeoutError;
+  });
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(() => {
+      timedOut = true;
+      reject(timeoutError);
+    }, remainingMs);
+    timer.unref();
+  });
+  try {
+    return await Promise.race([acquisition, timeout]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}
+
 async function loadProviderList(
   client: ProfileModelsClient,
   maxProviders: number,
+  modelInfo: unknown,
 ): Promise<{ providers: LiveProviderOption[]; activeProvider: string }> {
   // Prefer the local/session catalog first (usually cached in Hermes).
   // Only fall through when the response has no real provider rows.
   const primary = await client.requestOptional("/api/models", "GET");
   let acc = extractProviders(primary, maxProviders);
 
+  // The configured options surface is the authoritative place for named
+  // custom endpoints, including providers imported from local CLI proxies.
+  // Merge it even when the fast session catalog already listed providers.
+  const configured = await client.requestOptional("/api/model/options?explicit_only=1", "GET");
+  acc = mergeProviderCatalogs(acc, extractProviders(configured, maxProviders), maxProviders);
+
   const fallbacks = [
     "/api/models?freshness=session_visit",
     "/api/providers",
-    "/api/model/options?explicit_only=1",
   ] as const;
   for (const path of fallbacks) {
     if (acc.hasListedProviders) break;
@@ -199,9 +533,8 @@ async function loadProviderList(
     acc = mergeProviderExtracts(acc, extractProviders(raw, maxProviders), maxProviders);
   }
 
-  if (acc.activeProvider === "" && acc.providers.length > 0) {
-    const info = await client.requestOptional("/api/model/info", "GET");
-    const fromInfo = extractActiveProvider(info);
+  if (acc.activeProvider === "") {
+    const fromInfo = extractActiveProvider(modelInfo);
     if (fromInfo !== undefined) {
       acc = mergeProviderExtracts(
         acc,
@@ -214,25 +547,57 @@ async function loadProviderList(
   return { providers: acc.providers, activeProvider: acc.activeProvider };
 }
 
+function mergeProviderCatalogs(
+  base: ProviderListExtract,
+  next: ProviderListExtract,
+  maxProviders: number,
+): ProviderListExtract {
+  const activeProvider = next.activeProvider || base.activeProvider;
+  const merged = new Map<string, LiveProviderOption>();
+  for (const item of [...base.providers, ...next.providers]) {
+    const existing = merged.get(item.id);
+    merged.set(item.id, existing === undefined
+      ? { ...item }
+      : {
+        id: item.id,
+        label: item.label === item.id ? existing.label : item.label,
+        active: existing.active || item.active,
+      });
+    if (merged.size >= maxProviders) break;
+  }
+  const providers = [...merged.values()];
+  ensureActiveProviderRow(providers, activeProvider, maxProviders);
+  return {
+    providers,
+    activeProvider,
+    hasListedProviders: base.hasListedProviders || next.hasListedProviders,
+  };
+}
+
 async function loadModelsForProvider(
   client: ProfileModelsClient,
   provider: string,
   maxModels: number,
   forceRefresh: boolean,
+  allowRefresh: boolean,
 ): Promise<LiveModelOption[]> {
   // Fast path: serve whatever Hermes already has in its live list.
   // POST /api/models/refresh often hits remote provider APIs and dominates latency.
-  const fromLive = await tryLoadLiveModels(client, provider, maxModels);
+  const fromLive = filterLocalCliModels(
+    provider,
+    await tryLoadLiveModels(client, provider, maxModels),
+  );
   if (fromLive.length > 0 && !forceRefresh) return fromLive;
 
-  if (forceRefresh || fromLive.length === 0) {
-    try {
-      await client.request("/api/models/refresh", "POST", { provider });
-    } catch (error) {
-      // Refresh is best-effort; continue to live/options when Hermes rejects unknown refresh.
-      if (error instanceof HermesModelsError && error.code === "timed_out") throw error;
-    }
-    const afterRefresh = await tryLoadLiveModels(client, provider, maxModels);
+  if (allowRefresh && (forceRefresh || fromLive.length === 0)) {
+    // Compatibility gaps are optional, but auth, transport, 5xx and malformed
+    // success responses must fail an explicit refresh instead of presenting a
+    // stale list as freshly updated.
+    await client.requestRefreshOptional("/api/models/refresh", { provider });
+    const afterRefresh = filterLocalCliModels(
+      provider,
+      await tryLoadLiveModels(client, provider, maxModels),
+    );
     if (afterRefresh.length > 0) return afterRefresh;
   }
 
@@ -243,9 +608,21 @@ async function loadModelsForProvider(
       "GET",
     );
     return extractModelsForProvider(optionsPayload, provider, maxModels);
-  } catch {
+  } catch (error) {
+    if (error instanceof HermesModelsError && error.code === "timed_out") throw error;
     return fromLive;
   }
+}
+
+function filterLocalCliModels(provider: string, models: LiveModelOption[]): LiveModelOption[] {
+  if (provider.startsWith("local-runtime-")) return models;
+  const marker = "local-cli-";
+  if (!provider.startsWith(marker)) return models;
+  const sourceProvider = provider.slice(marker.length);
+  // OpenCodex publishes its default Codex subscription models without a
+  // provider prefix; every other routed provider uses its explicit namespace.
+  if (sourceProvider === "openai") return models.filter((model) => !model.id.includes("/"));
+  return models.filter((model) => model.id.startsWith(`${sourceProvider}/`));
 }
 
 async function tryLoadLiveModels(
@@ -531,6 +908,21 @@ function extractActiveProvider(value: unknown): string | undefined {
   return undefined;
 }
 
+function extractConfiguredModel(value: unknown): string | undefined {
+  if (!isRecord(value)) return undefined;
+  for (const key of ["model", "default_model", "defaultModel", "current_model", "currentModel"] as const) {
+    const candidate = sanitizeModelId(value[key]);
+    if (candidate !== undefined) return candidate;
+  }
+  if (isRecord(value.model)) {
+    for (const key of ["id", "name", "default"] as const) {
+      const nested = sanitizeModelId(value.model[key]);
+      if (nested !== undefined) return nested;
+    }
+  }
+  return undefined;
+}
+
 function normalizeModelOption(value: unknown): LiveModelOption | undefined {
   if (typeof value === "string") {
     const id = sanitizeModelId(value);
@@ -556,7 +948,7 @@ interface NormalizedBackend {
 class ProfileModelsClient {
   constructor(
     private readonly backend: NormalizedBackend,
-    private readonly timeoutMs: number,
+    private readonly deadlineMs: number,
     private readonly maxResponseBytes: number,
   ) {}
 
@@ -568,11 +960,16 @@ class ProfileModelsClient {
     return await this.#fetch(path, method, body, true);
   }
 
+  async requestRefreshOptional(path: string, body: Record<string, unknown>): Promise<unknown> {
+    return await this.#fetch(path, "POST", body, true, true);
+  }
+
   async #fetch(
     path: string,
     method: "GET" | "POST",
     body: Record<string, unknown> | undefined,
     optional: boolean,
+    strictOptional = false,
   ): Promise<unknown> {
     const target = new URL(path, this.backend.baseUrl);
     if (
@@ -582,8 +979,12 @@ class ProfileModelsClient {
       throw invalid("Hermes models path is invalid.");
     }
 
+    const remainingMs = this.deadlineMs - Date.now();
+    if (remainingMs <= 0) {
+      throw new HermesModelsError("timed_out", "Hermes model catalog request timed out.");
+    }
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), this.timeoutMs);
+    const timer = setTimeout(() => controller.abort(), remainingMs);
     timer.unref();
     try {
       const response = await fetch(target, {
@@ -604,7 +1005,7 @@ class ProfileModelsClient {
           throw rejected();
         }
         // Compatibility gaps (unknown query, missing route, method, not implemented).
-        if (optional && isCompatibilityStatus(response.status)) {
+        if (optional && (strictOptional ? isRefreshCompatibilityStatus(response.status) : isCompatibilityStatus(response.status))) {
           await response.body?.cancel().catch(() => undefined);
           return undefined;
         }
@@ -617,18 +1018,23 @@ class ProfileModelsClient {
         return JSON.parse(text) as unknown;
       } catch {
         // Incomplete/non-JSON discovery payloads fall through to the next source.
-        if (optional) return undefined;
+        if (optional && !strictOptional) return undefined;
         throw rejected();
       }
     } catch (error) {
       if (error instanceof HermesModelsError) throw error;
       if (isAbortError(error)) throw new HermesModelsError("timed_out", "Hermes model catalog request timed out.");
-      if (optional) return undefined;
+      if (optional && !strictOptional) return undefined;
       throw rejected();
     } finally {
       clearTimeout(timer);
     }
   }
+}
+
+/** Only statuses proving that the refresh surface itself is unavailable. */
+function isRefreshCompatibilityStatus(status: number): boolean {
+  return status === 404 || status === 405 || status === 501;
 }
 
 /** Status codes that mean "try another Hermes models/providers surface" for discovery. */
@@ -666,8 +1072,14 @@ function sanitizeLabel(value: unknown): string | undefined {
 }
 
 function containsSuspicious(value: string): boolean {
-  return /api[_-]?key|secret|token|password|credential|authorization|bearer/i.test(value)
-    || value.includes("\0");
+  if (value.includes("\0")) return true;
+  const normalized = value.trim();
+  // Provider vocabulary legitimately contains words such as "token-plan" and
+  // "tokenhub". Reject credential-shaped content, not those public names.
+  return /^(?:api[_-]?key|secret|token|password|credential|authorization|bearer)(?:[_-]?value)?$/i.test(normalized)
+    || /(?:api[_-]?key|secret|token|password|credential|authorization)\s*[:=]\s*\S+/i.test(normalized)
+    || /bearer\s+[A-Za-z0-9._~+/=-]{8,}/i.test(normalized)
+    || /\b(?:sk|pk)-[A-Za-z0-9_-]{8,}\b/i.test(normalized);
 }
 
 function normalizeBackend(value: HermesProfileBackendAccess): NormalizedBackend {

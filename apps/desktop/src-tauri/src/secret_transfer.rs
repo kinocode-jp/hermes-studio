@@ -11,9 +11,9 @@ use std::{
     time::{Duration, Instant},
 };
 
-use tauri::Manager;
-
-use crate::capability::{authenticated_owned_capability, OwnedCapabilityOutcome};
+use crate::capability::{
+    authenticated_owned_capability, close_owned_desktop_window, OwnedCapabilityOutcome,
+};
 use crate::constants::{OFFICE_HOST, OFFICE_PORT};
 use crate::http::{
     http_status_is_ok, read_bounded_response, remaining_timeout, response_deadline,
@@ -62,11 +62,7 @@ fn deposit_secret_blocking(app: &tauri::AppHandle, value: String) -> Result<Stri
     let capability = match authenticated_owned_capability(app) {
         OwnedCapabilityOutcome::Valid(capability) => capability,
         OwnedCapabilityOutcome::Invalid => {
-            // Mirror other capability commands: close the owned window when
-            // ownership is no longer valid.
-            if let Some(window) = app.get_webview_window("main") {
-                let _ = window.close();
-            }
+            close_owned_desktop_window(app);
             return Err("Hermes Studio desktop session is no longer valid.".into());
         }
         OwnedCapabilityOutcome::NotOwned | OwnedCapabilityOutcome::TransientUnavailable => {

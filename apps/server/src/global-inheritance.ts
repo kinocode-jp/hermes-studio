@@ -20,7 +20,11 @@ export interface GlobalInheritanceOptions {
    * Profile overrides still win and permanently relinquish Office ownership.
    */
   listTeamLayers?(): Promise<readonly OfficeTeamSkillLayer[]>;
+  /** Total budget for one queued reconciliation/materialization job. */
+  materializationTimeoutMs?: number;
 }
+
+const DEFAULT_MATERIALIZATION_TIMEOUT_MS = 10_000;
 
 /**
  * Owns the boundary between Office policy layers and independent Hermes homes.
@@ -37,10 +41,12 @@ export interface GlobalInheritanceOptions {
  */
 export class GlobalInheritanceCoordinator {
   readonly #options: GlobalInheritanceOptions;
+  readonly #materializationTimeoutMs: number;
   #queue: Promise<void> = Promise.resolve();
 
   constructor(options: GlobalInheritanceOptions) {
     this.#options = options;
+    this.#materializationTimeoutMs = boundedTimeout(options.materializationTimeoutMs);
   }
 
   async read(): Promise<OfficeGlobalSettingsDto> {
@@ -101,12 +107,14 @@ export class GlobalInheritanceCoordinator {
   }
 
   async update(input: OfficeGlobalSettingsUpdate): Promise<OfficeGlobalSettingsDto> {
+    const deadlineMs = this.#deadline();
     return await this.#serialized(async () => {
-      await this.#reconcilePendingSkillOverrides();
-      await this.#reconcilePendingGlobalSkillMutations();
+      await this.#reconcilePendingSkillOverrides(deadlineMs);
+      await this.#reconcilePendingGlobalSkillMutations(deadlineMs);
+      assertBeforeDeadline(deadlineMs);
       const staged = await this.#options.store.beginMaterialization(input);
-      return await this.#materializeDesired(staged.settings.revision, staged.settings, staged.managedSkills, staged.skillOverrides);
-    });
+      return await this.#materializeDesired(staged.settings.revision, staged.settings, staged.managedSkills, staged.skillOverrides, deadlineMs);
+    }, deadlineMs);
   }
 
   /**
@@ -114,22 +122,26 @@ export class GlobalInheritanceCoordinator {
    * settings revision. Used after team settings or membership changes.
    */
   async rematerializeSkills(): Promise<OfficeGlobalSettingsDto> {
+    const deadlineMs = this.#deadline();
     return await this.#serialized(async () => {
-      await this.#reconcilePendingSkillOverrides();
-      await this.#reconcilePendingGlobalSkillMutations();
+      await this.#reconcilePendingSkillOverrides(deadlineMs);
+      await this.#reconcilePendingGlobalSkillMutations(deadlineMs);
+      assertBeforeDeadline(deadlineMs);
       const state = await this.#options.store.readMaterialization();
       return await this.#materializeDesired(
         state.settings.revision,
         state.settings,
         state.managedSkills,
         state.skillOverrides,
+        deadlineMs,
       );
-    });
+    }, deadlineMs);
   }
 
   /** A Profile-scoped user toggle wins; Office relinquishes this pair. */
   async noteProfileSkillOverride(profile: string, skill: string): Promise<void> {
-    await this.#serialized(async () => await this.#options.store.markSkillOverride(profile, skill));
+    const deadlineMs = this.#deadline();
+    await this.#serialized(async () => await this.#options.store.markSkillOverride(profile, skill), deadlineMs);
   }
 
   /** Durable intent protects the user change until Hermes and ownership agree. */
@@ -140,13 +152,14 @@ export class GlobalInheritanceCoordinator {
     expectedEnabled: boolean,
     mutation: () => Promise<void>,
   ): Promise<void> {
+    const deadlineMs = this.#deadline();
     await this.#serialized(async () => {
-      await this.#reconcilePendingGlobalSkillMutations();
+      await this.#reconcilePendingGlobalSkillMutations(deadlineMs);
       const ownership = await this.#options.store.readMaterialization();
       const alreadyOwned = ownership.skillOverrides.some((item) => item.profile === profile && item.skill === skill);
       if (alreadyOwned) {
         try {
-          const current = (await this.#options.settings.listSkills(profile)).find((item) => item.name === skill);
+          const current = (await this.#options.settings.listSkills(profile, { deadlineMs })).find((item) => item.name === skill);
           if (current?.enabled === desiredEnabled) return;
         } catch { /* Ownership is already durable; the normal mutation reports runtime failure. */ }
         await mutation();
@@ -154,7 +167,7 @@ export class GlobalInheritanceCoordinator {
       }
       const prepared = await this.#options.store.prepareSkillOverride(profile, skill, desiredEnabled, expectedEnabled);
       if (prepared.existing) {
-        await this.#reconcilePendingSkillOverride(prepared.transaction);
+        await this.#reconcilePendingSkillOverride(prepared.transaction, deadlineMs);
         return;
       }
       try {
@@ -170,7 +183,7 @@ export class GlobalInheritanceCoordinator {
         throw reconciliationPending();
       }
       await this.#commitSkillOverride(prepared.transaction);
-    });
+    }, deadlineMs);
   }
 
   async #materializeDesired(
@@ -178,16 +191,21 @@ export class GlobalInheritanceCoordinator {
     settings: OfficeGlobalSettingsDto,
     managedSkills: Array<{ profile: string; skill: string }>,
     skillOverrides: Array<{ profile: string; skill: string }>,
+    deadlineMs: number,
   ): Promise<OfficeGlobalSettingsDto> {
     const managed = new Map(managedSkills.map((item) => [keyOf(item.profile, item.skill), item]));
     const overrides = new Map(skillOverrides.map((item) => [keyOf(item.profile, item.skill), item]));
     const failures: OfficeGlobalSettingsDto["skillSync"]["failures"] = [];
     let profiles: string[];
     try {
-      profiles = uniqueProfiles(await this.#options.listProfiles());
+      profiles = uniqueProfiles(await settleBeforeDeadline(this.#options.listProfiles(), deadlineMs));
     } catch {
-      await this.#options.store.finishMaterialization(revision, [...managed.values()], [...overrides.values()], [{ profile: "default", skill: "profile-discovery", operation: "enable" }]);
-      throw unavailable();
+      return await this.#options.store.finishMaterialization(
+        revision,
+        [...managed.values()],
+        [...overrides.values()],
+        [{ profile: "default", skill: "profile-discovery", operation: "enable" }],
+      );
     }
     const profileSet = new Set(profiles);
     for (const [key, item] of managed) if (!profileSet.has(item.profile)) managed.delete(key);
@@ -196,17 +214,34 @@ export class GlobalInheritanceCoordinator {
     let teamLayers: readonly OfficeTeamSkillLayer[] = [];
     if (this.#options.listTeamLayers !== undefined) {
       try {
-        teamLayers = await this.#options.listTeamLayers();
+        teamLayers = await settleBeforeDeadline(this.#options.listTeamLayers(), deadlineMs);
       } catch {
-        await this.#options.store.finishMaterialization(revision, [...managed.values()], [...overrides.values()], [{ profile: "default", skill: "team-discovery", operation: "enable" }]);
-        throw unavailable();
+        return await this.#options.store.finishMaterialization(
+          revision,
+          [...managed.values()],
+          [...overrides.values()],
+          [{ profile: "default", skill: "team-discovery", operation: "enable" }],
+        );
       }
     }
 
-    for (const profile of profiles) {
+    for (const [profileIndex, profile] of profiles.entries()) {
+      if (deadlineMs <= Date.now()) {
+        // Persist all remaining work as pending without issuing more Hermes I/O.
+        for (const remainingProfile of profiles.slice(profileIndex)) {
+          const remainingDesired = desiredSkillsForProfile(remainingProfile, settings, teamLayers);
+          for (const skill of remainingDesired) failures.push({ profile: remainingProfile, skill, operation: "enable" });
+          for (const item of managed.values()) {
+            if (item.profile === remainingProfile && !remainingDesired.has(item.skill)) {
+              failures.push({ profile: item.profile, skill: item.skill, operation: "disable" });
+            }
+          }
+        }
+        break;
+      }
       const desired = desiredSkillsForProfile(profile, settings, teamLayers);
       let skills;
-      try { skills = await this.#options.settings.listSkills(profile); }
+      try { skills = await this.#options.settings.listSkills(profile, { deadlineMs }); }
       catch {
         for (const skill of desired) failures.push({ profile, skill, operation: "enable" });
         for (const item of managed.values()) if (item.profile === profile && !desired.has(item.skill)) failures.push({ profile, skill: item.skill, operation: "disable" });
@@ -235,7 +270,7 @@ export class GlobalInheritanceCoordinator {
         }
         if (current.enabled) continue; // Already enabled by the Profile/user; never claim it.
         try {
-          await this.#applyGlobalSkillMutation(revision, profile, skill, true, false);
+          await this.#applyGlobalSkillMutation(revision, profile, skill, true, false, deadlineMs);
           managed.set(key, { profile, skill });
         } catch {
           failures.push({ profile, skill, operation: "enable" });
@@ -250,7 +285,7 @@ export class GlobalInheritanceCoordinator {
           continue;
         }
         try {
-          await this.#applyGlobalSkillMutation(revision, profile, item.skill, false, true);
+          await this.#applyGlobalSkillMutation(revision, profile, item.skill, false, true, deadlineMs);
           managed.delete(keyOf(item.profile, item.skill));
         } catch {
           failures.push({ profile, skill: item.skill, operation: "disable" });
@@ -264,14 +299,14 @@ export class GlobalInheritanceCoordinator {
       [...overrides.values()],
       dedupeFailures(failures),
     );
-    if (result.skillSync.state === "pending") throw unavailable();
     return result;
   }
 
-  async #reconcilePendingSkillOverrides(): Promise<void> {
+  async #reconcilePendingSkillOverrides(deadlineMs: number): Promise<void> {
     const state = await this.#options.store.readMaterialization();
     for (const transaction of state.pendingSkillOverrides) {
-      await this.#reconcilePendingSkillOverride(transaction);
+      assertBeforeDeadline(deadlineMs);
+      await this.#reconcilePendingSkillOverride(transaction, deadlineMs);
     }
   }
 
@@ -281,14 +316,16 @@ export class GlobalInheritanceCoordinator {
     skill: string,
     desiredEnabled: boolean,
     expectedEnabled: boolean,
+    deadlineMs: number,
   ): Promise<void> {
+    assertBeforeDeadline(deadlineMs);
     const prepared = await this.#options.store.prepareGlobalSkillMutation(revision, profile, skill, desiredEnabled, expectedEnabled);
     if (prepared.existing) {
-      await this.#reconcilePendingGlobalSkillMutation(prepared.transaction);
+      await this.#reconcilePendingGlobalSkillMutation(prepared.transaction, deadlineMs);
       return;
     }
     try {
-      await this.#options.settings.setSkillEnabled(profile, skill, desiredEnabled, expectedEnabled);
+      await this.#options.settings.setSkillEnabled(profile, skill, desiredEnabled, expectedEnabled, { deadlineMs });
     } catch (error) {
       if (isDefinitePreconditionFailure(error)) {
         try { await this.#options.store.abortGlobalSkillMutation(prepared.transaction); }
@@ -300,33 +337,34 @@ export class GlobalInheritanceCoordinator {
     catch { throw unavailable(); }
   }
 
-  async #reconcilePendingGlobalSkillMutations(): Promise<void> {
+  async #reconcilePendingGlobalSkillMutations(deadlineMs: number): Promise<void> {
     const state = await this.#options.store.readMaterialization();
     for (const transaction of state.pendingGlobalSkillMutations) {
-      await this.#reconcilePendingGlobalSkillMutation(transaction);
+      assertBeforeDeadline(deadlineMs);
+      await this.#reconcilePendingGlobalSkillMutation(transaction, deadlineMs);
     }
   }
 
-  async #reconcilePendingGlobalSkillMutation(transaction: OfficePendingGlobalSkillMutation): Promise<void> {
+  async #reconcilePendingGlobalSkillMutation(transaction: OfficePendingGlobalSkillMutation, deadlineMs: number): Promise<void> {
     let skills;
-    try { skills = await this.#options.settings.listSkills(transaction.profile); }
+    try { skills = await this.#options.settings.listSkills(transaction.profile, { deadlineMs }); }
     catch { throw unavailable(); }
     const current = skills.find((skill) => skill.name === transaction.skill);
     if (current === undefined) throw unavailable();
     if (current.enabled !== transaction.desiredEnabled) {
       if (current.enabled !== transaction.expectedEnabled) throw new HermesSettingsError("conflict", "Global skill changed while reconciliation was pending.");
       try {
-        await this.#options.settings.setSkillEnabled(transaction.profile, transaction.skill, transaction.desiredEnabled, transaction.expectedEnabled);
+        await this.#options.settings.setSkillEnabled(transaction.profile, transaction.skill, transaction.desiredEnabled, transaction.expectedEnabled, { deadlineMs });
       } catch { throw unavailable(); }
     }
     try { await this.#options.store.commitGlobalSkillMutation(transaction); }
     catch { throw unavailable(); }
   }
 
-  async #reconcilePendingSkillOverride(transaction: OfficePendingSkillOverride): Promise<void> {
+  async #reconcilePendingSkillOverride(transaction: OfficePendingSkillOverride, deadlineMs: number): Promise<void> {
     let skills;
     try {
-      skills = await this.#options.settings.listSkills(transaction.profile);
+      skills = await this.#options.settings.listSkills(transaction.profile, { deadlineMs });
     } catch {
       throw reconciliationPending();
     }
@@ -342,6 +380,7 @@ export class GlobalInheritanceCoordinator {
           transaction.skill,
           transaction.desiredEnabled,
           transaction.expectedEnabled,
+          { deadlineMs },
         );
       } catch {
         throw reconciliationPending();
@@ -358,11 +397,16 @@ export class GlobalInheritanceCoordinator {
     }
   }
 
-  async #serialized<T>(operation: () => Promise<T>): Promise<T> {
-    const result = this.#queue.then(operation);
+  async #serialized<T>(operation: () => Promise<T>, deadlineMs: number): Promise<T> {
+    const result = this.#queue.then(async () => {
+      assertBeforeDeadline(deadlineMs);
+      return await operation();
+    });
     this.#queue = result.then(() => undefined, () => undefined);
     return await result;
   }
+
+  #deadline(): number { return Date.now() + this.#materializationTimeoutMs; }
 }
 
 /**
@@ -404,4 +448,29 @@ function reconciliationPending(): HermesSettingsError { return new HermesSetting
 function isDefinitePreconditionFailure(error: unknown): boolean {
   return error instanceof HermesSettingsError
     && (error.code === "conflict" || error.code === "invalid_request" || error.code === "not_found");
+}
+
+function boundedTimeout(value: number | undefined): number {
+  return value === undefined || !Number.isFinite(value)
+    ? DEFAULT_MATERIALIZATION_TIMEOUT_MS
+    : Math.min(60_000, Math.max(100, Math.trunc(value)));
+}
+
+function assertBeforeDeadline(deadlineMs: number): void {
+  if (deadlineMs <= Date.now()) throw unavailable();
+}
+
+async function settleBeforeDeadline<T>(operation: Promise<T>, deadlineMs: number): Promise<T> {
+  const remainingMs = deadlineMs - Date.now();
+  if (remainingMs <= 0) throw unavailable();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(() => reject(unavailable()), remainingMs);
+    timer.unref();
+  });
+  try {
+    return await Promise.race([operation, timeout]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
 }

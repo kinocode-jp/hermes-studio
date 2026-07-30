@@ -1,3 +1,4 @@
+import { effect } from "@preact/signals";
 import { officeInventoryReliability } from "@hermes-studio/protocol";
 import { initialSessions, initialTaskComments, initialTasks, initialTeams, profiles } from "./demo-data";
 import { createDemoKanbanApi } from "./demo-kanban-api";
@@ -9,8 +10,9 @@ import { loadKanbanDemoRuntime, registerKanbanProfileTaskUpdater, resetKanbanRun
 import { prefetchSelectedProfileSettings } from "./settings-prefetch";
 import { findStoredSession, storedSessionClientId } from "./session-identity";
 import { isScheduledSessionHidden } from "./scheduled-sessions";
-import { deleteStoredSession } from "./sessions-api";
-import { mergeServerSessionStatus } from "./session-runtime";
+import { deleteStoredSessions } from "./sessions-api";
+import { runSessionDeletionBatch, type SessionDeletionProgress } from "./session-deletion";
+import { isChatRunActive, mergeServerSessionStatus } from "./session-runtime";
 import { reconcileChatSessionDisconnected } from "./chat-session-reconciliation";
 import { reconcileDefaultAvatarProfiles, registerDefaultAvatarProfiles } from "./avatar-preferences";
 import { ensurePokemonDisplayNames } from "./profile-names";
@@ -33,6 +35,7 @@ import {
   activeSessionId,
   activeSurface,
   chatSocketState,
+  embeddedChatSessionIds,
   inspectorTab,
   latestOfficeSnapshotIdentity,
   officeAccess,
@@ -48,6 +51,7 @@ import {
   settingsModalOpen,
   profileChatModalId,
   profileChatModalPaneIds,
+  profileChatModalActivePaneId,
   runtimeDataSource,
   selectedProfile,
   selectedProfileId,
@@ -59,6 +63,7 @@ import {
 } from "./store-state";
 import { persistUiNavPreferences } from "./ui-nav-prefs";
 import { addPanelToActiveDashboard, removePanel, activeDashboard } from "./dashboard-layout";
+import { clearAllChatComposerStates, clearChatComposerState } from "./chat-composer-state";
 
 export {
   MAX_OPEN_CHAT_SESSIONS,
@@ -66,6 +71,7 @@ export {
   activeSessionId,
   activeSurface,
   chatSocketState,
+  embeddedChatSessionIds,
   inspectorTab,
   mobileInspectorOpen,
   mobileWorkspaceOpen,
@@ -81,6 +87,7 @@ export {
   settingsModalOpen,
   profileChatModalId,
   profileChatModalPaneIds,
+  profileChatModalActivePaneId,
   selectedProfile,
   selectedProfileId,
   selectedProfileSessions,
@@ -96,11 +103,13 @@ export {
   openMobileWorkspace,
 } from "./mobile-routes";
 
-export { addTaskComment, assignTask, createTask, expandedTaskId, kanbanAssignees, kanbanState, moveTask, refreshKanbanBoard, registerKanbanRuntime, retryTaskComments, taskCommentDetail, tasks, toggleTaskComments } from "./kanban-store";
+export { addTaskComment, assignTask, clearFocusedKanbanTask, createTask, expandedTaskId, focusKanbanTask, focusedKanbanTaskId, kanbanAssignees, kanbanState, moveTask, refreshKanbanBoard, registerKanbanRuntime, retryTaskComments, taskCommentDetail, tasks, toggleTaskComments } from "./kanban-store";
 import {
   applyChatGatewayEvent,
   applyChatHistory,
   applySessionModelPrefs,
+  stageSessionModelChange,
+  cancelSessionModelChange,
   clearFollowUpSuggestions,
   interruptSession,
   reconcilePromptOperationsWithHistory,
@@ -115,17 +124,22 @@ import {
   setChatSessionConnecting,
   setChatSessionDisconnected,
   setChatSessionError,
+  setChatSessionQueued,
   setChatSessionReady,
   setChatSocketState,
   steerSession,
   tryFlushCardSeed,
+  pendingCardSeedForPrompt,
   consumeCardSeed,
+  consumeChatComposerPrefill,
 } from "./store-chat";
 
 export {
   applyChatGatewayEvent,
   applyChatHistory,
   applySessionModelPrefs,
+  stageSessionModelChange,
+  cancelSessionModelChange,
   clearFollowUpSuggestions,
   interruptSession,
   reconcilePromptOperationsWithHistory,
@@ -140,11 +154,14 @@ export {
   setChatSessionConnecting,
   setChatSessionDisconnected,
   setChatSessionError,
+  setChatSessionQueued,
   setChatSessionReady,
   setChatSocketState,
   steerSession,
   tryFlushCardSeed,
+  pendingCardSeedForPrompt,
   consumeCardSeed,
+  consumeChatComposerPrefill,
 };
 
 registerKanbanProfileTaskUpdater((counts) => {
@@ -158,6 +175,7 @@ registerKanbanProfileTaskUpdater((counts) => {
  */
 export function navigateToSurface(surface: Surface): void {
   if (surface === "settings" || surface === "library") {
+    clearMobileRoutes();
     openSettingsModal(surface === "library" ? "global" : settingsTab.value);
     return;
   }
@@ -186,6 +204,8 @@ export function registerChatRuntime(actions: {
   releaseSession(clientSessionId: string): void;
   submitPrompt(clientSessionId: string, text: string, operationId: string): Promise<import("./chat-api").ChatPromptResult> | void;
   steer(clientSessionId: string, text: string): Promise<import("./chat-api").ChatSteerResult>;
+  execSlash?(clientSessionId: string, command: string, confirmExpensiveModel?: boolean): Promise<import("./chat-api").ChatSlashResult>;
+  completeSlash?(text: string): Promise<import("./chat-api").SlashCompletionItem[]>;
   interrupt(clientSessionId: string): Promise<void> | void;
   respondClarify(clientSessionId: string, requestId: string, answer: string): Promise<void>;
   respondApproval(clientSessionId: string, approvalId: string, choice: import("./domain").ApprovalChoice): Promise<void>;
@@ -194,21 +214,44 @@ export function registerChatRuntime(actions: {
   officeRuntimeHooks.releaseChatSession = actions.releaseSession;
   officeRuntimeHooks.submitChatPrompt = actions.submitPrompt;
   officeRuntimeHooks.steerChatSession = actions.steer;
+  officeRuntimeHooks.execSlashCommand = actions.execSlash
+    ?? (async () => { throw new Error("Chat runtime does not support slash commands."); });
+  officeRuntimeHooks.completeSlashCommand = actions.completeSlash ?? (async () => []);
   officeRuntimeHooks.interruptChatSession = actions.interrupt;
   officeRuntimeHooks.respondClarify = actions.respondClarify;
   officeRuntimeHooks.respondApproval = actions.respondApproval;
   for (const target of getOpenChatTargets()) officeRuntimeHooks.ensureChatSession(target);
 }
 
+// A hidden session can keep its Hermes lease while a run finishes. Those
+// leases still count against the server's per-owner cap even though they are
+// intentionally absent from the visible target list.
+const deferredChatTargetReleases = new Set<string>();
+
 export function getOpenChatTargets(): ChatTarget[] {
-  return openSessionIds.value.flatMap((clientSessionId) => {
+  // The UI deliberately exposes at most four foreground chats. The server has
+  // additional bounded headroom for delegated or closing runs, while this
+  // client still reserves visible capacity for hidden active runs until their
+  // terminal event arrives.
+  const foregroundSessionIds = [
+    ...profileChatModalPaneIds.value,
+    ...embeddedChatSessionIds.value,
+  ];
+  const requestedSessionIds = foregroundSessionIds.length > 0
+    ? [...new Set([...foregroundSessionIds, ...openSessionIds.value])]
+    : [...new Set(openSessionIds.value)];
+  const requested = new Set(requestedSessionIds);
+  const hiddenReservedLeases = [...deferredChatTargetReleases].filter((sessionId) => {
+    if (requested.has(sessionId)) return false;
+    const session = sessions.value.find((item) => item.id === sessionId);
+    return session !== undefined && isChatRunActive(session);
+  }).length;
+  const visibleCapacity = Math.max(0, MAX_OPEN_CHAT_SESSIONS - hiddenReservedLeases);
+  const activeSessionIds = requestedSessionIds.slice(0, visibleCapacity);
+  return [...new Set(activeSessionIds)].flatMap((clientSessionId) => {
     const session = sessions.value.find((item) => item.id === clientSessionId);
-    if (!session || session.remoteKind === "demo" || !session.remoteKind) return [];
-    return [{
-      clientSessionId: session.id,
-      profileId: session.profileId,
-      ...(session.storedSessionId ? { storedSessionId: session.storedSessionId } : {})
-    }];
+    const target = session === undefined ? undefined : chatTarget(session);
+    return target === undefined ? [] : [target];
   });
 }
 
@@ -270,13 +313,19 @@ export function applyOfficeSnapshot(snapshot: OfficeSnapshot, source: string | O
     setLatestOfficeSnapshotIdentity(source);
   }
   const explicitDemo = snapshot.capabilities.features.includes("demo");
+  const runtimeReady = snapshot.capabilities.runtime.state === "ready";
+  const nonReadyInventoryUnreliable = !explicitDemo
+    && !runtimeReady
+    && (officeInventoryReliability(snapshot.inventory.profiles) !== "complete"
+      || officeInventoryReliability(snapshot.inventory.sessions) !== "complete");
   const profileInventoryUnavailable = !explicitDemo
-    && snapshot.capabilities.runtime.state === "ready"
+    && runtimeReady
     && snapshot.profiles.length === 0
     && officeInventoryReliability(snapshot.inventory.profiles) !== "complete";
+  const preserveLastKnownLiveState = runtimeDataSource === "live" && nonReadyInventoryUnreliable;
   officeSnapshot.value = snapshot;
   officeConnection.value = {
-    state: explicitDemo ? "demo" : profileInventoryUnavailable ? "degraded" : "connected",
+    state: explicitDemo ? "demo" : profileInventoryUnavailable || nonReadyInventoryUnreliable ? "degraded" : "connected",
     source: explicitDemo ? "demo" : "server",
     serverUrl,
     runtime: snapshot.capabilities.runtime.state,
@@ -292,8 +341,8 @@ export function applyOfficeSnapshot(snapshot: OfficeSnapshot, source: string | O
     loadExplicitDemoState();
     return true;
   }
-  if (snapshot.capabilities.runtime.state !== "ready") {
-    clearRuntimeState();
+  if (!runtimeReady) {
+    if (!preserveLastKnownLiveState) clearRuntimeState();
     return true;
   }
   if (profileInventoryUnavailable) {
@@ -361,6 +410,9 @@ export function applyOfficeSnapshot(snapshot: OfficeSnapshot, source: string | O
       ...(live.createdAt === undefined ? {} : { createdAt: live.createdAt }),
       ...(live.updatedAt === undefined ? {} : { updatedAt: live.updatedAt }),
       ...(live.lastMessagePreview === undefined ? {} : { lastMessagePreview: live.lastMessagePreview }),
+      ...(live.conversationKind === undefined ? {} : { conversationKind: live.conversationKind }),
+      ...(live.delegationTaskId === undefined ? {} : { delegationTaskId: live.delegationTaskId }),
+      ...(live.delegatedByProfileId === undefined ? {} : { delegatedByProfileId: live.delegatedByProfileId }),
       status: mergeServerSessionStatus(previous, live.activity),
       connectionState: previous?.connectionState ?? "disconnected",
       historyState: previous?.historyState ?? "unloaded",
@@ -370,16 +422,35 @@ export function applyOfficeSnapshot(snapshot: OfficeSnapshot, source: string | O
   });
   const retainedStored = snapshot.inventory.sessions.hasMore || snapshot.inventory.sessions.truncated ? previousSessions.filter((session) => session.remoteKind === "stored" && !snapshot.sessions.some((live) => live.id === (session.storedSessionId ?? session.id) && live.profileId === session.profileId)) : [];
   const unpersistedDrafts = previousSessions.filter((session) => session.remoteKind === "draft" && !session.storedSessionId);
-  sessions.value = [
+  const nextSessions = [
     ...snapshotSessions,
     ...retainedStored.filter((session) => !isScheduledSessionHidden(session)),
     ...unpersistedDrafts,
   ];
+  const nextSessionIds = new Set(nextSessions.map((session) => session.id));
+  for (const previous of previousSessions) {
+    if (!nextSessionIds.has(previous.id)) clearChatComposerState(previous.id);
+  }
+  sessions.value = nextSessions;
 
-  const liveSessionIds = new Set(sessions.value.map((session) => session.id));
-  const previouslyOpen = openSessionIds.value;
-  openSessionIds.value = previouslyOpen.filter((id) => liveSessionIds.has(id));
-  for (const removedId of previouslyOpen.filter((id) => !liveSessionIds.has(id))) releaseChatTarget(removedId);
+  const liveSessionIds = nextSessionIds;
+  openSessionIds.value = openSessionIds.value.filter((id) => liveSessionIds.has(id));
+  if (profileChatModalId.value !== null
+    && !profileList.value.some((profile) => profile.id === profileChatModalId.value)) {
+    profileChatModalId.value = null;
+    profileChatModalPaneIds.value = [];
+    profileChatModalActivePaneId.value = "";
+  } else {
+    profileChatModalPaneIds.value = profileChatModalPaneIds.value.filter((id) => liveSessionIds.has(id));
+    if (!profileChatModalPaneIds.value.includes(profileChatModalActivePaneId.value)) {
+      profileChatModalActivePaneId.value = profileChatModalPaneIds.value.at(-1) ?? "";
+    }
+  }
+  embeddedChatSessionIds.value = embeddedChatSessionIds.value.filter((id) => liveSessionIds.has(id));
+  // Reconcile both presentation surfaces after inventory removal. A vanished
+  // modal-only session must not retain a hidden lease, and a newly available
+  // workspace slot must resume automatically.
+  reconcileActiveChatTargets(previousTargetIds);
   if (!liveSessionIds.has(activeSessionId.value)) activeSessionId.value = openSessionIds.value.at(-1) ?? "";
   if (!profileList.value.some((profile) => profile.id === selectedProfileId.value)) {
     selectedProfileId.value = profileList.value[0]?.id ?? "";
@@ -395,7 +466,6 @@ export function setOfficeEventStream(eventStream: import("./domain").OfficeConne
 }
 
 export function setOfficeError(message: string, serverUrl: string, preserveRuntime = false): void {
-  if (!preserveRuntime) { clearRuntimeState(); officeSnapshot.value = undefined; }
   officeConnection.value = {
     ...officeConnection.value,
     state: "error",
@@ -404,6 +474,9 @@ export function setOfficeError(message: string, serverUrl: string, preserveRunti
     eventStream: "closed",
     message: officeRuntimeMessage(message)
   };
+  // Publish the unavailable transport state before clearing session inventory.
+  // Dashboard wiring can then distinguish suspension from an intentional close.
+  if (!preserveRuntime) { clearRuntimeState(); officeSnapshot.value = undefined; }
 }
 
 function activityToStatus(activity: string): Profile["status"] {
@@ -428,9 +501,10 @@ export function selectProfile(profileId: string, options?: { openWorkspace?: boo
   inspectorTab.value = "chat";
   persistNavigationState();
   if (options?.openWorkspace) {
-    const existing = sessions.value.find((session) => session.profileId === profileId);
-    if (existing) openSession(existing.id);
-    else createSession(profileId);
+    // A profile/character click means "start a chat", not "resume whichever
+    // durable conversation happened to be listed first". Existing sessions
+    // are resumed only by an explicit session-row selection.
+    createSession(profileId);
     // Studio floor / character click: chat workspace only on mobile (not the inspector).
     openMobileWorkspace();
     return;
@@ -475,47 +549,143 @@ export function closeProfileSettingsModal(): void {
 }
 
 export function openProfileChatModal(profileId: string, options?: { sessionId?: string }): void {
+  const reusingOpenModal = profileChatModalId.value === profileId;
   selectedProfileId.value = profileId;
   prefetchSelectedProfileSettings(profileId);
   profileChatModalId.value = profileId;
   if (options?.sessionId) {
-    profileChatModalPaneIds.value = [options.sessionId];
-    ensureSessionConnection(options.sessionId);
-  } else {
-    profileChatModalPaneIds.value = [];
+    const session = sessions.value.find((item) => item.id === options.sessionId);
+    if (session?.profileId !== profileId) {
+      replaceProfileChatModalPanes([]);
+    } else if (reusingOpenModal && profileChatModalPaneIds.value.length > 0) {
+      selectProfileChatModalSession(options.sessionId);
+    } else {
+      replaceProfileChatModalPanes([options.sessionId]);
+      profileChatModalActivePaneId.value = options.sessionId;
+    }
+  } else if (!reusingOpenModal) {
+    replaceProfileChatModalPanes([]);
+  }
+  // A newly opened profile modal should always present a usable conversation.
+  // Repeated open requests preserve existing panes; only an empty modal gets
+  // a fresh draft.
+  if (profileChatModalPaneIds.value.length === 0) {
+    const sessionId = createSession(profileId, { workspace: false });
+    if (sessionId) {
+      replaceProfileChatModalPanes([sessionId]);
+      profileChatModalActivePaneId.value = sessionId;
+    }
   }
   persistNavigationState();
 }
 
 export function closeProfileChatModal(): void {
+  replaceProfileChatModalPanes([]);
   profileChatModalId.value = null;
-  profileChatModalPaneIds.value = [];
+  profileChatModalActivePaneId.value = "";
 }
 
-export function addProfileChatModalPane(sessionId: string): boolean {
+export function openEmbeddedChatSession(sessionId: string): boolean {
+  if (!sessions.value.some((session) => session.id === sessionId)) return false;
+  const previousTargets = new Set(getOpenChatTargets().map((target) => target.clientSessionId));
+  embeddedChatSessionIds.value = [
+    sessionId,
+    ...embeddedChatSessionIds.value.filter((id) => id !== sessionId),
+  ].slice(0, MAX_OPEN_CHAT_SESSIONS);
+  reconcileActiveChatTargets(previousTargets);
+  return true;
+}
+
+export function closeEmbeddedChatSession(sessionId: string): void {
+  if (!embeddedChatSessionIds.value.includes(sessionId)) return;
+  const previousTargets = new Set(getOpenChatTargets().map((target) => target.clientSessionId));
+  embeddedChatSessionIds.value = embeddedChatSessionIds.value.filter((id) => id !== sessionId);
+  reconcileActiveChatTargets(previousTargets);
+}
+
+export function addProfileChatModalPane(sessionId: string, options?: { index?: number }): boolean {
   const modalProfileId = profileChatModalId.value;
   if (!modalProfileId) return false;
   const session = sessions.value.find((item) => item.id === sessionId);
   if (!session || session.profileId !== modalProfileId) return false;
   const current = profileChatModalPaneIds.value;
   if (current.includes(sessionId)) {
+    if (typeof options?.index === "number") moveProfileChatModalPane(sessionId, options.index);
+    profileChatModalActivePaneId.value = sessionId;
     ensureSessionConnection(sessionId);
     return true;
   }
   if (current.length >= MAX_PROFILE_CHAT_MODAL_PANES) return false;
-  profileChatModalPaneIds.value = [...current, sessionId];
+  const next = [...current];
+  const insertAt = typeof options?.index === "number"
+    ? Math.max(0, Math.min(next.length, Math.floor(options.index)))
+    : next.length;
+  next.splice(insertAt, 0, sessionId);
+  replaceProfileChatModalPanes(next);
+  profileChatModalActivePaneId.value = sessionId;
+  return true;
+}
+
+export function setProfileChatModalActivePane(sessionId: string): boolean {
+  if (!profileChatModalPaneIds.value.includes(sessionId)) return false;
+  profileChatModalActivePaneId.value = sessionId;
   ensureSessionConnection(sessionId);
   return true;
 }
 
+/** Click contract: focus an existing pane, otherwise replace the last-active pane. */
+export function selectProfileChatModalSession(sessionId: string): boolean {
+  const modalProfileId = profileChatModalId.value;
+  const session = sessions.value.find((item) => item.id === sessionId);
+  if (!modalProfileId || session?.profileId !== modalProfileId) return false;
+  const current = profileChatModalPaneIds.value;
+  if (current.includes(sessionId)) return setProfileChatModalActivePane(sessionId);
+  if (current.length === 0) return addProfileChatModalPane(sessionId);
+  const target = current.includes(profileChatModalActivePaneId.value)
+    ? profileChatModalActivePaneId.value
+    : current.at(-1)!;
+  return replaceProfileChatModalPane(target, sessionId);
+}
+
+/** Replace one modal pane, removing a duplicate source pane when necessary. */
+export function replaceProfileChatModalPane(targetSessionId: string, sessionId: string): boolean {
+  const modalProfileId = profileChatModalId.value;
+  const session = sessions.value.find((item) => item.id === sessionId);
+  const current = profileChatModalPaneIds.value;
+  if (!modalProfileId || session?.profileId !== modalProfileId || !current.includes(targetSessionId)) return false;
+  if (targetSessionId === sessionId) return setProfileChatModalActivePane(sessionId);
+  const next: string[] = [];
+  for (const id of current) {
+    if (id === targetSessionId) next.push(sessionId);
+    else if (id !== sessionId) next.push(id);
+  }
+  replaceProfileChatModalPanes(next);
+  profileChatModalActivePaneId.value = sessionId;
+  ensureSessionConnection(sessionId);
+  return true;
+}
+
+export function moveProfileChatModalPane(sessionId: string, index: number): boolean {
+  const current = profileChatModalPaneIds.value;
+  const from = current.indexOf(sessionId);
+  if (from < 0) return false;
+  let desired = Math.max(0, Math.min(current.length, Math.floor(index)));
+  if (from < desired) desired -= 1;
+  const next = current.filter((id) => id !== sessionId);
+  next.splice(Math.max(0, Math.min(next.length, desired)), 0, sessionId);
+  replaceProfileChatModalPanes(next);
+  profileChatModalActivePaneId.value = sessionId;
+  return true;
+}
+
 export function removeProfileChatModalPane(sessionId: string): void {
-  profileChatModalPaneIds.value = profileChatModalPaneIds.value.filter((id) => id !== sessionId);
+  replaceProfileChatModalPanes(profileChatModalPaneIds.value.filter((id) => id !== sessionId));
 }
 
 export function setProfileChatModalPanes(sessionIds: readonly string[]): void {
   const modalProfileId = profileChatModalId.value;
   if (!modalProfileId) {
-    profileChatModalPaneIds.value = [];
+    replaceProfileChatModalPanes([]);
     return;
   }
   const allowed = sessionIds.filter((sessionId) => {
@@ -527,8 +697,16 @@ export function setProfileChatModalPanes(sessionIds: readonly string[]): void {
     if (!unique.includes(id)) unique.push(id);
     if (unique.length >= MAX_PROFILE_CHAT_MODAL_PANES) break;
   }
-  profileChatModalPaneIds.value = unique;
-  for (const id of unique) ensureSessionConnection(id);
+  replaceProfileChatModalPanes(unique);
+}
+
+function replaceProfileChatModalPanes(next: string[]): void {
+  const previousTargets = new Set(getOpenChatTargets().map((target) => target.clientSessionId));
+  profileChatModalPaneIds.value = next;
+  if (!next.includes(profileChatModalActivePaneId.value)) {
+    profileChatModalActivePaneId.value = next.at(-1) ?? "";
+  }
+  reconcileActiveChatTargets(previousTargets);
 }
 
 
@@ -548,6 +726,7 @@ export function clearWorkspaceSessionDropPreview(): void {
 }
 
 export function ensureSessionConnection(sessionId: string): void {
+  if (!getOpenChatTargets().some((target) => target.clientSessionId === sessionId)) return;
   const session = sessions.value.find((item) => item.id === sessionId);
   if (!session) return;
   selectedProfileId.value = session.profileId;
@@ -564,16 +743,15 @@ export function ensureSessionConnection(sessionId: string): void {
 export function openSession(sessionId: string, options?: { workspace?: boolean; index?: number }): void {
   const addToWorkspace = options?.workspace !== false;
   const wasOpen = openSessionIds.value.includes(sessionId);
+  const previousTargets = new Set(getOpenChatTargets().map((target) => target.clientSessionId));
   if (addToWorkspace) {
     if (!wasOpen) {
-      const previousIds = openSessionIds.value;
-      const nextIds = appendOpenSessionId(previousIds, sessionId, options?.index);
-      openSessionIds.value = nextIds;
-      for (const evictedId of previousIds.filter((id) => !nextIds.includes(id))) releaseChatTarget(evictedId);
+      openSessionIds.value = appendOpenSessionId(openSessionIds.value, sessionId, options?.index);
     } else if (typeof options?.index === "number") {
       openSessionIds.value = moveOpenSessionId(openSessionIds.value, sessionId, options.index);
     }
     activeSessionId.value = sessionId;
+    reconcileActiveChatTargets(previousTargets);
   }
   const session = sessions.value.find((item) => item.id === sessionId);
   if (session) {
@@ -584,10 +762,10 @@ export function openSession(sessionId: string, options?: { workspace?: boolean; 
       || session.connectionState !== "ready"
       || session.historyState === "error"
       || session.historyState === "unloaded";
-    if (needsEnsure) {
-      const target = chatTarget(session);
-      if (target) officeRuntimeHooks.ensureChatSession(target);
-    }
+    const newlyActivated = addToWorkspace
+      && !previousTargets.has(sessionId)
+      && getOpenChatTargets().some((target) => target.clientSessionId === sessionId);
+    if (needsEnsure && !newlyActivated) ensureSessionConnection(sessionId);
   }
 }
 
@@ -618,8 +796,9 @@ export function moveOpenSessionId(currentIds: readonly string[], sessionId: stri
 }
 
 export function closeSession(sessionId: string): void {
-  releaseChatTarget(sessionId);
+  const previousTargets = new Set(getOpenChatTargets().map((target) => target.clientSessionId));
   openSessionIds.value = openSessionIds.value.filter((id) => id !== sessionId);
+  reconcileActiveChatTargets(previousTargets);
   if (activeSessionId.value === sessionId) {
     activeSessionId.value = openSessionIds.value.at(-1) ?? "";
   }
@@ -629,37 +808,103 @@ export function closeSession(sessionId: string): void {
 export function dismissSessions(sessionIds: readonly string[]): void {
   const ids = new Set(sessionIds);
   if (ids.size === 0) return;
-  for (const sessionId of ids) releaseChatTarget(sessionId);
+  for (const sessionId of ids) clearChatComposerState(sessionId);
+  const previouslyActiveTargetIds = new Set(getOpenChatTargets().map((target) => target.clientSessionId));
+  for (const sessionId of ids) {
+    if (!previouslyActiveTargetIds.has(sessionId)) releaseChatTarget(sessionId);
+  }
   sessions.value = sessions.value.filter((session) => !ids.has(session.id));
   openSessionIds.value = openSessionIds.value.filter((sessionId) => !ids.has(sessionId));
+  profileChatModalPaneIds.value = profileChatModalPaneIds.value.filter((sessionId) => !ids.has(sessionId));
+  if (!profileChatModalPaneIds.value.includes(profileChatModalActivePaneId.value)) {
+    profileChatModalActivePaneId.value = profileChatModalPaneIds.value.at(-1) ?? "";
+  }
+  embeddedChatSessionIds.value = embeddedChatSessionIds.value.filter((sessionId) => !ids.has(sessionId));
+  reconcileActiveChatTargets(previouslyActiveTargetIds);
   if (ids.has(activeSessionId.value)) activeSessionId.value = openSessionIds.value.at(-1) ?? "";
   updateProfileSessionCounts();
   if (openSessionIds.value.length === 0) noteMobileWorkspaceClosed();
 }
 
-/** Permanently delete durable Hermes sessions, then drop them from Studio lists. */
-export async function deleteSessions(sessionIds: readonly string[]): Promise<{ deleted: string[]; failed: string[] }> {
-  const targets = sessions.value.filter((session) => sessionIds.includes(session.id));
+export type DeleteSessionsOptions = {
+  concurrency?: number;
+  timeoutMs?: number;
+  onProgress?(progress: SessionDeletionProgress): void;
+};
+
+const BULK_SESSION_DELETE_CONCURRENCY = 2;
+const SESSION_DELETE_TIMEOUT_MS = 20_000;
+const HERMES_SESSION_DELETE_BATCH_SIZE = 500;
+
+/** Permanently delete durable Hermes sessions and immediately drop confirmed successes from Studio lists. */
+export async function deleteSessions(
+  sessionIds: readonly string[],
+  options: DeleteSessionsOptions = {},
+): Promise<{ deleted: string[]; failed: string[] }> {
+  const requested = new Set(sessionIds);
+  const targets = sessions.value.filter((session) => requested.has(session.id));
   if (targets.length === 0) return { deleted: [], failed: [] };
 
-  const deleted: string[] = [];
-  const failed: string[] = [];
-  // Sequential deletes keep Hermes load predictable for bulk prune actions.
+  type DurableDelete = { session: (typeof targets)[number]; storedId: string };
+  type ProfileDeleteBatch = { profileId: string; targets: DurableDelete[] };
+  const durableTargets: DurableDelete[] = [];
+  const localTargets: (typeof targets)[number][] = [];
   for (const session of targets) {
     const storedId = session.storedSessionId ?? (session.remoteKind === "stored" ? session.id : undefined);
-    if (!storedId) {
-      deleted.push(session.id);
-      continue;
-    }
-    try {
-      await deleteStoredSession(session.profileId, storedId);
-      deleted.push(session.id);
-    } catch {
-      failed.push(session.id);
+    if (storedId) durableTargets.push({ session, storedId });
+    else localTargets.push(session);
+  }
+  const byProfile = new Map<string, DurableDelete[]>();
+  for (const target of durableTargets) {
+    const existing = byProfile.get(target.session.profileId) ?? [];
+    existing.push(target);
+    byProfile.set(target.session.profileId, existing);
+  }
+  const batches: ProfileDeleteBatch[] = [];
+  for (const [profileId, profileTargets] of byProfile) {
+    for (let offset = 0; offset < profileTargets.length; offset += HERMES_SESSION_DELETE_BATCH_SIZE) {
+      batches.push({ profileId, targets: profileTargets.slice(offset, offset + HERMES_SESSION_DELETE_BATCH_SIZE) });
     }
   }
-  if (deleted.length > 0) dismissSessions(deleted);
-  return { deleted, failed };
+
+  const deletedLocalIds = localTargets.map((session) => session.id);
+  if (deletedLocalIds.length > 0) dismissSessions(deletedLocalIds);
+  let completed = localTargets.length;
+  let deleted = localTargets.length;
+  let failed = 0;
+  if (completed > 0) options.onProgress?.({ completed, total: targets.length, deleted, failed });
+
+  const result = await runSessionDeletionBatch(batches, async (batch) => {
+    const storedIds = batch.targets.map((target) => target.storedId);
+    let firstFailure: unknown;
+    try {
+      await deleteStoredSessions(batch.profileId, storedIds, { timeoutMs: options.timeoutMs ?? SESSION_DELETE_TIMEOUT_MS });
+    } catch (error) {
+      firstFailure = error;
+      // Bulk deletion is idempotent: a retry safely resolves a transient
+      // failure or a timeout after Hermes committed the transaction.
+      try {
+        await deleteStoredSessions(batch.profileId, storedIds, { timeoutMs: options.timeoutMs ?? SESSION_DELETE_TIMEOUT_MS });
+      } catch {
+        failed += batch.targets.length;
+        completed += batch.targets.length;
+        options.onProgress?.({ completed, total: targets.length, deleted, failed });
+        throw firstFailure;
+      }
+    }
+    const deletedIds = batch.targets.map((target) => target.session.id);
+    dismissSessions(deletedIds);
+    deleted += batch.targets.length;
+    completed += batch.targets.length;
+    options.onProgress?.({ completed, total: targets.length, deleted, failed });
+  }, {
+    concurrency: options.concurrency ?? BULK_SESSION_DELETE_CONCURRENCY,
+  });
+
+  return {
+    deleted: [...deletedLocalIds, ...result.deleted.flatMap((batch) => batch.targets.map((target) => target.session.id))],
+    failed: result.failed.flatMap((batch) => batch.targets.map((target) => target.session.id)),
+  };
 }
 
 /**
@@ -676,13 +921,18 @@ export function askAssigneeAboutTask(
 
   const existing = findCardAskSession(sessions.value, task.id, assigneeId);
   if (existing) {
-    openSession(existing.id, openWorkspace ? undefined : { workspace: false });
-    if (openWorkspace) openMobileWorkspace();
+    if (openWorkspace) {
+      openSession(existing.id);
+      openMobileWorkspace();
+    } else {
+      openEmbeddedChatSession(existing.id);
+    }
     return existing.id;
   }
 
-  const sessionId = createSession(assigneeId);
+  const sessionId = createSession(assigneeId, { workspace: openWorkspace });
   if (sessionId === undefined) return undefined;
+  if (!openWorkspace) openEmbeddedChatSession(sessionId);
 
   const seed = buildCardAskSeedPrompt(cardAskSeedInputFromTask({ ...task, assigneeId }));
   sessions.value = sessions.value.map((session) =>
@@ -702,7 +952,7 @@ export function askAssigneeAboutTask(
   return sessionId;
 }
 
-export function createSession(profileId: string): string | undefined {
+export function createSession(profileId: string, options?: { workspace?: boolean }): string | undefined {
   const isLive = officeConnection.value.source === "server" && officeConnection.value.runtime === "ready";
   const isDemo = officeConnection.value.source === "demo" && officeConnection.value.state === "demo";
   if ((!isLive && !isDemo) || !profileList.value.some((profile) => profile.id === profileId)) return undefined;
@@ -724,7 +974,7 @@ export function createSession(profileId: string): string | undefined {
     ...(reasoningEffort ? { reasoningEffort } : {}),
   };
   sessions.value = [...sessions.value, session];
-  openSession(session.id);
+  openSession(session.id, { workspace: options?.workspace !== false });
   return session.id;
 }
 
@@ -751,6 +1001,7 @@ function loadExplicitDemoState(): void {
 
 function clearRuntimeState(): void {
   for (const target of getOpenChatTargets()) releaseChatTarget(target.clientSessionId);
+  clearAllChatComposerStates();
   profileList.value = [];
   sessions.value = [];
   resetKanbanRuntimeState();
@@ -758,6 +1009,10 @@ function clearRuntimeState(): void {
   selectedProfileId.value = "";
   openSessionIds.value = [];
   activeSessionId.value = "";
+  profileChatModalId.value = null;
+  profileChatModalPaneIds.value = [];
+  profileChatModalActivePaneId.value = "";
+  embeddedChatSessionIds.value = [];
   clearMobileRoutes();
   chatSocketState.value = { state: "disconnected", message: officeMessage("runtime.chat.waiting") };
   setRuntimeDataSource("none");
@@ -782,6 +1037,55 @@ function chatTarget(session: import("./domain").ChatSession): ChatTarget | undef
 }
 
 function releaseChatTarget(sessionId: string): void {
+  const session = sessions.value.find((item) => item.id === sessionId);
+  if (session && isChatRunActive(session)) {
+    deferredChatTargetReleases.add(sessionId);
+    return;
+  }
+  releaseChatTargetNow(sessionId);
+}
+
+function releaseChatTargetNow(sessionId: string): void {
   sessions.value = sessions.value.map((session) => session.id === sessionId ? reconcileChatSessionDisconnected(session) : session);
   officeRuntimeHooks.releaseChatSession(sessionId);
+}
+
+// Closing a panel or switching dashboards is a layout operation, not an
+// interrupt command. Keep an active Hermes lease alive off-screen until its
+// terminal event has reached the store, then release it normally.
+effect(() => {
+  const currentSessions = sessions.value;
+  const visibleTargetIds = new Set(getOpenChatTargets().map((target) => target.clientSessionId));
+  for (const sessionId of deferredChatTargetReleases) {
+    if (visibleTargetIds.has(sessionId)) {
+      deferredChatTargetReleases.delete(sessionId);
+      continue;
+    }
+    const session = currentSessions.find((item) => item.id === sessionId);
+    if (session && isChatRunActive(session)) continue;
+    deferredChatTargetReleases.delete(sessionId);
+    releaseChatTargetNow(sessionId);
+    // Releasing the hidden reservation can expose a workspace slot that was
+    // deliberately held back. Ensures are idempotent for already-live targets.
+    for (const target of getOpenChatTargets()) officeRuntimeHooks.ensureChatSession(target);
+  }
+});
+
+function reconcileActiveChatTargets(previousTargetIds: ReadonlySet<string>): void {
+  // Recompute after every deferred release: an outgoing active run consumes a
+  // lease and can reduce how many newly-visible targets may start. Iteration
+  // prevents a foreground switch from briefly opening a fifth server lease.
+  const released = new Set<string>();
+  while (true) {
+    const nextTargetIds = new Set(getOpenChatTargets().map((target) => target.clientSessionId));
+    const outgoing = [...previousTargetIds].find((sessionId) => (
+      !released.has(sessionId) && !nextTargetIds.has(sessionId)
+    ));
+    if (outgoing === undefined) break;
+    released.add(outgoing);
+    releaseChatTarget(outgoing);
+  }
+  for (const target of getOpenChatTargets()) {
+    if (!previousTargetIds.has(target.clientSessionId)) officeRuntimeHooks.ensureChatSession(target);
+  }
 }

@@ -2,6 +2,7 @@ import type { IncomingMessage } from "node:http";
 import type { ProtocolError } from "@hermes-studio/protocol";
 import {
   HermesKanbanAdapter,
+  HermesKanbanCommitUnconfirmedError,
   HermesKanbanUpstreamError,
   KanbanValidationError,
   type CreateKanbanCardInput,
@@ -152,6 +153,16 @@ function errorResult(error: unknown): KanbanHttpResult {
   }
   if (error instanceof KanbanValidationError || error instanceof RequestBodyError) {
     return { status: 400, body: protocolError("bad_request", error.message) };
+  }
+  if (error instanceof HermesKanbanCommitUnconfirmedError) {
+    return {
+      status: 409,
+      body: {
+        code: "commit_unconfirmed",
+        message: "Hermes may have committed this Kanban change; refresh before retrying.",
+        retryable: false,
+      },
+    };
   }
   if (error instanceof HermesKanbanUpstreamError) {
     if (error.status === 404) return { status: 404, body: protocolError("not_found", "Kanban card was not found.") };

@@ -14,14 +14,19 @@ import type {
 import { HermesSettingsError } from "./hermes-settings.js";
 import type { HermesProjectsAdapter } from "./hermes-projects.js";
 import type { GlobalInheritanceCoordinator } from "./global-inheritance.js";
-import type { OfficeAgentBehaviorStore, SubagentMode } from "./office-agent-behavior.js";
+import type { OfficeAgentBehaviorStore, SharedSubagentCandidate, SubagentMode } from "./office-agent-behavior.js";
 import type { HermesConfigValue } from "./hermes-config.js";
 import type { HermesPrivilegedConfigValue } from "./hermes-privileged-config.js";
 import type { SecretTransferStore } from "./secret-transfer.js";
 import { SecretTransferError } from "./secret-transfer.js";
+import {
+  ChatModelPreferencesError,
+  type OfficeChatModelPreferencesStore,
+  validateChatModelPreferencesDocument,
+} from "./chat-model-preferences.js";
 
 export interface SettingsHttpDependencies {
-  /** Required for all profile/global settings routes; optional only for secret-transfer deposit. */
+  /** Required for Hermes profile/global routes; not for Studio-owned standalone settings. */
   settings?: HermesSettingsAdapter;
   globalSettings?: OfficeGlobalSettingsStore;
   globalInheritance?: GlobalInheritanceCoordinator;
@@ -30,6 +35,8 @@ export interface SettingsHttpDependencies {
   projects?: HermesProjectsAdapter;
   /** One-shot secret transfer store (owner privileged sessions only). */
   secretTransfers?: SecretTransferStore;
+  /** Studio-owned model selection shared across desktop and remote clients. */
+  chatModelPreferences?: OfficeChatModelPreferencesStore;
   /**
    * True when authorize already established an owner privileged-settings session
    * (local owner, or remote owner when HERMES_STUDIO_REMOTE_PRIVILEGED is on).
@@ -43,7 +50,7 @@ export interface SettingsHttpResult {
   body: unknown;
   headers?: Record<string, string>;
   changed?: {
-    kind: "global" | "memory" | "skill" | "soul" | "agent-behavior" | "config" | "privileged-config" | "secret" | "projects";
+    kind: "global" | "memory" | "skill" | "soul" | "agent-behavior" | "config" | "privileged-config" | "secret" | "projects" | "chat-model-preferences";
     profile?: string;
     id?: string;
     /** Metadata-only: category or change count — never field names for secrets, never values. */
@@ -54,6 +61,7 @@ export interface SettingsHttpResult {
 
 export function isSettingsHttpPath(pathname: string): boolean {
   return pathname === "/api/v1/settings/global"
+    || pathname === "/api/v1/settings/chat-model-preferences"
     || pathname === "/api/v1/secret-transfers"
     || /^\/api\/v1\/profiles\/[^/]+\/(?:settings|skills|soul|memory|agent-behavior|config|privileged-config|secrets|projects)(?:\/|$)/.test(pathname);
 }
@@ -115,6 +123,23 @@ export async function routeSettingsHttp(
       return methodNotAllowed("GET, PATCH");
     }
 
+    if (url.pathname === "/api/v1/settings/chat-model-preferences") {
+      if (dependencies.chatModelPreferences === undefined) {
+        return { status: 503, body: { error: { code: "storage_unavailable", message: "Chat model preferences are unavailable." } } };
+      }
+      if (request.method === "GET") return ok(await dependencies.chatModelPreferences.read());
+      if (request.method === "PUT") {
+        const body = await readObject(request, Math.min(maxBodyBytes, 64 * 1024));
+        assertOnlyKeys(body, ["expectedRevision", "document"]);
+        const updated = await dependencies.chatModelPreferences.update({
+          expectedRevision: requiredInteger(body.expectedRevision, "expectedRevision", 0),
+          document: validateChatModelPreferencesDocument(body.document),
+        });
+        return { ...ok(updated), changed: { kind: "chat-model-preferences" } };
+      }
+      return methodNotAllowed("GET, PUT");
+    }
+
     const segments = decodeSegments(url.pathname);
     if (segments.length < 5 || segments[0] !== "api" || segments[1] !== "v1" || segments[2] !== "profiles") return notFound();
     if (dependencies.settings === undefined) {
@@ -152,13 +177,12 @@ export async function routeSettingsHttp(
         if (request.method === "PUT") {
           const body = await readObject(request, maxBodyBytes);
           assertOnlyKeys(body, ["content", "expectedRevision"]);
-          await settings.updateSkillContent(
+          const updated = await settings.updateSkillContent(
             profile,
             skill,
             requiredString(body.content, "content", 512 * 1024, true),
             requiredRevision(body.expectedRevision),
           );
-          const updated = await settings.getSkillContent(profile, skill);
           return { ...ok(updated), changed: { kind: "skill", profile, id: skill } };
         }
         return methodNotAllowed("GET, PUT");
@@ -171,12 +195,12 @@ export async function routeSettingsHttp(
       if (request.method === "PUT") {
         const body = await readObject(request, maxBodyBytes);
         assertOnlyKeys(body, ["content", "expectedRevision"]);
-        await settings.updateProfileSoul(
+        const updated = await settings.updateProfileSoul(
           profile,
           requiredString(body.content, "content", 256 * 1024, true),
           requiredRevision(body.expectedRevision),
         );
-        return { ...ok(await settings.getProfileSoul(profile)), changed: { kind: "soul", profile } };
+        return { ...ok(updated), changed: { kind: "soul", profile } };
       }
       return methodNotAllowed("GET, PUT");
     }
@@ -188,9 +212,12 @@ export async function routeSettingsHttp(
       if (request.method === "GET") return ok(await dependencies.agentBehavior.read(profile));
       if (request.method === "PUT") {
         const body = await readObject(request, maxBodyBytes);
-        assertOnlyKeys(body, ["expectedRevision", "subagentMode", "preferredSubagent", "preferredCandidateIds", "sharedCandidates"]);
+        assertOnlyKeys(body, ["expectedRevision", "expectedSharedRevision", "subagentMode", "preferredSubagent", "preferredCandidateIds", "sharedCandidates"]);
         const updated = await dependencies.agentBehavior.update(profile, {
           expectedRevision: requiredInteger(body.expectedRevision, "expectedRevision", 0),
+          ...(body.expectedSharedRevision === undefined ? {} : {
+            expectedSharedRevision: requiredInteger(body.expectedSharedRevision, "expectedSharedRevision", 0),
+          }),
           ...(body.subagentMode === undefined ? {} : { subagentMode: requiredSubagentMode(body.subagentMode) }),
           ...(body.preferredSubagent === undefined ? {} : { preferredSubagent: requiredString(body.preferredSubagent, "preferredSubagent", 128, true) }),
           ...(body.preferredCandidateIds === undefined ? {} : { preferredCandidateIds: requiredStringArray(body.preferredCandidateIds, "preferredCandidateIds", 3) }),
@@ -375,8 +402,8 @@ export async function routeSettingsHttp(
         const body = await readObject(request, maxBodyBytes);
         assertOnlyKeys(body, ["provider", "expectedProvider"]);
         const provider = requiredString(body.provider, "provider", 64, true);
-        await settings.setMemoryProvider(profile, provider, requiredString(body.expectedProvider, "expectedProvider", 64, true));
-        return { ...ok(await settings.getMemoryStatus(profile)), changed: { kind: "memory", profile } };
+        const updated = await settings.setMemoryProvider(profile, provider, requiredString(body.expectedProvider, "expectedProvider", 64, true));
+        return { ...ok(updated), changed: { kind: "memory", profile } };
       }
       if (segments.length === 6 && segments[5] === "files") {
         if (request.method !== "GET") return methodNotAllowed("GET");
@@ -406,13 +433,13 @@ export async function routeSettingsHttp(
         const body = await readObject(request, maxBodyBytes);
         assertOnlyKeys(body, ["target"]);
         const target = requiredMemoryResetTarget(body.target);
-        await settings.resetBuiltinMemory(profile, target);
+        const updated = await settings.resetBuiltinMemory(profile, target);
         return {
           ...ok({
             ok: true,
             target,
-            files: await settings.getBuiltinMemoryFiles(profile),
-            status: await settings.getMemoryStatus(profile),
+            files: updated.files,
+            status: updated.status,
           }),
           changed: { kind: "memory", profile, id: `reset:${target}` },
         };
@@ -423,13 +450,13 @@ export async function routeSettingsHttp(
         if (request.method === "PATCH") {
           const body = await readObject(request, maxBodyBytes);
           assertOnlyKeys(body, ["values", "expectedRevision"]);
-          await settings.updateMemoryProviderConfig(
+          const updated = await settings.updateMemoryProviderConfig(
             profile,
             provider,
             requiredSettingsValues(body.values),
             requiredRevision(body.expectedRevision),
           );
-          return { ...ok(await settings.getMemoryProviderConfig(profile, provider)), changed: { kind: "memory", profile, id: provider } };
+          return { ...ok(updated), changed: { kind: "memory", profile, id: provider } };
         }
         return methodNotAllowed("GET, PATCH");
       }
@@ -441,6 +468,7 @@ export async function routeSettingsHttp(
     return notFound();
   } catch (error) {
     if (error instanceof HttpInputError) return { status: error.status, body: { error: { code: error.code, message: error.message } } };
+    if (error instanceof ChatModelPreferencesError) return chatModelPreferencesError(error);
     if (error instanceof HermesSettingsError) return settingsError(error);
     return { status: 502, body: { error: { code: "runtime_unavailable", message: "Hermes settings are unavailable." } } };
   }
@@ -484,6 +512,23 @@ function requiredSubagentMode(value: unknown): SubagentMode {
 function requiredGlobalContext(value: unknown): string { if (typeof value !== "string" || !isGlobalContextWithinBudget(value)) throw fieldError("context"); return value; }
 function requiredRevision(value: unknown): string { if (typeof value !== "string" || !/^[A-Za-z0-9_-]{43}$/.test(value)) throw fieldError("expectedRevision"); return value; }
 function requiredStringArray(value: unknown, name: string, maxItems: number): string[] { if (!Array.isArray(value) || value.length > maxItems || !value.every((item) => typeof item === "string")) throw fieldError(name); return [...value] as string[]; }
+function requiredSharedSubagentCandidates(value: unknown): SharedSubagentCandidate[] {
+  if (!Array.isArray(value) || value.length > 32) throw fieldError("sharedCandidates");
+  return value.map((item, index) => {
+    if (!isRecord(item)) throw fieldError(`sharedCandidates.${index}`);
+    assertOnlyKeys(item, ["id", "label", "provider", "model", "reasoningEffort", "enabled"]);
+    const id = requiredString(item.id, `sharedCandidates.${index}.id`, 64);
+    if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(id)) throw fieldError(`sharedCandidates.${index}.id`);
+    return {
+      id,
+      label: requiredString(item.label, `sharedCandidates.${index}.label`, 128, true),
+      provider: requiredString(item.provider, `sharedCandidates.${index}.provider`, 128, true),
+      model: requiredString(item.model, `sharedCandidates.${index}.model`, 128, true),
+      reasoningEffort: requiredString(item.reasoningEffort, `sharedCandidates.${index}.reasoningEffort`, 32, true),
+      enabled: requiredBoolean(item.enabled, `sharedCandidates.${index}.enabled`),
+    };
+  });
+}
 function requiredSettingsValues(value: unknown): Record<string, boolean | string> { if (!isRecord(value) || Object.keys(value).length > 100) throw fieldError("values"); const result: Record<string, boolean | string> = {}; for (const [key, item] of Object.entries(value)) { if (typeof item !== "boolean" && typeof item !== "string") throw fieldError(`values.${key}`); result[key] = item; } return result; }
 function requiredMemoryFileKey(value: string | undefined): "memory" | "user" {
   if (value === "memory" || value === "user") return value;
@@ -633,7 +678,8 @@ function fieldError(name: string): HttpInputError { return new HttpInputError(40
 function ok(body: unknown): SettingsHttpResult { return { status: 200, body }; }
 function notFound(): SettingsHttpResult { return { status: 404, body: { error: { code: "not_found", message: "Settings route was not found." } } }; }
 function methodNotAllowed(allow: string): SettingsHttpResult { return { status: 405, body: { error: { code: "method_not_allowed", message: "Method is not allowed." } }, headers: { Allow: allow } }; }
-function settingsError(error: HermesSettingsError): SettingsHttpResult { const status = error.code === "conflict" ? 409 : error.code === "invalid_request" ? 400 : error.code === "not_found" ? 404 : error.code === "timed_out" ? 504 : 502; const code = error.code === "rejected" ? "runtime_unavailable" : error.code; return { status, body: { error: { code, message: error.message } } }; }
+function settingsError(error: HermesSettingsError): SettingsHttpResult { const status = error.code === "conflict" || error.code === "commit_unconfirmed" ? 409 : error.code === "invalid_request" ? 400 : error.code === "not_found" ? 404 : error.code === "timed_out" ? 504 : 502; const code = error.code === "rejected" ? "runtime_unavailable" : error.code; return { status, body: { error: { code, message: error.message } } }; }
+function chatModelPreferencesError(error: ChatModelPreferencesError): SettingsHttpResult { const status = error.code === "conflict" ? 409 : error.code === "invalid_request" ? 400 : 503; return { status, body: { error: { code: error.code, message: error.message } } }; }
 function isRecord(value: unknown): value is Record<string, unknown> { return typeof value === "object" && value !== null && !Array.isArray(value); }
 
 class HttpInputError extends Error {

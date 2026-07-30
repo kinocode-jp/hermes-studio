@@ -6,8 +6,11 @@ import {
   addTaskComment,
   askAssigneeAboutTask,
   assignTask,
+  clearFocusedKanbanTask,
+  closeEmbeddedChatSession,
   createTask,
   expandedTaskId,
+  focusedKanbanTaskId,
   kanbanAssignees,
   kanbanState,
   officeConnection,
@@ -48,6 +51,7 @@ import {
 import { InfoTip } from "./info-tip";
 import { ChatIcon, CloseIcon, MenuIcon, SendIcon } from "./icons";
 import { useMobileOverlay } from "./use-mobile-overlay";
+import { useModalOutsideClose } from "./use-modal-outside-close";
 import { ChatPane } from "./chat-pane";
 
 export { isKanbanColumnCollapsed, requestTaskMove } from "../kanban-board-logic";
@@ -66,16 +70,24 @@ const writableColumns = columns.filter((column): column is typeof column & { wri
 const writableStatuses = new Set<TaskStatus>(writableColumns.map((column) => column.writable));
 
 const DRAG_MIME = "application/x-hermes-task";
+
+function isKanbanTaskDrag(event: DragEvent): boolean {
+  return Boolean(event.dataTransfer?.types && [...event.dataTransfer.types].includes(DRAG_MIME));
+}
 const DETAIL_CLICK_SLOP_PX = 6;
 
-function TaskCard({ task }: { task: WorkTask }) {
+function TaskCard({ task, focusRequested = false }: { task: WorkTask; focusRequested?: boolean }) {
   const [detailOpen, setDetailOpen] = useState(false);
+  const cardRef = useRef<HTMLElement>(null);
   const detailGesture = useRef<{ x: number; y: number; dragged: boolean; pointerId: number | null } | null>(null);
   const suppressOpenUntil = useRef(0);
   const assignee = profileList.value.find((profile) => profile.id === task.assigneeId);
   const selectableProfiles = kanbanAssignees.value.length === 0
     ? profileList.value
-    : profileList.value.filter((profile) => kanbanAssignees.value.includes(profile.id));
+    // `default` is the Studio reception/coordinator profile. Hermes board
+    // snapshots may omit it from active-worker candidates, but the server
+    // accepts it as a valid assignee and coordinator work must be trackable.
+    : profileList.value.filter((profile) => profile.id === "default" || kanbanAssignees.value.includes(profile.id));
   const expanded = expandedTaskId.value === task.id;
   const detail = taskCommentDetail.value.cardId === task.id ? taskCommentDetail.value : undefined;
   const unconfirmedComment = unconfirmedTaskComments.value[task.id];
@@ -92,11 +104,22 @@ function TaskCard({ task }: { task: WorkTask }) {
   const previewText = task.latestSummary ?? task.body;
   const statusLabel = columns.find((column) => column.id === task.status);
 
+  useEffect(() => {
+    if (!focusRequested) return;
+    const reducedMotion = typeof matchMedia === "function" && matchMedia("(prefers-reduced-motion: reduce)").matches;
+    cardRef.current?.scrollIntoView({ block: "center", inline: "nearest", behavior: reducedMotion ? "auto" : "smooth" });
+    setDetailOpen(true);
+    clearFocusedKanbanTask(task.id);
+  }, [focusRequested, task.id]);
+
   const submitComment = async (event: SubmitEvent) => {
     event.preventDefault();
     const form = event.currentTarget as HTMLFormElement;
     const input = form.elements.namedItem("comment") as HTMLInputElement;
-    if (await addTaskComment(task.id, input.value) === "success") form.reset();
+    const submittedValue = input.value;
+    if (await addTaskComment(task.id, submittedValue) === "success" && input.isConnected && input.value === submittedValue) {
+      input.value = "";
+    }
   };
 
   const openDetailIfClick = () => {
@@ -116,6 +139,7 @@ function TaskCard({ task }: { task: WorkTask }) {
 
   return (
     <article
+      ref={cardRef}
       class={`task-card priority-${task.priority} ${task.pending ? "is-pending" : ""}`}
       draggable={!task.pending}
       onDragStart={(event) => {
@@ -296,6 +320,7 @@ function TaskDetailModal({
   const modalSize = getAppModalSize("task-detail");
   const resize = useMemo(() => createModalResizeHandlers("task-detail"), []);
   useEffect(() => () => resize.dispose(), [resize]);
+  const outsideClose = useModalOutsideClose(onClose);
 
   // Keep comments expanded while the modal is open.
   useEffect(() => {
@@ -306,7 +331,7 @@ function TaskDetailModal({
   const assignee = profileList.value.find((profile) => profile.id === liveTask.assigneeId);
   const selectableProfiles = kanbanAssignees.value.length === 0
     ? profileList.value
-    : profileList.value.filter((profile) => kanbanAssignees.value.includes(profile.id));
+    : profileList.value.filter((profile) => profile.id === "default" || kanbanAssignees.value.includes(profile.id));
   const detail = taskCommentDetail.value.cardId === liveTask.id ? taskCommentDetail.value : undefined;
   const unconfirmedComment = unconfirmedTaskComments.value[liveTask.id];
   const chatReady = (officeConnection.value.source === "server" && officeConnection.value.runtime === "ready")
@@ -335,7 +360,8 @@ function TaskDetailModal({
   const showChat = chatSessionId !== null && Boolean(chatSession && chatProfile);
   const chatStatusText = !chatSession ? ""
     : chatSession.connectionState === "error" ? t("chat.status.error")
-      : chatSession.connectionState === "connecting" ? t("chat.status.connecting")
+      : chatSession.connectionState === "queued" ? t("chat.status.queued")
+        : chatSession.connectionState === "connecting" ? t("chat.status.connecting")
         : chatSession.connectionState === "disconnected" ? t("chat.status.reconnecting")
           : chatSession.status === "waiting" ? t("chat.status.waiting")
             : chatSession.status === "streaming" ? t("chat.status.running")
@@ -347,11 +373,19 @@ function TaskDetailModal({
     setChatSessionId(null);
   };
 
+  useEffect(() => {
+    if (typeof chatSessionId !== "string") return;
+    return () => closeEmbeddedChatSession(chatSessionId);
+  }, [chatSessionId]);
+
   const submitComment = async (event: SubmitEvent) => {
     event.preventDefault();
     const form = event.currentTarget as HTMLFormElement;
     const input = form.elements.namedItem("comment") as HTMLInputElement;
-    if (await addTaskComment(liveTask.id, input.value) === "success") form.reset();
+    const submittedValue = input.value;
+    if (await addTaskComment(liveTask.id, submittedValue) === "success" && input.isConnected && input.value === submittedValue) {
+      input.value = "";
+    }
   };
 
   const askAssignee = () => {
@@ -364,14 +398,7 @@ function TaskDetailModal({
       class="task-detail-modal-layer"
       data-modal-affordance="true"
       role="presentation"
-      onPointerDown={(event) => {
-        if (shouldIgnoreModalOutsideClose()) return;
-        if (event.target === event.currentTarget) onClose();
-      }}
-      onClick={(event) => {
-        if (shouldIgnoreModalOutsideClose()) return;
-        if (event.target === event.currentTarget) onClose();
-      }}
+      {...outsideClose}
     >
       <button
         class="task-detail-modal-scrim"
@@ -793,6 +820,7 @@ export function KanbanBoard({ hideTitle = false }: { hideTitle?: boolean } = {})
   }, 0);
   const visibleColumns = paintKanbanColumns(columns, columnVisibility, itemCountFor);
   const selectedStatusCount = visibleKanbanStatuses(columnVisibility).length;
+  const focusedTask = tasks.value.find((task) => task.id === focusedKanbanTaskId.value);
 
   const updateColumnVisibility = (next: KanbanColumnVisibility) => {
     const sanitized: KanbanColumnVisibility = {
@@ -805,6 +833,31 @@ export function KanbanBoard({ hideTitle = false }: { hideTitle?: boolean } = {})
     saveKanbanColumnVisibility(sanitized);
   };
 
+  useEffect(() => {
+    if (!focusedTask) return;
+    if (memberIds && (focusedTask.assigneeId === undefined || !memberIds.has(focusedTask.assigneeId))) {
+      setKanbanTeamFilter("");
+    }
+    if (columnVisibility.mode === "selected"
+      && !columnVisibility.selected.includes(focusedTask.status as KanbanBoardStatus)) {
+      updateColumnVisibility({
+        ...columnVisibility,
+        selected: toggleKanbanSelectedStatus(
+          columnVisibility.selected,
+          focusedTask.status as KanbanBoardStatus,
+        ),
+      });
+    }
+    setColumnCollapse((current) => ({ ...current, [focusedTask.status]: false }));
+  }, [
+    focusedTask?.id,
+    focusedTask?.status,
+    focusedTask?.assigneeId,
+    teamFilterId,
+    columnVisibility.mode,
+    columnVisibility.selected.join("|"),
+  ]);
+
 
   const toggleColumn = (columnId: TaskStatus, itemCount: number) => {
     setColumnCollapse((current) => {
@@ -816,11 +869,13 @@ export function KanbanBoard({ hideTitle = false }: { hideTitle?: boolean } = {})
   const acceptDrop = (column: (typeof columns)[number], event: DragEvent) => {
     const status = column.writable;
     if (!status) return;
+    const taskId = event.dataTransfer?.getData(DRAG_MIME);
+    // Other draggable content (sidebar panels and chats) belongs to the
+    // dashboard-level drop target and must keep bubbling through the board.
+    if (!taskId) return;
     event.preventDefault();
     event.stopPropagation();
-    const taskId = event.dataTransfer?.getData(DRAG_MIME);
     setDragOverColumn(null);
-    if (!taskId) return;
     // Dropping onto a collapsed column expands it so the move is visible.
     setColumnCollapse((current) => ({ ...current, [column.id]: false }));
     void requestTaskMove(taskId, status);
@@ -1058,12 +1113,12 @@ export function KanbanBoard({ hideTitle = false }: { hideTitle?: boolean } = {})
               key={column.id}
               data-column={column.id}
               onDragEnter={(event) => {
-                if (!column.writable) return;
+                if (!column.writable || !isKanbanTaskDrag(event)) return;
                 event.preventDefault();
                 setDragOverColumn(column.id);
               }}
               onDragOver={(event) => {
-                if (!column.writable) return;
+                if (!column.writable || !isKanbanTaskDrag(event)) return;
                 event.preventDefault();
                 if (event.dataTransfer) event.dataTransfer.dropEffect = "move";
                 if (dragOverColumn !== column.id) setDragOverColumn(column.id);
@@ -1109,7 +1164,13 @@ export function KanbanBoard({ hideTitle = false }: { hideTitle?: boolean } = {})
                 hidden={columnVisibility.layout !== "stream" && collapsed}
                 aria-hidden={columnVisibility.layout !== "stream" && collapsed}
               >
-                {items.map((task) => <TaskCard key={task.id} task={task} />)}
+                {items.map((task) => (
+                  <TaskCard
+                    key={task.id}
+                    task={task}
+                    focusRequested={focusedKanbanTaskId.value === task.id}
+                  />
+                ))}
                 {items.length === 0 && (
                   <p class={`column-empty ${column.writable ? "is-droppable" : ""}`}>
                     {column.writable ? t("kanban.emptyDrop") : t("kanban.empty")}

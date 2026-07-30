@@ -54,10 +54,19 @@ test("a new live generation terminalizes old rows while authoritative running re
   assert.equal(connecting.pendingInteraction, undefined);
   assert.equal(connecting.messages[0]?.status, "cancelled");
 
-  const running = reconcileChatSessionReady(connecting, "live-new", "stored-1", { running: true, status: "idle" });
+  const running = reconcileChatSessionReady(connecting, "live-new", "stored-1", {
+    running: true,
+    status: "idle",
+    model: "model-a",
+    provider: "provider-a",
+    reasoningEffort: "medium",
+  });
   assert.equal(running.status, "streaming");
   assert.equal(isChatRunActive(running), true);
   assert.equal(canSubmitChatPrompt(running), false);
+  assert.equal(running.model, "model-a");
+  assert.equal(running.provider, "provider-a");
+  assert.equal(running.reasoningEffort, "medium");
 
   const cold = reconcileChatSessionReady(connecting, "live-new", "stored-1", { running: false, status: "running" });
   assert.equal(cold.status, "ready");
@@ -65,9 +74,12 @@ test("a new live generation terminalizes old rows while authoritative running re
   assert.equal(canSubmitChatPrompt(cold), true);
 
   const infoRunning = reduceChatGatewayEvent(baseSession, {
-    type: "session.info", liveSessionId: "live-new", payload: { running: true, status: "idle" }
+    type: "session.info", liveSessionId: "live-new", payload: { running: true, status: "idle", model: "model-b", provider: "provider-b", reasoningEffort: "high" }
   });
-  assert.equal(infoRunning, baseSession);
+  assert.equal(infoRunning.status, baseSession.status);
+  assert.equal(infoRunning.model, "model-b");
+  assert.equal(infoRunning.provider, "provider-b");
+  assert.equal(infoRunning.reasoningEffort, "high");
   const delayedIdle = reduceChatGatewayEvent(infoRunning, {
     type: "session.info", liveSessionId: "live-new", payload: { running: false, status: "idle" }
   });

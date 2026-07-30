@@ -33,6 +33,9 @@ export function settingsOperation(method: string | undefined, pathname: string):
   if (/\/memory\/files(?:\/|$)/.test(pathname)) return "memory.update";
   // Desktop-native secret deposit (no browser JSON secret body on consume).
   if (pathname === "/api/v1/secret-transfers") return "secret.write";
+  if (pathname === "/api/v1/settings/chat-model-preferences") {
+    return method === "GET" ? "state.read" : "chat-model-preferences.update";
+  }
   // Privileged config + secrets: never state.read. Owner + local-only ops;
   // handlers also require desktop-capability (ordinary loopback browser fails closed).
   if (/\/profiles\/[^/]+\/privileged-config(?:\/|$)/.test(pathname)) {

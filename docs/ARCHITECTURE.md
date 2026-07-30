@@ -66,11 +66,14 @@ are persisted under the same Hermes Studio state area (by default
 are Office metadata that group Hermes profile IDs many-to-many; Hermes remains
 the canonical source for individual profiles and Kanban card assignees, and card
 assignment is never rewritten to a synthetic team identity. The three
-Office remote environment variables (`HERMES_STUDIO_REMOTE_TOKEN`,
-`HERMES_STUDIO_ALLOWED_ORIGINS`, `HERMES_STUDIO_TRUSTED_PROXY_HOPS`) are owned
-by the host environment and inherited only by the Office server child via the
-desktop launcher or the production / tailnet Node launchers; they are not
-forwarded to the managed Hermes Agent runtime. The optional
+Office remote variables (`HERMES_STUDIO_REMOTE_TOKEN`,
+`HERMES_STUDIO_ALLOWED_ORIGINS`, `HERMES_STUDIO_TRUSTED_PROXY_HOPS`) come from
+the explicit host environment or, for integrated macOS desktop launches, a
+validated encrypted Keychain item. Explicit environment values take precedence
+over the stored desktop fallback as one deployment configuration; stored and
+explicit remote fields are never mixed. The desktop or Node launchers pass these
+values only to the Office server child; they are not forwarded to the managed
+Hermes Agent runtime. The optional
 `npm run start:tailnet` entry point (`scripts/start-tailnet.mjs`) discovers the
 host Tailscale MagicDNS name, enforces the single canonical HTTPS origin
 (rejecting alternate remotes; retaining valid loopback origins), defaults
@@ -103,16 +106,37 @@ numeric counters are stored (no message text) in `~/.hermes-studio/token-usage.j
 bucketed by Asia/Tokyo day and Profile, with a 90-day retention cap. Estimated
 series are labeled in the Office UI via `GET /api/v1/stats/token-usage`.
 
-Chat model preferences (main provider/model/reasoning effort) are stored only on
-the device in `localStorage` and applied on `session.create` (and as a
-session-scoped `/model` command for an open chat). Named **LLM router presets**
-pair a main model with an optional **sub model** (intended for subagent-style
-work) under a user-chosen label so the composer can switch pairs quickly. Sub
-model selection is persisted and shown in the model panel, but Hermes
+Chat model preferences (main/sub provider, model, reasoning effort, and named
+presets) are revisioned in the Studio-owned
+`~/.hermes-studio/chat-model-preferences.json` store. Authenticated desktop and
+Tailnet clients synchronize through
+`GET`/`PUT /api/v1/settings/chat-model-preferences`; `localStorage` remains only
+as an offline fallback and one-time local-desktop migration source when the
+shared store is empty. Remote clients never seed from their origin-local cache.
+Changes are broadcast as metadata-only events so another connected client can
+refresh without exposing preference values in the event or audit log. The main
+selection is applied on `session.create` (and as a session-scoped `/model`
+command for an open chat). Named **LLM router presets** pair a main model with an
+optional **sub model** (intended for subagent-style work) under a user-chosen
+label so the composer can switch pairs quickly. Sub model selection is persisted
+and shown in the model panel, but Hermes
 `session.create` currently accepts only `model` / `provider` / `reasoning_effort`
 for the main chat model—there is no accepted wire field for a sub model—so
 Office does not invent one. Applying a sub model to Hermes subagents remains
 blocked on Hermes support.
+
+Before loading that picker, Studio performs a bounded local-provider sync. It
+reads only public model/provider metadata from the fixed loopback OpenCodex
+proxy (`127.0.0.1:10100`) and from running OpenAI-compatible local runtimes at
+the standard Ollama, LM Studio, and vLLM loopback ports. It then registers or
+updates only Studio-owned `local-cli-*` / `local-runtime-*` custom endpoint ids
+for the selected Hermes profile. Codex models published without a provider
+prefix are grouped using their `owned_by` metadata; namespaced Claude, Gemini,
+Kimi, xAI, and other configured OpenCodex providers remain separated. API keys,
+OAuth tokens, CLI config files, arbitrary ports, and non-loopback destinations
+are never read or accepted by this discovery path. Installed CLIs that do not
+publish an OpenAI-compatible model endpoint (for example the OpenCode session
+server) are not misrepresented as Hermes model providers.
 
 Snapshot capabilities are derived from the authenticated principal, exposure,
 and operation policies at response time. Audit HTTP data and audit-derived

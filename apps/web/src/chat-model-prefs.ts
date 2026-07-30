@@ -1,4 +1,10 @@
 import { signal } from "@preact/signals";
+import type {
+  ChatModelPreferencePreset,
+  ChatModelPreferenceSlot,
+  ChatModelPreferencesDocument as SharedChatModelPreferencesDocument,
+  ChatModelPreferencesSnapshot,
+} from "@hermes-studio/protocol";
 import { OfficeHttpError, officeFetchJson } from "./office-api";
 
 const STORAGE_KEY = "hermes-studio:chat-model-prefs:v3";
@@ -40,28 +46,13 @@ export const REASONING_EFFORT_VALUES = [
 export type ReasoningEffortValue = (typeof REASONING_EFFORT_VALUES)[number];
 const REASONING_EFFORT_SET: ReadonlySet<string> = new Set(REASONING_EFFORT_VALUES);
 
-export type ChatModelPrefs = {
-  provider: string;
-  model: string;
-  /** Empty = model default (omit reasoning_effort on create). */
-  reasoningEffort: string;
-};
+export type ChatModelPrefs = ChatModelPreferenceSlot;
 
-/** Named main+sub pairing stored per device (localStorage). */
-export type ChatModelPreset = {
-  id: string;
-  name: string;
-  main: ChatModelPrefs;
-  sub: ChatModelPrefs;
-};
+/** Named main+sub pairing shared by authenticated clients through Studio Server. */
+export type ChatModelPreset = ChatModelPreferencePreset;
 
-/** Parsed device document for main/sub selection and named presets. */
-export type ChatModelPrefsDocument = {
-  main: ChatModelPrefs;
-  sub: ChatModelPrefs;
-  presets: ChatModelPreset[];
-  activePresetId?: string;
-};
+/** Parsed main/sub selection and named presets, with a local fallback cache. */
+export type ChatModelPrefsDocument = SharedChatModelPreferencesDocument;
 
 export type LiveChatProviderOption = {
   id: string;
@@ -80,6 +71,9 @@ export type LiveChatModelsCatalog = {
   profile: string;
   providers: LiveChatProviderOption[];
   provider: string;
+  /** Profile-configured target for resetting an already-open session. */
+  defaultProvider: string;
+  defaultModel: string;
   models: LiveChatModelOption[];
   refreshedAt: string;
 };
@@ -99,6 +93,14 @@ export const chatModelSubName = signal(initial.sub.model);
 export const chatModelSubReasoningEffort = signal(initial.sub.reasoningEffort);
 export const chatModelPresets = signal<ChatModelPreset[]>(initial.presets);
 export const chatModelActivePresetId = signal<string | undefined>(initial.activePresetId);
+
+let sharedRevision: number | undefined;
+let sharedInitialized = false;
+let sharedSyncFlight: Promise<void> | undefined;
+let sharedWriteTail: Promise<void> = Promise.resolve();
+let localDocumentVersion = 0;
+let lastSyncedDocument: string | undefined;
+let initialLocalMigrationEnabled = false;
 
 export function isManualChatModelProvider(provider: string): boolean {
   return provider.trim() === CHAT_MODEL_MANUAL_PROVIDER;
@@ -184,6 +186,16 @@ export function activeChatModelPreset(): ChatModelPreset | undefined {
   const id = chatModelActivePresetId.value;
   if (!id) return undefined;
   return chatModelPresets.value.find((preset) => preset.id === id);
+}
+
+/** A preset label is session-local only when exactly one preset matches its main slot. */
+export function matchingChatModelPresetName(
+  presets: readonly ChatModelPreset[],
+  session: ChatModelPrefs,
+): string | undefined {
+  const target = resolvedCreateModelPrefs(session);
+  const matches = presets.filter((preset) => slotsEqual(resolvedCreateModelPrefs(preset.main), target));
+  return matches.length === 1 ? matches[0]!.name : undefined;
 }
 
 /**
@@ -429,7 +441,26 @@ export function sanitizePresetName(value: string): string | undefined {
 
 /** Short client cache so reopening the model panel does not wait on Hermes every time. */
 const CLIENT_CATALOG_TTL_MS = 30_000;
-const clientCatalogCache = new Map<string, { expiresAt: number; catalog: LiveChatModelsCatalog }>();
+const LOCAL_MODEL_SYNC_TTL_MS = 30_000;
+const clientCatalogCache = new Map<string, {
+  expiresAt: number;
+  generation: number;
+  catalog: LiveChatModelsCatalog;
+}>();
+const clientCatalogGenerations = new Map<string, number>();
+const clientCatalogRefreshes = new Map<string, Promise<LiveChatModelsCatalog>>();
+const localModelSyncs = new Map<string, { expiresAt: number; promise: Promise<void> }>();
+
+async function syncLocalModelProviders(profile: string, force = false): Promise<void> {
+  const existing = localModelSyncs.get(profile);
+  if (!force && existing !== undefined && existing.expiresAt > Date.now()) return await existing.promise;
+  const sync = officeFetchJson<unknown>(
+    `/api/v1/models/local-cli/sync?${new URLSearchParams({ profile }).toString()}`,
+    { timeoutMs: FETCH_TIMEOUT_MS, method: "POST" },
+  ).then(() => undefined).catch(() => undefined);
+  localModelSyncs.set(profile, { expiresAt: Date.now() + LOCAL_MODEL_SYNC_TTL_MS, promise: sync });
+  await sync;
+}
 
 /**
  * Same-origin Studio live catalog for one Hermes profile.
@@ -448,35 +479,84 @@ export async function fetchLiveChatModels(
     : "";
   const cacheKey = `${valid}\0${providerKey}`;
   const forceRefresh = options?.forceRefresh === true;
+  // The sync is local, bounded, secret-free, and idempotent. Unsupported or
+  // unavailable CLI proxies/runtimes simply leave the native Hermes catalog unchanged.
+  await syncLocalModelProviders(valid, forceRefresh);
   if (!forceRefresh) {
+    const refreshing = clientCatalogRefreshes.get(cacheKey);
+    if (refreshing !== undefined) {
+      try { return await refreshing; } catch { /* Fall through to a read-only retry. */ }
+    }
     const hit = clientCatalogCache.get(cacheKey);
     if (hit !== undefined && hit.expiresAt > Date.now()) return hit.catalog;
   }
 
   const query = new URLSearchParams({ profile: valid });
   if (providerKey !== "") query.set("provider", providerKey);
-  if (forceRefresh) query.set("fresh", "1");
-  try {
-    const raw = await officeFetchJson<unknown>(
-      `/api/v1/models?${query.toString()}`,
-      { timeoutMs: FETCH_TIMEOUT_MS },
-    );
-    const catalog = parseLiveCatalog(raw, valid);
-    clientCatalogCache.set(cacheKey, {
-      expiresAt: Date.now() + CLIENT_CATALOG_TTL_MS,
-      catalog,
-    });
-    return catalog;
-  } catch (error) {
-    if (error instanceof ChatModelCatalogError) throw error;
-    if (error instanceof OfficeHttpError) {
-      if (error.status === 400) throw new ChatModelCatalogError("invalid");
-      if (error.status === 404) throw new ChatModelCatalogError("not-found");
-      if (error.status === 401 || error.status === 403) throw new ChatModelCatalogError("unauthorized");
+  const load = async (): Promise<LiveChatModelsCatalog> => {
+    try {
+      const raw = await officeFetchJson<unknown>(
+        `/api/v1/models${forceRefresh ? "/refresh" : ""}?${query.toString()}`,
+        { timeoutMs: FETCH_TIMEOUT_MS, ...(forceRefresh ? { method: "POST" as const } : {}) },
+      );
+      return parseLiveCatalog(raw, valid);
+    } catch (error) {
+      if (error instanceof ChatModelCatalogError) throw error;
+      if (error instanceof OfficeHttpError) {
+        if (error.status === 400) throw new ChatModelCatalogError("invalid");
+        if (error.status === 404) throw new ChatModelCatalogError("not-found");
+        if (error.status === 401 || error.status === 403) throw new ChatModelCatalogError("unauthorized");
+        throw new ChatModelCatalogError("unavailable");
+      }
       throw new ChatModelCatalogError("unavailable");
     }
-    throw new ChatModelCatalogError("unavailable");
+  };
+
+  if (forceRefresh) {
+    const generation = (clientCatalogGenerations.get(cacheKey) ?? 0) + 1;
+    clientCatalogGenerations.set(cacheKey, generation);
+    let refresh!: Promise<LiveChatModelsCatalog>;
+    refresh = load().then(async (catalog) => {
+      if ((clientCatalogGenerations.get(cacheKey) ?? 0) !== generation) {
+        const newer = clientCatalogRefreshes.get(cacheKey);
+        if (newer !== undefined && newer !== refresh) {
+          try { return await newer; } catch { return catalog; }
+        }
+        const latest = clientCatalogCache.get(cacheKey);
+        return latest !== undefined && latest.generation > generation ? latest.catalog : catalog;
+      }
+      clientCatalogCache.set(cacheKey, {
+        expiresAt: Date.now() + CLIENT_CATALOG_TTL_MS,
+        generation,
+        catalog,
+      });
+      return catalog;
+    }).finally(() => {
+      if (clientCatalogRefreshes.get(cacheKey) === refresh) clientCatalogRefreshes.delete(cacheKey);
+    });
+    clientCatalogRefreshes.set(cacheKey, refresh);
+    return await refresh;
   }
+
+  // Every network request owns a generation. This prevents an older ordinary
+  // GET from overwriting a newer GET as well as a forced refresh.
+  const generation = (clientCatalogGenerations.get(cacheKey) ?? 0) + 1;
+  clientCatalogGenerations.set(cacheKey, generation);
+  const catalog = await load();
+  if ((clientCatalogGenerations.get(cacheKey) ?? 0) !== generation) {
+    const refreshing = clientCatalogRefreshes.get(cacheKey);
+    if (refreshing !== undefined) {
+      try { return await refreshing; } catch { return catalog; }
+    }
+    const latest = clientCatalogCache.get(cacheKey);
+    return latest !== undefined && latest.generation > generation ? latest.catalog : catalog;
+  }
+  clientCatalogCache.set(cacheKey, {
+    expiresAt: Date.now() + CLIENT_CATALOG_TTL_MS,
+    generation,
+    catalog,
+  });
+  return catalog;
 }
 
 export class ChatModelCatalogError extends Error {
@@ -513,6 +593,14 @@ export function parseLiveCatalog(value: unknown, expectedProfile: string): LiveC
   if (value.provider.trim() !== "" && selectedProvider === undefined) {
     throw new ChatModelCatalogError("incompatible");
   }
+  const defaultProviderValue = typeof value.defaultProvider === "string" ? value.defaultProvider.trim() : "";
+  const defaultModelValue = typeof value.defaultModel === "string" ? value.defaultModel.trim() : "";
+  const defaultProvider = defaultProviderValue === "" ? "" : sanitizeProviderId(defaultProviderValue);
+  const defaultModel = defaultModelValue === "" ? "" : sanitizeModelId(defaultModelValue);
+  if ((defaultProviderValue !== "" && defaultProvider === undefined)
+    || (defaultModelValue !== "" && defaultModel === undefined)) {
+    throw new ChatModelCatalogError("incompatible");
+  }
 
   const providers: LiveChatProviderOption[] = [];
   const seenProviders = new Set<string>();
@@ -546,6 +634,8 @@ export function parseLiveCatalog(value: unknown, expectedProfile: string): LiveC
     profile: value.profile,
     providers,
     provider: selectedProvider ?? "",
+    defaultProvider: defaultProvider ?? "",
+    defaultModel: defaultModel ?? "",
     models,
     refreshedAt: value.refreshedAt,
   };
@@ -623,18 +713,191 @@ function slotsEqual(left: ChatModelPrefs, right: ChatModelPrefs): boolean {
     && left.reasoningEffort === right.reasoningEffort;
 }
 
+/**
+ * Reconcile the local fallback cache with the Studio-owned shared document.
+ * The first authenticated local desktop claims an empty server document with
+ * its existing v3 preferences; remote clients always adopt the host copy.
+ */
+export function synchronizeChatModelPreferences(options?: { migrateLocal?: boolean }): Promise<void> {
+  if (options?.migrateLocal === true) initialLocalMigrationEnabled = true;
+  if (sharedSyncFlight !== undefined) return sharedSyncFlight;
+  const flight = (sharedInitialized ? refreshSharedPreferences() : initializeSharedPreferences())
+    .finally(() => {
+      if (sharedSyncFlight === flight) sharedSyncFlight = undefined;
+    });
+  sharedSyncFlight = flight;
+  return flight;
+}
+
+async function initializeSharedPreferences(): Promise<void> {
+  const startingVersion = localDocumentVersion;
+  const localDocument = currentPrefsDocument();
+  const remote = await fetchSharedPreferences();
+  sharedRevision = remote.revision;
+  lastSyncedDocument = serializePrefsDocument(remote.document);
+
+  if (startingVersion !== localDocumentVersion) {
+    sharedInitialized = true;
+    enqueueSharedWrite(currentPrefsDocument(), localDocumentVersion);
+    return;
+  }
+
+  if (remote.revision === 0 && initialLocalMigrationEnabled) {
+    try {
+      const claimed = await putSharedPreferences(0, localDocument);
+      sharedRevision = claimed.revision;
+      lastSyncedDocument = serializePrefsDocument(claimed.document);
+      sharedInitialized = true;
+      if (startingVersion !== localDocumentVersion) {
+        enqueueSharedWrite(currentPrefsDocument(), localDocumentVersion);
+      }
+      return;
+    } catch (error) {
+      if (!(error instanceof OfficeHttpError) || error.status !== 409) throw error;
+      const winner = await fetchSharedPreferences();
+      sharedRevision = winner.revision;
+      lastSyncedDocument = serializePrefsDocument(winner.document);
+      sharedInitialized = true;
+      if (startingVersion === localDocumentVersion) applySharedPreferences(winner.document);
+      else enqueueSharedWrite(currentPrefsDocument(), localDocumentVersion);
+      return;
+    }
+  }
+
+  applySharedPreferences(remote.document);
+  sharedInitialized = true;
+}
+
+async function refreshSharedPreferences(): Promise<void> {
+  await sharedWriteTail;
+  const startingVersion = localDocumentVersion;
+  const localDocument = currentPrefsDocument();
+  const localSerialized = serializePrefsDocument(localDocument);
+  const remote = await fetchSharedPreferences();
+  sharedRevision = remote.revision;
+
+  if (startingVersion !== localDocumentVersion) {
+    enqueueSharedWrite(currentPrefsDocument(), localDocumentVersion);
+    return;
+  }
+  if (lastSyncedDocument === localSerialized) {
+    applySharedPreferences(remote.document);
+    return;
+  }
+  enqueueSharedWrite(localDocument, startingVersion);
+}
+
 function persist(): void {
+  const document = currentPrefsDocument();
+  writeLocalPrefsDocument(document);
+  localDocumentVersion += 1;
+  if (sharedInitialized) enqueueSharedWrite(document, localDocumentVersion);
+}
+
+function enqueueSharedWrite(document: ChatModelPrefsDocument, version: number): void {
+  const serialized = serializePrefsDocument(document);
+  const pending = sharedWriteTail.then(async () => {
+    if (!sharedInitialized || sharedRevision === undefined) return;
+    if (version < localDocumentVersion && serialized !== serializePrefsDocument(currentPrefsDocument())) return;
+    await saveSharedPreferences(document, serialized, version);
+  });
+  sharedWriteTail = pending.catch(() => undefined);
+}
+
+async function saveSharedPreferences(
+  document: ChatModelPrefsDocument,
+  serialized: string,
+  version: number,
+): Promise<void> {
+  if (sharedRevision === undefined) return;
+  let saved: ChatModelPreferencesSnapshot;
+  try {
+    saved = await putSharedPreferences(sharedRevision, document);
+  } catch (error) {
+    if (!(error instanceof OfficeHttpError) || error.status !== 409) throw error;
+    const latest = await fetchSharedPreferences();
+    sharedRevision = latest.revision;
+    lastSyncedDocument = serializePrefsDocument(latest.document);
+    if (version !== localDocumentVersion || serialized !== serializePrefsDocument(currentPrefsDocument())) return;
+    saved = await putSharedPreferences(latest.revision, document);
+  }
+  sharedRevision = saved.revision;
+  lastSyncedDocument = serialized;
+}
+
+async function fetchSharedPreferences(): Promise<ChatModelPreferencesSnapshot> {
+  return parseSharedPreferencesSnapshot(await officeFetchJson<unknown>(
+    "/api/v1/settings/chat-model-preferences",
+    { timeoutMs: FETCH_TIMEOUT_MS },
+  ));
+}
+
+async function putSharedPreferences(
+  expectedRevision: number,
+  document: ChatModelPrefsDocument,
+): Promise<ChatModelPreferencesSnapshot> {
+  return parseSharedPreferencesSnapshot(await officeFetchJson<unknown>(
+    "/api/v1/settings/chat-model-preferences",
+    {
+      timeoutMs: FETCH_TIMEOUT_MS,
+      method: "PUT",
+      body: { expectedRevision, document },
+    },
+  ));
+}
+
+function parseSharedPreferencesSnapshot(value: unknown): ChatModelPreferencesSnapshot {
+  if (!isRecord(value)
+    || !Number.isSafeInteger(value.revision)
+    || (value.revision as number) < 0
+    || typeof value.updatedAt !== "string"
+    || Number.isNaN(Date.parse(value.updatedAt))
+    || !isRecord(value.document)
+    || !isRecord(value.document.main)
+    || !isRecord(value.document.sub)
+    || !Array.isArray(value.document.presets)) {
+    throw new Error("Studio Server returned incompatible chat model preferences.");
+  }
+  return {
+    revision: value.revision as number,
+    document: parseChatModelPrefsDocument(value.document),
+    updatedAt: value.updatedAt,
+  };
+}
+
+function applySharedPreferences(document: ChatModelPrefsDocument): void {
+  const parsed = parseChatModelPrefsDocument(document);
+  chatModelProvider.value = parsed.main.provider;
+  chatModelName.value = parsed.main.model;
+  chatModelReasoningEffort.value = parsed.main.reasoningEffort;
+  chatModelSubProvider.value = parsed.sub.provider;
+  chatModelSubName.value = parsed.sub.model;
+  chatModelSubReasoningEffort.value = parsed.sub.reasoningEffort;
+  chatModelPresets.value = parsed.presets;
+  chatModelActivePresetId.value = parsed.activePresetId;
+  lastSyncedDocument = serializePrefsDocument(parsed);
+  writeLocalPrefsDocument(parsed);
+}
+
+function currentPrefsDocument(): ChatModelPrefsDocument {
+  return {
+    main: currentChatModelPrefs(),
+    sub: currentChatModelSubPrefs(),
+    presets: chatModelPresets.value,
+    ...(chatModelActivePresetId.value ? { activePresetId: chatModelActivePresetId.value } : {}),
+  };
+}
+
+function serializePrefsDocument(document: ChatModelPrefsDocument): string {
+  return JSON.stringify(document);
+}
+
+function writeLocalPrefsDocument(document: ChatModelPrefsDocument): void {
   if (typeof localStorage === "undefined") return;
   try {
-    const document: ChatModelPrefsDocument = {
-      main: currentChatModelPrefs(),
-      sub: currentChatModelSubPrefs(),
-      presets: chatModelPresets.value,
-      ...(chatModelActivePresetId.value ? { activePresetId: chatModelActivePresetId.value } : {}),
-    };
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(document));
+    localStorage.setItem(STORAGE_KEY, serializePrefsDocument(document));
   } catch {
-    // Preferences are best-effort.
+    // Local cache is best-effort; the authenticated server copy is authoritative.
   }
 }
 

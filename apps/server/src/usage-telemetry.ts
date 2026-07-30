@@ -295,19 +295,24 @@ export class UsageTelemetryStore {
 
   async #load(): Promise<UsageTelemetryFile> {
     if (this.#memory !== undefined) return structuredClone(this.#memory);
+    let raw: string;
     try {
-      const raw = await readFile(this.#filePath, "utf8");
+      raw = await readFile(this.#filePath, "utf8");
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException)?.code !== "ENOENT") throw error;
+      const empty: UsageTelemetryFile = { version: 1, profiles: {} };
+      this.#memory = empty;
+      return structuredClone(empty);
+    }
+    try {
       const parsed = JSON.parse(raw) as unknown;
       const normalized = normalizeFile(parsed);
       this.#memory = normalized;
       return structuredClone(normalized);
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException)?.code === "ENOENT") {
-        const empty: UsageTelemetryFile = { version: 1, profiles: {} };
-        this.#memory = empty;
-        return structuredClone(empty);
-      }
-      // Corrupt store: start fresh rather than break chat.
+    } catch {
+      // A file that was read successfully but is not valid JSON can recover to
+      // an empty store. Transient filesystem errors above remain retryable and
+      // must never be cached as empty or overwrite valid telemetry later.
       const empty: UsageTelemetryFile = { version: 1, profiles: {} };
       this.#memory = empty;
       return structuredClone(empty);

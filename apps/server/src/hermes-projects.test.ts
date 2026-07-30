@@ -103,6 +103,22 @@ test("projects adapter maps gateway error codes to settings errors", async (t) =
   });
   await assert.rejects(
     () => adapter.deleteProject("coder", "missing"),
-    (error: unknown) => error instanceof HermesSettingsError && error.code === "not_found",
+    (error: unknown) => error instanceof HermesSettingsError
+      && error.code === "not_found"
+      && error.message === "Hermes project was not found."
+      && !error.message.includes("no such project"),
+  );
+});
+
+test("projects adapter never exposes resolver diagnostics", async () => {
+  const adapter = createHermesProjectsAdapter({
+    resolveProfileBackend: async () => { throw new Error("private executable /Users/example/.hermes/token"); },
+  });
+  await assert.rejects(
+    () => adapter.listProjects("coder"),
+    (error: unknown) => error instanceof HermesSettingsError
+      && error.code === "rejected"
+      && error.message === "Hermes projects are unavailable."
+      && !error.message.includes("/Users/example"),
   );
 });

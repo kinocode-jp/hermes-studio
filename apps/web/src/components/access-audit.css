@@ -45,6 +45,11 @@
   color: var(--ink);
   font: 700 var(--text-lg)/1.25 var(--font-sans);
 }
+.access-audit__title p {
+  margin: 4px 0 0;
+  color: var(--ink-muted);
+  font: 500 var(--text-sm)/1.4 var(--font-sans);
+}
 
 .access-audit__current {
   display: flex;
@@ -182,13 +187,25 @@
   }
   .access-audit__gate > button,
   .access-audit__logout-action,
-  .access-audit__device button { min-width: 44px; height: 44px; }
+  .access-audit__device button {
+    min-width: var(--target-mobile);
+    min-height: var(--target-mobile);
+    height: auto;
+  }
   .access-audit__rail-head { display: none; }
   .access-audit__rail li { grid-template-columns: minmax(115px, 1fr) auto; gap: 8px 12px; padding: 12px; }
   .access-audit__rail li.access-audit__device { grid-template-columns: minmax(0, 1fr) auto auto; }
   .access-audit__rail li > :nth-child(3) { color: var(--ink-muted); font-size: var(--text-xs); }
   .access-audit__outcome { justify-self: end; }
   .access-audit__message { flex-direction: column; gap: 4px; }
+}
+
+@media (max-width: 400px) {
+  .access-audit__gate { grid-template-columns: auto minmax(0, 1fr); }
+  .access-audit__gate > button {
+    width: 100%;
+    min-height: var(--target-mobile);
+  }
 }
 
 @container workspace-surface (max-width: 620px) {

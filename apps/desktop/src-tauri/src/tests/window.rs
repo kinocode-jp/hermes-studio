@@ -3,8 +3,9 @@ use std::path::PathBuf;
 use crate::constants::OFFICE_URL;
 use crate::startup::{StartupFailure, StartupNoticeKind};
 use crate::window::{
-    html_escape, percent_encode_data, startup_notice_data_url, startup_notice_data_url_kind,
-    startup_notice_html, startup_notice_html_kind, startup_window_url, StartupView,
+    html_escape, percent_encode_data, startup_loading_data_url, startup_loading_html,
+    startup_notice_data_url, startup_notice_data_url_kind, startup_notice_html,
+    startup_notice_html_kind, startup_window_url, StartupView,
 };
 
 #[test]
@@ -31,6 +32,21 @@ fn startup_window_uses_app_assets_only_after_owned_server_readiness() {
             .expect("app URL should be preserved"),
         app_url
     );
+}
+
+#[test]
+fn startup_window_uses_a_fixed_local_loading_document_before_readiness() {
+    let app_url = tauri::WebviewUrl::App(PathBuf::from("index.html"));
+    let url = startup_window_url(&app_url, &StartupView::Loading)
+        .expect("loading URL should parse");
+
+    let tauri::WebviewUrl::CustomProtocol(url) = url else {
+        panic!("loading view must be a fixed data URL");
+    };
+    assert_eq!(url.scheme(), "data");
+    assert!(startup_loading_data_url().starts_with("data:text/html;charset=utf-8,"));
+    assert!(!startup_loading_html().contains("127.0.0.1"));
+    assert!(!startup_loading_html().contains("<script"));
 }
 
 #[test]
@@ -76,6 +92,11 @@ fn startup_notices_include_detail_and_log_path_when_present() {
 
 #[test]
 fn startup_notices_use_cause_specific_fixed_recovery_instructions() {
+    let candidate = startup_notice_html_kind(StartupNoticeKind::ExistingServerCandidate);
+    assert!(candidate.contains("do not verify its identity"));
+    assert!(candidate.contains("manually open http://127.0.0.1:4317/"));
+    assert!(candidate.contains("do not open the URL"));
+
     let port_used = startup_notice_html_kind(StartupNoticeKind::PortUsedByOtherService);
     assert!(port_used.contains("which application owns loopback port 4317"));
     assert!(port_used.contains("close it normally"));

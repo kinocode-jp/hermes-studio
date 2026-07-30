@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   HermesKanbanAdapter,
+  HermesKanbanCommitUnconfirmedError,
   KanbanValidationError,
   createHermesKanbanHttpRequester,
   type HermesKanbanRequest,
@@ -202,5 +203,26 @@ test("HTTP requester is loopback-only, route-limited, and never returns upstream
   await assert.rejects(
     requester({ method: "GET", path: "/api/profiles" }),
     /Only Hermes Kanban routes/,
+  );
+});
+
+test("non-idempotent POST transport and response-shape failures are commit-unconfirmed", async () => {
+  const requester = createHermesKanbanHttpRequester({
+    baseUrl: "http://127.0.0.1:9119",
+    sessionToken: "x".repeat(32),
+    fetch: async () => { throw new Error("reply lost after dispatch"); },
+  });
+  await assert.rejects(
+    requester({ method: "POST", path: "/api/plugins/kanban/tasks", body: { title: "Maybe created" } }),
+    HermesKanbanCommitUnconfirmedError,
+  );
+
+  await assert.rejects(
+    mockAdapter(() => ({ accepted: true })).createCard({ title: "Malformed success" }),
+    HermesKanbanCommitUnconfirmedError,
+  );
+  await assert.rejects(
+    mockAdapter(() => ({ ok: false })).addComment("t_deadbeef", "Maybe added"),
+    HermesKanbanCommitUnconfirmedError,
   );
 });

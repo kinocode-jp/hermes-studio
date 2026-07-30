@@ -1,3 +1,4 @@
+import { officeInventoryReliability } from "@hermes-studio/protocol";
 import type { OfficeSnapshot, OfficeSnapshotRequestIdentity } from "./domain";
 import {
   resolveOfficeSynchronization,
@@ -133,8 +134,14 @@ export function connectOfficeApi(callbacks: OfficeApiCallbacks, configuredServer
       }
       if (!isCurrentSnapshotRequest(identity)) return undefined;
       clearSnapshotRetry();
-      snapshotRetryAttempt = 0;
+      const inventoryReliable = officeSnapshotInventoryReliable(snapshot);
+      if (inventoryReliable) snapshotRetryAttempt = 0;
       callbacks.onSnapshot(snapshot, identity);
+      // The server deliberately returns an unavailable/truncated inventory as
+      // a valid snapshot so last-known-good UI state is preserved. Treat that
+      // as retryable transport state; otherwise a cold-start timeout leaves
+      // the desktop app degraded until it is restarted manually.
+      if (!inventoryReliable) scheduleSnapshotRetry(identity.connectionGeneration);
       if (recoverySynchronizationGeneration === identity.connectionGeneration) {
         const synchronizedRevision = recoverySynchronizationRevision;
         const shouldRearmEvents = rearmEventsAfterRecovery;
@@ -253,8 +260,8 @@ export function connectOfficeApi(callbacks: OfficeApiCallbacks, configuredServer
     socketAuthRevision = lease.authRevision;
     socketOpened = false;
     socketFailedBeforeOpen = false;
-    socket.addEventListener("open", () => {
-      if (socket !== nextSocket || stopped) return;
+    const markEventStreamOpen = () => {
+      if (socket !== nextSocket || stopped || nextSocket.readyState !== WebSocket.OPEN || socketOpened) return;
       socketOpened = true;
       preOpenFailureCount = 0;
       reconnectAttempt = 0;
@@ -267,8 +274,9 @@ export function connectOfficeApi(callbacks: OfficeApiCallbacks, configuredServer
         recoverySynchronizationRevision = undefined;
         resolveOfficeSynchronization(serverUrl, synchronizedRevision);
       }
-    });
-    socket.addEventListener("message", (event) => {
+    };
+    nextSocket.addEventListener("open", markEventStreamOpen);
+    nextSocket.addEventListener("message", (event) => {
       const message = parseEvent(event.data);
       if (!message) return;
       callbacks.onEvent?.(message);
@@ -276,7 +284,7 @@ export function connectOfficeApi(callbacks: OfficeApiCallbacks, configuredServer
         scheduleSnapshotRefresh();
       }
     });
-    socket.addEventListener("close", (event) => {
+    nextSocket.addEventListener("close", (event) => {
       if (socket !== nextSocket) return;
       const rejectedRevision = socketAuthRevision;
       const ambiguousPreOpenFailure = !socketOpened && (event.code === 1006 || socketFailedBeforeOpen);
@@ -327,11 +335,14 @@ export function connectOfficeApi(callbacks: OfficeApiCallbacks, configuredServer
         },
       );
     });
-    socket.addEventListener("error", () => {
+    nextSocket.addEventListener("error", () => {
       if (socket !== nextSocket) return;
       socketFailedBeforeOpen = !socketOpened;
       nextSocket.close();
     });
+    // Match the chat transport's fast-loopback handling: the upgrade may have
+    // completed before listeners were attached.
+    if (nextSocket.readyState === WebSocket.OPEN) markEventStreamOpen();
   };
 
   const start = async () => {
@@ -385,4 +396,9 @@ export function connectOfficeApi(callbacks: OfficeApiCallbacks, configuredServer
     }
   };
 
+}
+
+export function officeSnapshotInventoryReliable(snapshot: Pick<OfficeSnapshot, "inventory">): boolean {
+  return officeInventoryReliability(snapshot.inventory.profiles) === "complete"
+    && officeInventoryReliability(snapshot.inventory.sessions) === "complete";
 }

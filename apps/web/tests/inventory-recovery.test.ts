@@ -4,6 +4,24 @@ import type { OfficeSnapshot, OfficeSnapshotRequestIdentity } from "../src/domai
 import { initializeInventory, loadMoreSessions, registerInventorySnapshotRefresh, sessionInventoryState } from "../src/inventory.ts";
 import { storedSessionClientId } from "../src/session-identity.ts";
 import { applyOfficeSnapshot, profileList, sessions } from "../src/store.ts";
+import { officeSnapshotInventoryReliable } from "../src/office-api-connection.ts";
+
+test("partial snapshot inventory remains retryable until both inventories are reliable", () => {
+  const reliable = snapshot("cursor");
+  assert.equal(officeSnapshotInventoryReliable(reliable), true);
+  assert.equal(officeSnapshotInventoryReliable({
+    inventory: {
+      ...reliable.inventory,
+      profiles: { returned: 0, available: 0, hasMore: false, truncated: true, partialFailures: 1 },
+    },
+  }), false);
+  assert.equal(officeSnapshotInventoryReliable({
+    inventory: {
+      ...reliable.inventory,
+      sessions: { returned: 0, available: 0, hasMore: false, truncated: true, partialFailures: 1 },
+    },
+  }), false);
+});
 
 test("a stale continuation refreshes the snapshot once and resumes pagination", async () => {
   const serverUrl = "http://127.0.0.1:54321";

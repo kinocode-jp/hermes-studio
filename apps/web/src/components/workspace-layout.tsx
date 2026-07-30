@@ -83,7 +83,7 @@ export function WorkspaceLayout({ main, workspace, hasChats, surfaceVisible = tr
 
   useEffect(() => {
     if (typeof matchMedia !== "function") return;
-    const query = matchMedia("(max-width: 767px)");
+    const query = matchMedia("(max-width: 768px)");
     const update = () => setMobile(query.matches);
     update();
     query.addEventListener("change", update);
@@ -369,5 +369,5 @@ function edgeLabel(placement: WorkspacePlacement): string {
 }
 
 function matchesMobile(): boolean {
-  return typeof matchMedia === "function" && matchMedia("(max-width: 767px)").matches;
+  return typeof matchMedia === "function" && matchMedia("(max-width: 768px)").matches;
 }

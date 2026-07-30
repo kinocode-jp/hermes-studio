@@ -1,34 +1,37 @@
+import { Fragment } from "preact";
 import { useEffect, useRef, useState } from "preact/hooks";
-import type { Profile } from "../domain";
-import { chatSessionTitle, t, type TranslationKey } from "../i18n";
+import type { Profile, WorkTask } from "../domain";
+import { chatSessionTitle, localizeRuntimeMessage, t, type TranslationKey } from "../i18n";
 import { loadMoreProfiles, profileInventoryState } from "../inventory";
-import { tasks } from "../kanban-store";
+import { deleteTask, tasks } from "../kanban-store";
 import { profileDisplayName, profileDisplayNameMap, profileSecondaryName } from "../profile-names";
 import {
   activeSessionId,
+  focusKanbanTask,
   openMobileWorkspace,
   openProfileChatModal,
-  openSession,
   openSessionIds,
   profileList,
   selectProfile,
   selectedProfileId,
   sessions,
-  setWorkspaceSessionDropPreview,
-  clearWorkspaceSessionDropPreview,
-  profileChatModalId,
 } from "../store";
 import {
   activeDashboard,
   activeDashboardId,
-  createDashboard,
   dashboards,
-  deleteDashboard,
   renameDashboard,
+  MAX_DASHBOARD_PANELS,
   MAX_DASHBOARDS,
   type DashboardPanelKind,
 } from "../dashboard-layout";
-import { activateDashboard, addDashboardPanel } from "../dashboard-actions";
+import { activateDashboard, activateDashboardContainingPanel, addDashboardPanel, createDashboardWithDefaultChat, deleteDashboardWithActivation, selectDashboardChatSession } from "../dashboard-actions";
+import {
+  beginSidebarPanelPointerDrag,
+  beginSidebarSessionPointerDrag,
+  consumeSidebarPanelClickSuppression,
+  consumeSidebarSessionClickSuppression,
+} from "../dashboard-drag";
 import {
   SIDEBAR_ICON_THRESHOLD,
   SIDEBAR_MAX_WIDTH,
@@ -37,15 +40,19 @@ import {
   isSidebarProfileOpen,
   setSidebarProfilesOpen,
   setSidebarMode,
+  setSidebarTasksOpen,
+  setSidebarTeamsOpen,
   setSidebarWidth,
   previewSidebarWidth,
   sidebarMode,
   sidebarProfilesOpen,
+  sidebarTasksOpen,
+  sidebarTeamsOpen,
   sidebarWidth,
   toggleSidebarProfileOpen,
 } from "../sidebar-layout";
 import { CharacterPortrait } from "./character-portrait";
-import { BoardIcon, CardsIcon, ChatIcon, GroupIcon, HomeIcon, ListIcon, ScheduleIcon, UsersIcon } from "./icons";
+import { BoardIcon, CardsIcon, ChatIcon, GroupIcon, HomeIcon, ListIcon, ScheduleIcon, TrashIcon, UsersIcon } from "./icons";
 import { StatusPill } from "./status-pill";
 import { TeamBadges } from "./team-badges";
 import { teams } from "../teams-store";
@@ -57,9 +64,11 @@ import {
   sortProfilesBySidebarOrder,
 } from "../profile-order";
 import { ProfileContextMenu, useProfileContextMenu } from "./profile-context-menu";
-import { isScheduledSessionHidden, scheduledSessionCount } from "../scheduled-sessions";
+import { isScheduledSessionHidden } from "../scheduled-sessions";
 import { isPhoneViewport } from "../viewport";
 import { createProfileSession } from "./profile-panel";
+import { SessionDeleteDialog } from "./session-delete-dialog";
+import { useMobileOverlay } from "./use-mobile-overlay";
 
 
 function sidebarTaskStatusLabel(status: string): string {
@@ -81,11 +90,12 @@ function sidebarTaskAssigneeName(assigneeId: string, profiles: readonly Profile[
   return profile ? profileDisplayName(profile) : assigneeId;
 }
 
-/** Panel-add entries shown in the nav area. Clicking adds the panel to the active dashboard. */
+/** Dashboard panel entries: click navigates to an existing pane; drag places one. */
 const panelNavItems: { kind: DashboardPanelKind; icon: typeof HomeIcon; label: TranslationKey }[] = [
   { kind: "studio", icon: HomeIcon, label: "nav.office" },
   { kind: "kanban", icon: BoardIcon, label: "nav.kanban" },
   { kind: "teams", icon: UsersIcon, label: "nav.teams" },
+  { kind: "scheduled", icon: ScheduleIcon, label: "nav.scheduled" },
   { kind: "profiles", icon: GroupIcon, label: "dashboard.panel.profiles" },
 ];
 
@@ -104,8 +114,160 @@ export function SideRail() {
   const inventory = profileInventoryState.value;
   const iconOnly = isSidebarIconOnly();
   const [phoneViewport, setPhoneViewport] = useState(isPhoneViewport());
+  const [mobileTabKind, setMobileTabKind] = useState<DashboardPanelKind>(() =>
+    panelNavItems.find((item) => activeDashboard.value.panels.some((panel) => panel.kind === item.kind))?.kind
+    ?? "studio"
+  );
   const [dragProfileId, setDragProfileId] = useState<string | null>(null);
   const [dropTargetId, setDropTargetId] = useState<string | null>(null);
+  const [panelActionNote, setPanelActionNote] = useState("");
+  const [sessionClickTooltip, setSessionClickTooltip] = useState<{ sessionId: string; left: number; top: number; width: number } | null>(null);
+  const [sessionDeleteRequestId, setSessionDeleteRequestId] = useState<string | null>(null);
+  const [dashboardDeleteRequest, setDashboardDeleteRequest] = useState<{ id: string; name: string } | null>(null);
+  const [taskDeleteRequest, setTaskDeleteRequest] = useState<WorkTask | null>(null);
+  const [taskDeleteBusy, setTaskDeleteBusy] = useState(false);
+  const [taskDeleteFailed, setTaskDeleteFailed] = useState(false);
+  const panelActionNoteTimer = useRef<number | undefined>(undefined);
+  const sessionClickTooltipTimer = useRef<number | undefined>(undefined);
+  const dashboardDeleteOverlay = useMobileOverlay<HTMLElement>({
+    kind: "modal",
+    open: dashboardDeleteRequest !== null,
+    onClose: () => setDashboardDeleteRequest(null),
+    viewport: "(min-width: 0px)",
+  });
+  const taskDeleteOverlay = useMobileOverlay<HTMLElement>({
+    kind: "modal",
+    open: taskDeleteRequest !== null,
+    onClose: () => {
+      if (!taskDeleteBusy) setTaskDeleteRequest(null);
+    },
+    viewport: "(min-width: 0px)",
+  });
+
+  const requestTaskDelete = (task: WorkTask) => {
+    if (task.pending || taskDeleteBusy) return;
+    setTaskDeleteFailed(false);
+    setTaskDeleteRequest(task);
+  };
+
+  const confirmTaskDelete = async () => {
+    const request = taskDeleteRequest;
+    if (!request || taskDeleteBusy) return;
+    setTaskDeleteBusy(true);
+    setTaskDeleteFailed(false);
+    const deleted = await deleteTask(request.id);
+    setTaskDeleteBusy(false);
+    if (deleted) setTaskDeleteRequest(null);
+    else setTaskDeleteFailed(true);
+  };
+
+  const showPanelActionNote = (message: string) => {
+    if (panelActionNoteTimer.current !== undefined) window.clearTimeout(panelActionNoteTimer.current);
+    setPanelActionNote(message);
+    panelActionNoteTimer.current = window.setTimeout(() => {
+      setPanelActionNote("");
+      panelActionNoteTimer.current = undefined;
+    }, 2200);
+  };
+
+  const showSessionClickTooltip = (event: MouseEvent, sessionId: string) => {
+    if (!(event.currentTarget instanceof HTMLElement)) return;
+    if (sessionClickTooltipTimer.current !== undefined) window.clearTimeout(sessionClickTooltipTimer.current);
+    const rect = event.currentTarget.getBoundingClientRect();
+    const width = Math.min(320, Math.max(220, window.innerWidth - 16));
+    const left = Math.min(
+      Math.max(8, rect.right + 8),
+      Math.max(8, window.innerWidth - width - 8),
+    );
+    const top = Math.min(Math.max(44, rect.top + rect.height / 2), window.innerHeight - 44);
+    setSessionClickTooltip({ sessionId, left, top, width });
+    sessionClickTooltipTimer.current = window.setTimeout(() => {
+      setSessionClickTooltip(null);
+      sessionClickTooltipTimer.current = undefined;
+    }, 3200);
+  };
+
+  const clearSessionClickTooltip = () => {
+    if (sessionClickTooltipTimer.current !== undefined) window.clearTimeout(sessionClickTooltipTimer.current);
+    sessionClickTooltipTimer.current = undefined;
+    setSessionClickTooltip(null);
+  };
+
+  const activateOrAddPanelFromClick = (kind: DashboardPanelKind): boolean => {
+    if (activeDashboard.value.panels.length === 0) {
+      const result = addDashboardPanel(kind);
+      if (result === "full") {
+        showPanelActionNote(t("dashboard.panelLimit", { count: MAX_DASHBOARD_PANELS }));
+        return false;
+      }
+      return true;
+    }
+    return activateDashboardContainingPanel(kind);
+  };
+
+  const revealMobilePanel = (kind: DashboardPanelKind, sessionId?: string) => {
+    window.requestAnimationFrame(() => {
+      const candidates = [...document.querySelectorAll<HTMLElement>(`.dashboard-panel--${kind}`)];
+      const panel = sessionId
+        ? candidates.find((item) => item.dataset.sessionId === sessionId)
+        : candidates[0];
+      if (!panel) return;
+      const reducedMotion = typeof matchMedia === "function"
+        && matchMedia("(prefers-reduced-motion: reduce)").matches;
+      panel.scrollIntoView({ behavior: reducedMotion ? "auto" : "smooth", block: "start" });
+    });
+  };
+
+  const activateMobileTab = (kind: DashboardPanelKind): boolean => {
+    setMobileTabKind(kind);
+    const alreadyPresent = activeDashboard.value.panels.some((panel) => panel.kind === kind);
+    if (!alreadyPresent && !activateDashboardContainingPanel(kind)) {
+      const result = addDashboardPanel(kind);
+      if (result === "full") {
+        showPanelActionNote(t("dashboard.panelLimit", { count: MAX_DASHBOARD_PANELS }));
+        return false;
+      }
+    }
+    revealMobilePanel(kind);
+    return true;
+  };
+
+  const activateMobileChatTab = (profileId: string) => {
+    setMobileTabKind("chat");
+    const sessionId = activeSessionId.value;
+    if (sessionId) {
+      if (!activateDashboardContainingPanel("chat", { sessionId })) {
+        const result = addDashboardPanel("chat", { sessionId });
+        if (result === "full") {
+          showPanelActionNote(t("dashboard.panelLimit", { count: MAX_DASHBOARD_PANELS }));
+          return;
+        }
+      }
+      openMobileWorkspace();
+      revealMobilePanel("chat", sessionId);
+      closeMobileProfiles();
+      return;
+    }
+    if (createProfileSession(profileId)) revealMobilePanel("chat", activeSessionId.value);
+    closeMobileProfiles();
+  };
+
+  const addPanelFromKeyboard = (kind: DashboardPanelKind) => {
+    const result = addDashboardPanel(kind);
+    if (result === "full") {
+      showPanelActionNote(t("dashboard.panelLimit", { count: MAX_DASHBOARD_PANELS }));
+      return;
+    }
+    if (panelActionNoteTimer.current !== undefined) window.clearTimeout(panelActionNoteTimer.current);
+    panelActionNoteTimer.current = undefined;
+    setPanelActionNote("");
+    if (phoneViewport) closeMobileProfiles();
+  };
+
+  useEffect(() => () => {
+    if (panelActionNoteTimer.current !== undefined) window.clearTimeout(panelActionNoteTimer.current);
+    if (sessionClickTooltipTimer.current !== undefined) window.clearTimeout(sessionClickTooltipTimer.current);
+  }, []);
 
   useEffect(() => {
     if (typeof matchMedia !== "function") return;
@@ -135,14 +297,11 @@ export function SideRail() {
     : { mode: "flat" as const, profiles: orderedProfiles };
 
   const copy = {
-    profiles: t("sidebar.profiles"),
     displayMode: t(sidebarMode.value === "rows" ? "sidebar.mode.cards" : "sidebar.mode.rows"),
-    profileToggle: t(sidebarProfilesOpen.value ? "sidebar.profilesClose" : "sidebar.profilesOpen"),
     profileExpand: t("sidebar.sessionsShow"),
     profileCollapse: t("sidebar.sessionsHide"),
     resize: t("sidebar.resize"),
     resizeTitle: t("sidebar.resizeTitle"),
-    profileCount: t("sidebar.profileCount", { count: profileList.value.length }),
     sessionCount: (count: number) => t("sidebar.sessionCount", { count }),
   };
 
@@ -165,12 +324,6 @@ export function SideRail() {
     event.currentTarget.setPointerCapture(event.pointerId);
   };
 
-  const openSidebarSession = (sessionId: string) => {
-    openSession(sessionId);
-    openMobileWorkspace();
-    closeMenu();
-  };
-
   const openMobileProfiles = () => {
     setSidebarProfilesOpen(true);
   };
@@ -185,10 +338,9 @@ export function SideRail() {
       return;
     }
     // Icon-only mode has no session list; open the chat modal directly.
-    if (iconOnly) {
+    if (iconOnly && !phoneViewport) {
       selectProfile(profileId, { openDetail: false });
       openProfileChatModal(profileId);
-      if (phoneViewport) closeMobileProfiles();
       closeMenu();
       return;
     }
@@ -196,7 +348,10 @@ export function SideRail() {
     selectProfile(profileId, { openDetail: false });
     const hasSessions = sessions.value.some((session) => session.profileId === profileId);
     if (hasSessions) toggleSidebarProfileOpen(profileId);
-    if (phoneViewport) closeMobileProfiles();
+    // On phones this row is the accordion control inside the profile sheet.
+    // Keep the sheet open so the newly revealed conversations can be selected
+    // or dragged; only a profile with no conversations closes the sheet.
+    if (phoneViewport && !hasSessions) closeMobileProfiles();
     closeMenu();
   };
 
@@ -247,11 +402,41 @@ export function SideRail() {
   };
 
   const onSessionClick = (event: MouseEvent, sessionId: string, profileId: string) => {
+    if (consumeSidebarSessionClickSuppression(sessionId)) return;
     if (event.altKey || event.metaKey || event.ctrlKey) {
       openSessionMenu(event, sessionId, profileId);
       return;
     }
-    openSidebarSession(sessionId);
+    const result = selectDashboardChatSession(sessionId);
+    if (result === "drag-required") {
+      showSessionClickTooltip(event, sessionId);
+      return;
+    }
+    if (result === "full") {
+      showPanelActionNote(t("dashboard.panelLimit", { count: MAX_DASHBOARD_PANELS }));
+      return;
+    }
+    if (result === "missing") return;
+    clearSessionClickTooltip();
+    if (phoneViewport) setMobileTabKind("chat");
+    openMobileWorkspace();
+    if (phoneViewport) revealMobilePanel("chat", sessionId);
+    closeMenu();
+    if (phoneViewport) closeMobileProfiles();
+  };
+
+  const onSessionKeyDown = (event: KeyboardEvent, sessionId: string) => {
+    if (event.key !== "Enter" || !event.shiftKey) return;
+    event.preventDefault();
+    event.stopPropagation();
+    const result = addDashboardPanel("chat", { sessionId });
+    if (result === "full") {
+      showPanelActionNote(t("dashboard.panelLimit", { count: MAX_DASHBOARD_PANELS }));
+      return;
+    }
+    setMobileTabKind("chat");
+    openMobileWorkspace();
+    revealMobilePanel("chat", sessionId);
     if (phoneViewport) closeMobileProfiles();
   };
 
@@ -325,26 +510,41 @@ export function SideRail() {
                   <button
                     class="sidebar-session"
                     type="button"
-                    draggable
                     data-session-id={session.id}
                     style={isOpen ? { "--session-color": profile.color } : undefined}
                     aria-current={activeSessionId.value === session.id ? "true" : undefined}
-                    aria-label={`${displayName} — ${chatSessionTitle(session)}`}
+                    aria-keyshortcuts="Shift+Enter"
+                    aria-describedby={sessionClickTooltip?.sessionId === session.id ? "sidebar-session-click-tooltip" : undefined}
+                    aria-label={`${displayName} — ${chatSessionTitle(session)}${session.conversationKind === "delegated" ? ` — ${t("profile.delegatedChat")}` : ""}`}
                     onClick={(event) => onSessionClick(event, session.id, profile.id)}
+                    onKeyDown={(event) => onSessionKeyDown(event, session.id)}
                     onContextMenu={(event) => openSessionMenu(event, session.id, profile.id)}
-                    onDragStart={(event) => {
-                      event.dataTransfer?.setData("application/x-hermes-session", session.id);
-                      if (event.dataTransfer) event.dataTransfer.effectAllowed = "copy";
-                      // Main content shrinks only when the profile modal is closed.
-                      setWorkspaceSessionDropPreview(!profileChatModalId.value);
+                    onPointerDown={(event) => {
+                      if (event.pointerType === "mouse") beginSidebarSessionPointerDrag(event, session.id);
                     }}
-                    onDragEnd={() => clearWorkspaceSessionDropPreview()}
                   >
-                    <i aria-hidden="true" />
-                    <span>{chatSessionTitle(session)}</span>
+                    <i
+                      aria-hidden="true"
+                      onPointerDown={(event) => {
+                        if (event.pointerType === "mouse") return;
+                        event.stopPropagation();
+                        beginSidebarSessionPointerDrag(event, session.id);
+                      }}
+                    />
+                    <span>
+                      {chatSessionTitle(session)}
+                      {session.conversationKind === "delegated" && <em class="delegated-chat-badge">{t("profile.delegatedChat")}</em>}
+                    </span>
                     <small>{session.status === "streaming" ? t("profile.running") : isOpen ? t("profile.open") : "·"}</small>
                     {isOpen && <em aria-hidden="true">●</em>}
                   </button>
+                  <button
+                    class="sidebar-item-menu-trigger sidebar-session-delete"
+                    type="button"
+                    aria-label={t("chat.sessionDelete")}
+                    title={t("chat.sessionDelete")}
+                    onClick={() => setSessionDeleteRequestId(session.id)}
+                  ><TrashIcon width={14} height={14} /></button>
                   <button
                     class="sidebar-item-menu-trigger"
                     type="button"
@@ -384,14 +584,7 @@ export function SideRail() {
   );
 
   const activeSidebarTasks = tasks.value
-    .filter((task) =>
-      task.status === "running"
-      || task.status === "ready"
-      || task.status === "blocked"
-      || task.status === "review"
-      || task.status === "todo"
-      || task.status === "scheduled"
-    )
+    .filter((task) => task.status !== "done" && task.status !== "archived")
     .slice()
     .sort((left, right) => {
       const rank = (status: string): number => {
@@ -400,16 +593,136 @@ export function SideRail() {
           case "running": return 1;
           case "review": return 2;
           case "ready": return 3;
-          case "todo": return 4;
-          case "scheduled": return 5;
+          case "triage": return 4;
+          case "todo": return 5;
+          case "scheduled": return 6;
           default: return 9;
         }
       };
       const byStatus = rank(left.status) - rank(right.status);
       if (byStatus !== 0) return byStatus;
       return left.title.localeCompare(right.title);
-    })
-    .slice(0, 12);
+    });
+  const kanbanTaskTree = !iconOnly ? (
+    <section
+      class={`sidebar-tasks sidebar-tasks--nested${sidebarTasksOpen.value ? "" : " is-collapsed"}`}
+      aria-label={t("sidebar.tasks")}
+    >
+      {sidebarTasksOpen.value && <div id="sidebar-tasks-list" class="sidebar-tasks-list">
+        {activeSidebarTasks.length === 0 ? (
+          <p class="sidebar-tasks-empty">{t("sidebar.tasksEmpty")}</p>
+        ) : activeSidebarTasks.map((task) => (
+          <div key={task.id} class="sidebar-task-row">
+            <button
+              type="button"
+              class="sidebar-task-button"
+              disabled={task.pending}
+              onClick={() => {
+                if (activateOrAddPanelFromClick("kanban")) focusKanbanTask(task.id);
+              }}
+              aria-label={t("kanban.detailOpenAria", { title: task.title })}
+              title={t("kanban.detailOpenAria", { title: task.title })}
+            >
+              <b>{task.title}</b>
+              <small>
+                {sidebarTaskStatusLabel(task.status)}
+                {" · "}
+                {task.assigneeId
+                  ? sidebarTaskAssigneeName(task.assigneeId, profileList.value)
+                  : t("kanban.unassigned")}
+              </small>
+            </button>
+            <button
+              type="button"
+              class="sidebar-task-delete"
+              disabled={task.pending || taskDeleteBusy}
+              aria-label={t("sidebar.taskDelete", { title: task.title })}
+              title={t("sidebar.taskDelete", { title: task.title })}
+              onClick={() => requestTaskDelete(task)}
+            >
+              <TrashIcon />
+            </button>
+          </div>
+        ))}
+      </div>}
+    </section>
+  ) : null;
+  const teamTree = !iconOnly ? (
+    <section
+      class={`sidebar-nav-tree sidebar-teams--nested${sidebarTeamsOpen.value ? "" : " is-collapsed"}`}
+      aria-label={t("nav.teams")}
+    >
+      {sidebarTeamsOpen.value && <div id="sidebar-teams-list" class="sidebar-team-list">
+        {teams.value.length === 0 ? (
+          <p class="sidebar-nav-tree-empty">{t("teams.empty")}</p>
+        ) : teams.value.map((team) => (
+          <button
+            key={team.id}
+            type="button"
+            class="sidebar-team-button"
+            style={{ "--team-color": team.color }}
+            aria-label={`${team.name}, ${t("teams.memberCount", { count: team.memberProfileIds.length })}`}
+            title={team.name}
+            onClick={() => activateOrAddPanelFromClick("teams")}
+          >
+            <i aria-hidden="true" />
+            <b>{team.name}</b>
+            <small>{t("teams.memberCount", { count: team.memberProfileIds.length })}</small>
+          </button>
+        ))}
+      </div>}
+    </section>
+  ) : null;
+  const profileTree = (
+    <section
+      id="sidebar-profiles-sheet"
+      class={`sidebar-profiles sidebar-profiles--nested${sidebarProfilesOpen.value ? "" : " is-collapsed"}`}
+      aria-labelledby="sidebar-profiles-title"
+    >
+      {sidebarProfilesOpen.value && (
+        <>
+          {hasTeams && (
+            <header class="sidebar-section-head sidebar-profile-tools">
+              <div class="sidebar-section-head-tools">
+                <div class="profile-group-toggle" role="group" aria-label={t("sidebar.group.aria")}>
+                  <button
+                    type="button"
+                    class={groupMode === "profiles" ? "is-active" : ""}
+                    aria-pressed={groupMode === "profiles"}
+                    title={t("sidebar.group.profiles")}
+                    aria-label={t("sidebar.group.profiles")}
+                    onClick={() => setSidebarGroupMode("profiles")}
+                  ><ListIcon /></button>
+                  <button
+                    type="button"
+                    class={groupMode === "teams" ? "is-active" : ""}
+                    aria-pressed={groupMode === "teams"}
+                    title={t("sidebar.group.teams")}
+                    aria-label={t("sidebar.group.teams")}
+                    onClick={() => setSidebarGroupMode("teams")}
+                  ><GroupIcon /></button>
+                </div>
+              </div>
+            </header>
+          )}
+          <div class="sidebar-profile-list">
+            {grouping.mode === "flat"
+              ? grouping.profiles.map((profile) => renderProfileEntry(profile, profile.id))
+              : grouping.groups.map((group) => renderGroup(group))}
+            {profileList.value.length === 0 && <p class="sidebar-profile-empty">-</p>}
+          </div>
+          {inventory.hasMore && !iconOnly && (
+            <button class="sidebar-more" type="button" disabled={inventory.loading} onClick={() => void loadMoreProfiles()}>
+              {inventory.loading ? t("inventory.loading") : t("inventory.showMore")}
+            </button>
+          )}
+          {inventory.error && !iconOnly && (
+            <small class="inventory-note inventory-note--error">{localizeRuntimeMessage(inventory.error)}</small>
+          )}
+        </>
+      )}
+    </section>
+  );
 
   return (
     <nav
@@ -418,8 +731,11 @@ export function SideRail() {
       data-mobile-route-chrome
       data-sidebar-mode={sidebarMode.value}
       data-sidebar-icon-only={iconOnly ? "true" : "false"}
+      data-sidebar-tasks-open={sidebarTasksOpen.value ? "true" : "false"}
+      data-sidebar-teams-open={sidebarTeamsOpen.value ? "true" : "false"}
       data-sidebar-profiles-open={sidebarProfilesOpen.value ? "true" : "false"}
       data-mobile-profiles-open={phoneViewport && sidebarProfilesOpen.value ? "true" : "false"}
+      data-mobile-chat-available={phoneViewport && defaultProfile ? "true" : "false"}
       data-sidebar-group={groupMode}
     >
       <section class="sidebar-dashboards" aria-label={t("dashboard.listAria")}>
@@ -432,8 +748,7 @@ export function SideRail() {
             aria-label={t("dashboard.create")}
             title={t("dashboard.create")}
             onClick={() => {
-              const id = createDashboard();
-              if (id) activateDashboard(id);
+              createDashboardWithDefaultChat();
             }}
           >＋</button>
         </header>
@@ -510,7 +825,7 @@ export function SideRail() {
                     aria-label={t("dashboard.delete")}
                     title={t("dashboard.delete")}
                     onClick={() => {
-                      if (window.confirm(t("dashboard.deleteConfirm", { name }))) deleteDashboard(dashboard.id);
+                      setDashboardDeleteRequest({ id: dashboard.id, name });
                     }}
                   >×</button>
                 )}
@@ -525,178 +840,271 @@ export function SideRail() {
       <div class="side-rail-nav" role="group" aria-label={t("dashboard.addPanelGroup")}>
         {panelNavItems.map((item) => {
           const present = activeDashboard.value.panels.some((panel) => panel.kind === item.kind);
-          return (
+          const selected = phoneViewport ? mobileTabKind === item.kind : present;
+          const available = dashboards.value.some((dashboard) => dashboard.panels.some((panel) => panel.kind === item.kind));
+          const label = t(item.label);
+          const dragLabel = t("dashboard.dragPanelFromSidebar", { label });
+          const keyboardAddLabel = t("dashboard.keyboardAddPanel", { label });
+          const actionLabel = `${available ? `${t("dashboard.openPanel", { label })} / ${dragLabel}` : dragLabel} / ${keyboardAddLabel}`;
+          const disclosureOpen = item.kind === "kanban"
+            ? sidebarTasksOpen.value
+            : item.kind === "teams"
+              ? sidebarTeamsOpen.value
+              : item.kind === "profiles"
+                ? sidebarProfilesOpen.value
+                : undefined;
+          const disclosureId = item.kind === "kanban"
+            ? "sidebar-tasks-list"
+            : item.kind === "teams"
+              ? "sidebar-teams-list"
+              : item.kind === "profiles"
+                ? "sidebar-profiles-sheet"
+                : undefined;
+          const disclosureCount = item.kind === "kanban"
+            ? activeSidebarTasks.length
+            : item.kind === "teams"
+              ? teams.value.length
+              : item.kind === "profiles"
+                ? profileList.value.length
+                : undefined;
+          const hasDisclosure = disclosureOpen !== undefined
+            && (!iconOnly || (phoneViewport && item.kind === "profiles"));
+          const navButton = (
             <button
-              key={item.kind}
+              id={item.kind === "profiles" ? "sidebar-profiles-title" : undefined}
               type="button"
-              class={present ? "is-active" : ""}
-              aria-pressed={present}
-              title={t("dashboard.addPanel", { label: t(item.label) })}
-              aria-label={t("dashboard.addPanel", { label: t(item.label) })}
+              class={`sidebar-nav-button ${selected ? "is-active" : ""}${hasDisclosure ? " has-disclosure" : ""}`}
+              data-panel-kind={item.kind}
+              data-dashboard-available={available ? "true" : "false"}
+              aria-current={selected ? "page" : undefined}
+              aria-expanded={hasDisclosure ? disclosureOpen : undefined}
+              aria-controls={hasDisclosure ? disclosureId : undefined}
+              aria-keyshortcuts={phoneViewport ? undefined : "Shift+Enter"}
+              title={phoneViewport ? label : actionLabel}
+              aria-label={phoneViewport ? label : actionLabel}
               onClick={() => {
-                addDashboardPanel(item.kind);
-                if (phoneViewport) closeMobileProfiles();
+                if (consumeSidebarPanelClickSuppression(item.kind)) return;
+                if (phoneViewport) {
+                  activateMobileTab(item.kind);
+                  if (item.kind === "profiles") {
+                    if (sidebarProfilesOpen.value) closeMobileProfiles();
+                    else openMobileProfiles();
+                  } else {
+                    closeMobileProfiles();
+                  }
+                  return;
+                }
+                activateOrAddPanelFromClick(item.kind);
+                if (item.kind === "kanban" && !iconOnly) setSidebarTasksOpen(!sidebarTasksOpen.value);
+                if (item.kind === "teams" && !iconOnly) setSidebarTeamsOpen(!sidebarTeamsOpen.value);
+                if (item.kind === "profiles" && (!iconOnly || phoneViewport)) {
+                  if (phoneViewport) {
+                    if (sidebarProfilesOpen.value) closeMobileProfiles();
+                    else openMobileProfiles();
+                  } else {
+                    setSidebarProfilesOpen(!sidebarProfilesOpen.value);
+                  }
+                } else if (phoneViewport) {
+                  closeMobileProfiles();
+                }
               }}
+              onKeyDown={(event) => {
+                if (event.key !== "Enter" || !event.shiftKey) return;
+                event.preventDefault();
+                event.stopPropagation();
+                addPanelFromKeyboard(item.kind);
+              }}
+              onPointerDown={(event) => beginSidebarPanelPointerDrag(event, item.kind)}
             >
               <span aria-hidden="true"><item.icon /></span>
-              {!iconOnly && <b>{t(item.label)}</b>}
+              {(!iconOnly || phoneViewport) && <b>{label}</b>}
+              {hasDisclosure && (
+                <>
+                  <small class="sidebar-nav-count" aria-hidden="true">{disclosureCount}</small>
+                  <span class="sidebar-nav-chevron" aria-hidden="true">{disclosureOpen ? "▾" : "▸"}</span>
+                </>
+              )}
             </button>
+          );
+          return (
+            <Fragment key={item.kind}>
+              {item.kind === "profiles" && !iconOnly ? (
+                <div class="sidebar-profile-nav-row">
+                  {navButton}
+                  <button
+                    class="sidebar-display-toggle sidebar-profile-inline-display"
+                    type="button"
+                    aria-label={copy.displayMode}
+                    title={copy.displayMode}
+                    aria-pressed={sidebarMode.value === "rows"}
+                    onClick={() => setSidebarMode(sidebarMode.value === "rows" ? "cards" : "rows")}
+                  >{sidebarMode.value === "rows" ? <CardsIcon /> : <ListIcon />}</button>
+                </div>
+              ) : navButton}
+              {item.kind === "kanban" && kanbanTaskTree}
+              {item.kind === "teams" && teamTree}
+              {item.kind === "profiles" && profileTree}
+            </Fragment>
           );
         })}
       </div>
 
-      <button
-        class={`sidebar-scheduled-trigger ${activeDashboard.value.panels.some((panel) => panel.kind === "scheduled") ? "is-active" : ""}`}
-        type="button"
-        onClick={() => {
-          addDashboardPanel("scheduled");
-          if (phoneViewport) closeMobileProfiles();
-        }}
-        title={t("dashboard.addPanel", { label: t("nav.scheduled") })}
-        aria-label={t("dashboard.addPanel", { label: t("nav.scheduled") })}
-      >
-        <span aria-hidden="true"><ScheduleIcon /></span>
-        {!iconOnly && <b>{t("nav.scheduled")}</b>}
-        {scheduledSessionCount(sessions.value) > 0 && <small aria-hidden="true">{scheduledSessionCount(sessions.value)}</small>}
-      </button>
+      <p class="sidebar-panel-action-note" role="status" aria-live="polite" aria-atomic="true">
+        {panelActionNote}
+      </p>
+
+      {sessionClickTooltip && (
+        <div
+          id="sidebar-session-click-tooltip"
+          class="sidebar-session-click-tooltip"
+          role="tooltip"
+          style={{
+            left: `${sessionClickTooltip.left}px`,
+            top: `${sessionClickTooltip.top}px`,
+            width: `${sessionClickTooltip.width}px`,
+          }}
+        >
+          {t("dashboard.chatClickDragHint")}
+        </div>
+      )}
+
+      {sessionDeleteRequestId && (() => {
+        const session = sessions.value.find((item) => item.id === sessionDeleteRequestId);
+        return session
+          ? <SessionDeleteDialog session={session} onClose={() => setSessionDeleteRequestId(null)} />
+          : null;
+      })()}
+
+      {dashboardDeleteRequest && (
+        <div
+          class="scheduled-delete-dialog-layer"
+          role="presentation"
+          onPointerDown={(event) => event.stopPropagation()}
+          onClick={(event) => event.stopPropagation()}
+        >
+          <button
+            type="button"
+            class="scheduled-delete-dialog-scrim"
+            aria-label={t("common.cancel")}
+            onClick={() => setDashboardDeleteRequest(null)}
+          />
+          <section
+            ref={dashboardDeleteOverlay.ref}
+            class="scheduled-delete-dialog"
+            role="alertdialog"
+            aria-modal="true"
+            aria-labelledby="sidebar-dashboard-delete-title"
+            aria-describedby="sidebar-dashboard-delete-message"
+            tabIndex={-1}
+          >
+            <header>
+              <TrashIcon />
+              <h2 id="sidebar-dashboard-delete-title">{t("dashboard.delete")}</h2>
+            </header>
+            <div id="sidebar-dashboard-delete-message" class="scheduled-delete-dialog-message">
+              <p>{t("dashboard.deleteConfirm", { name: dashboardDeleteRequest.name })}</p>
+            </div>
+            <footer>
+              <button
+                type="button"
+                class="quiet-button"
+                data-mobile-overlay-initial-focus
+                onClick={() => setDashboardDeleteRequest(null)}
+              >
+                {t("common.cancel")}
+              </button>
+              <button
+                type="button"
+                class="scheduled-delete-dialog-confirm"
+                onClick={() => {
+                  const dashboardId = dashboardDeleteRequest.id;
+                  setDashboardDeleteRequest(null);
+                  deleteDashboardWithActivation(dashboardId);
+                }}
+              >
+                <TrashIcon />
+                <span>{t("dashboard.delete")}</span>
+              </button>
+            </footer>
+          </section>
+        </div>
+      )}
+
+      {taskDeleteRequest && (
+        <div
+          class="scheduled-delete-dialog-layer"
+          role="presentation"
+          onPointerDown={(event) => event.stopPropagation()}
+          onClick={(event) => event.stopPropagation()}
+        >
+          <button
+            type="button"
+            class="scheduled-delete-dialog-scrim"
+            aria-label={t("common.cancel")}
+            disabled={taskDeleteBusy}
+            onClick={() => {
+              if (!taskDeleteBusy) setTaskDeleteRequest(null);
+            }}
+          />
+          <section
+            ref={taskDeleteOverlay.ref}
+            class="scheduled-delete-dialog"
+            role="alertdialog"
+            aria-modal="true"
+            aria-labelledby="sidebar-task-delete-title"
+            aria-describedby="sidebar-task-delete-message"
+            tabIndex={-1}
+          >
+            <header>
+              <TrashIcon />
+              <h2 id="sidebar-task-delete-title">{t("sidebar.taskDeleteTitle")}</h2>
+            </header>
+            <div id="sidebar-task-delete-message" class="scheduled-delete-dialog-message">
+              <p>{t("sidebar.taskDeleteConfirm", { title: taskDeleteRequest.title })}</p>
+              <p>{t("sidebar.taskDeleteNote")}</p>
+            </div>
+            {taskDeleteFailed && <p class="scheduled-delete-error" role="alert">{t("sidebar.taskDeleteFailed")}</p>}
+            <footer>
+              <button
+                type="button"
+                class="quiet-button"
+                disabled={taskDeleteBusy}
+                data-mobile-overlay-initial-focus
+                onClick={() => setTaskDeleteRequest(null)}
+              >
+                {t("common.cancel")}
+              </button>
+              <button
+                type="button"
+                class="scheduled-delete-dialog-confirm"
+                disabled={taskDeleteBusy}
+                onClick={() => void confirmTaskDelete()}
+              >
+                <TrashIcon />
+                <span>{taskDeleteBusy ? t("sidebar.taskDeleting") : t("sidebar.taskDeleteAction")}</span>
+              </button>
+            </footer>
+          </section>
+        </div>
+      )}
 
       {phoneViewport && defaultProfile && (
         <button
-          class="sidebar-default-chat-trigger"
+          class={`sidebar-default-chat-trigger ${mobileTabKind === "chat" ? "is-active" : ""}`}
           type="button"
-          aria-label={t("sidebar.defaultChatStart", { name: profileDisplayName(defaultProfile) })}
-          title={t("sidebar.defaultChatStart", { name: profileDisplayName(defaultProfile) })}
-          onClick={() => {
-            createProfileSession(defaultProfile.id);
-            closeMobileProfiles();
-          }}
+          aria-current={mobileTabKind === "chat" ? "page" : undefined}
+          aria-label={activeSessionId.value
+            ? t("sidebar.currentChatOpen")
+            : t("sidebar.defaultChatStart", { name: profileDisplayName(defaultProfile) })}
+          title={activeSessionId.value
+            ? t("sidebar.currentChatOpen")
+            : t("sidebar.defaultChatStart", { name: profileDisplayName(defaultProfile) })}
+          onClick={() => activateMobileChatTab(defaultProfile.id)}
         >
           <span aria-hidden="true"><ChatIcon /></span>
+          <b>{t("dashboard.panel.chat")}</b>
         </button>
       )}
-
-      {phoneViewport && (
-        <button
-          class={`sidebar-profiles-trigger ${sidebarProfilesOpen.value ? "is-active" : ""}`}
-          type="button"
-          aria-expanded={sidebarProfilesOpen.value}
-          aria-controls="sidebar-profiles-sheet"
-          aria-label={copy.profileToggle}
-          title={copy.profiles}
-          onClick={() => (sidebarProfilesOpen.value ? closeMobileProfiles() : openMobileProfiles())}
-        >
-          <span aria-hidden="true"><UsersIcon /></span>
-          <small class="visually-hidden">{copy.profileCount}</small>
-        </button>
-      )}
-
-      <section class="sidebar-tasks" aria-labelledby="sidebar-tasks-title">
-        <header class="sidebar-section-head">
-          <button
-            id="sidebar-tasks-title"
-            class="sidebar-section-title"
-            type="button"
-            aria-expanded="true"
-            aria-label={t("sidebar.tasks")}
-            title={t("sidebar.tasks")}
-            onClick={() => addDashboardPanel("kanban")}
-          >
-            <b>{t("sidebar.tasks")}</b>
-            <small>{t("sidebar.taskCount", { count: activeSidebarTasks.length })}</small>
-          </button>
-        </header>
-        <div class="sidebar-tasks-list">
-          {activeSidebarTasks.length === 0 ? (
-            <p class="sidebar-tasks-empty">{t("sidebar.tasksEmpty")}</p>
-          ) : activeSidebarTasks.map((task) => (
-            <button
-              key={task.id}
-              type="button"
-              class="sidebar-task-button"
-              onClick={() => {
-                addDashboardPanel("kanban");
-                if (task.assigneeId) selectProfile(task.assigneeId);
-              }}
-              title={task.title}
-            >
-              <b>{task.title}</b>
-              <small>
-                {sidebarTaskStatusLabel(task.status)}
-                {" · "}
-                {task.assigneeId
-                  ? sidebarTaskAssigneeName(task.assigneeId, profileList.value)
-                  : t("kanban.unassigned")}
-              </small>
-            </button>
-          ))}
-        </div>
-      </section>
-
-      <section id="sidebar-profiles-sheet" class="sidebar-profiles" aria-labelledby="sidebar-profiles-title">
-        <header class="sidebar-section-head">
-          <button
-            id="sidebar-profiles-title"
-            class="sidebar-section-title"
-            type="button"
-            aria-expanded={sidebarProfilesOpen.value}
-            aria-label={copy.profileToggle}
-            title={copy.profileToggle}
-            onClick={() => {
-              if (phoneViewport) {
-                if (sidebarProfilesOpen.value) closeMobileProfiles();
-                else openMobileProfiles();
-                return;
-              }
-              setSidebarProfilesOpen(!sidebarProfilesOpen.value);
-            }}
-          >
-            <b>{copy.profiles}</b>
-            <small>{copy.profileCount}</small>
-            <span class="sidebar-section-chevron" aria-hidden="true">{sidebarProfilesOpen.value ? "−" : "+"}</span>
-          </button>
-          <div class="sidebar-section-head-tools">
-            {hasTeams && (
-              <div class="profile-group-toggle" role="group" aria-label={t("sidebar.group.aria")}>
-                <button
-                  type="button"
-                  class={groupMode === "profiles" ? "is-active" : ""}
-                  aria-pressed={groupMode === "profiles"}
-                  title={t("sidebar.group.profiles")}
-                  aria-label={t("sidebar.group.profiles")}
-                  onClick={() => setSidebarGroupMode("profiles")}
-                ><ListIcon /></button>
-                <button
-                  type="button"
-                  class={groupMode === "teams" ? "is-active" : ""}
-                  aria-pressed={groupMode === "teams"}
-                  title={t("sidebar.group.teams")}
-                  aria-label={t("sidebar.group.teams")}
-                  onClick={() => setSidebarGroupMode("teams")}
-                ><GroupIcon /></button>
-              </div>
-            )}
-            <button
-              class="sidebar-display-toggle"
-              type="button"
-              aria-label={copy.displayMode}
-              title={copy.displayMode}
-              aria-pressed={sidebarMode.value === "rows"}
-              onClick={() => setSidebarMode(sidebarMode.value === "rows" ? "cards" : "rows")}
-            >{sidebarMode.value === "rows" ? <CardsIcon /> : <ListIcon />}</button>
-          </div>
-        </header>
-        {sidebarProfilesOpen.value && <div class="sidebar-profile-list">
-          {grouping.mode === "flat"
-            ? grouping.profiles.map((profile) => renderProfileEntry(profile, profile.id))
-            : grouping.groups.map((group) => renderGroup(group))}
-          {profileList.value.length === 0 && <p class="sidebar-profile-empty">—</p>}
-        </div>}
-        {sidebarProfilesOpen.value && inventory.hasMore && !iconOnly && (
-          <button class="sidebar-more" type="button" disabled={inventory.loading} onClick={() => void loadMoreProfiles()}>
-            {inventory.loading ? t("inventory.loading") : t("inventory.showMore")}
-          </button>
-        )}
-      </section>
 
       <div
         class="sidebar-resize-handle"
@@ -729,6 +1137,7 @@ export function SideRail() {
           menuRef={menuRef}
           onClose={closeMenu}
           onOpenSession={openMenuSession}
+          onDeleteSession={setSessionDeleteRequestId}
         />
       )}
 

@@ -1,5 +1,5 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
-import type { HermesRuntimeSource } from "./hermes-backend.js";
+import { HermesCommitUnconfirmedError, HermesProfileError, type HermesRuntimeSource } from "./hermes-backend.js";
 import { writeError, writeJson } from "./server-http.js";
 
 const PROFILE_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
@@ -32,6 +32,7 @@ export async function handleProfilesHttp(
 ): Promise<void> {
   if (request.method === "POST" && requestUrl.pathname === PROFILES_PATH) {
     if (runtime?.createProfile === undefined) {
+      request.resume();
       writeError(response, 503, "runtime_unavailable", "Hermes runtime does not support profile creation.", maxJsonBytes);
       return;
     }
@@ -39,6 +40,7 @@ export async function handleProfilesHttp(
     try {
       body = await readJsonObject(request, Math.min(MAX_PROFILE_BODY_BYTES, maxJsonBytes));
     } catch (error) {
+      if (!request.readableEnded) request.resume();
       writeError(response, 400, "bad_request", error instanceof Error ? error.message : "Request body is invalid.", maxJsonBytes);
       return;
     }
@@ -55,8 +57,16 @@ export async function handleProfilesHttp(
       });
       writeJson(response, 201, { ok: true, name }, maxResponseJsonBytes, { "Cache-Control": "no-store" });
     } catch (error) {
-      const message = error instanceof Error ? error.message : "Unable to create profile.";
-      if (/invalid|exists|already/i.test(message)) {
+      if (error instanceof HermesCommitUnconfirmedError) {
+        writeJson(response, 409, {
+          code: "commit_unconfirmed",
+          message: "Hermes may have created this profile; refresh the profile list before retrying.",
+          retryable: false,
+        }, maxResponseJsonBytes, { "Cache-Control": "no-store" });
+        return;
+      }
+      if (error instanceof HermesProfileError && (error.code === "invalid" || error.code === "exists")) {
+        const message = error.code === "exists" ? "A profile with this name already exists." : "Profile name is invalid.";
         writeError(response, 400, "bad_request", message, maxJsonBytes);
         return;
       }
@@ -90,12 +100,12 @@ export async function handleProfilesHttp(
       await runtime.deleteProfile(name);
       writeJson(response, 200, { ok: true, name }, maxResponseJsonBytes, { "Cache-Control": "no-store" });
     } catch (error) {
-      const message = error instanceof Error ? error.message : "Unable to delete profile.";
-      if (/not found/i.test(message)) {
-        writeError(response, 404, "not_found", message, maxJsonBytes);
+      if (error instanceof HermesProfileError && error.code === "not_found") {
+        writeError(response, 404, "not_found", "Hermes profile was not found.", maxJsonBytes);
         return;
       }
-      if (/invalid|default/i.test(message)) {
+      if (error instanceof HermesProfileError && (error.code === "invalid" || error.code === "default")) {
+        const message = error.code === "default" ? "The default profile cannot be deleted." : "Profile name is invalid.";
         writeError(response, 400, "bad_request", message, maxJsonBytes);
         return;
       }

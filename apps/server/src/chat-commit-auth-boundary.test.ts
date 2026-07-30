@@ -47,11 +47,77 @@ test("prompt received by Hermes then closed upstream is reported as commit_uncon
   assert.equal(requests.filter(({ method }) => method === "prompt.submit").length, 1);
   assert.deepEqual(client.error(2), {
     code: -32008,
-    message: "Hermes may have accepted this prompt; reload history before retrying.",
+    message: "Hermes may have committed this request; reload history before retrying.",
     data: { reason: "commit_unconfirmed" },
   });
   assert.equal(JSON.stringify(client.frames()).includes("private upstream detail"), false);
   assert.deepEqual(client.closeCalls.at(-1), { code: 1013, reason: "Hermes chat restarted; reload history" });
+});
+
+test("slash mutation received by Hermes then closed upstream is reported as commit_unconfirmed", async () => {
+  let closeUpstream!: () => void;
+  const requests: HermesChatRequest[] = [];
+  const runtime = chatRuntime((onClosed) => {
+    closeUpstream = onClosed;
+    return connection(async (request) => {
+      requests.push(request);
+      if (request.method === "session.resume") return resumeResult(request, "live-slash-uncertain");
+      if (request.method === "slash.exec") {
+        closeUpstream();
+        throw new HermesChatTransportError("backend_closed", "private slash detail");
+      }
+      return { method: request.method, value: { status: "ok" } };
+    });
+  });
+  const client = new DelayedCloseWebSocket();
+  connectGateway(client, runtime);
+  await settle();
+
+  client.rpc(1, "session.resume", { session_id: "stored-slash-uncertain", profile: "default" });
+  await settle();
+  client.rpc(2, "slash.exec", { session_id: "live-slash-uncertain", command: "/compact" });
+  await settle(8);
+
+  assert.equal(requests.filter(({ method }) => method === "slash.exec").length, 1);
+  assert.deepEqual(client.error(2), {
+    code: -32008,
+    message: "Hermes may have committed this request; reload history before retrying.",
+    data: { reason: "commit_unconfirmed" },
+  });
+  assert.equal(JSON.stringify(client.frames()).includes("private slash detail"), false);
+});
+
+test("steer received by Hermes then closed upstream is reported as commit_unconfirmed", async () => {
+  let closeUpstream!: () => void;
+  const requests: HermesChatRequest[] = [];
+  const runtime = chatRuntime((onClosed) => {
+    closeUpstream = onClosed;
+    return connection(async (request) => {
+      requests.push(request);
+      if (request.method === "session.resume") return resumeResult(request, "live-steer-uncertain");
+      if (request.method === "session.steer") {
+        closeUpstream();
+        throw new HermesChatTransportError("backend_closed", "private steer detail");
+      }
+      return { method: request.method, value: { status: "ok" } };
+    });
+  });
+  const client = new DelayedCloseWebSocket();
+  connectGateway(client, runtime);
+  await settle();
+
+  client.rpc(1, "session.resume", { session_id: "stored-steer-uncertain", profile: "default" });
+  await settle();
+  client.rpc(2, "session.steer", { session_id: "live-steer-uncertain", text: "change direction" });
+  await settle(8);
+
+  assert.equal(requests.filter(({ method }) => method === "session.steer").length, 1);
+  assert.deepEqual(client.error(2), {
+    code: -32008,
+    message: "Hermes may have committed this request; reload history before retrying.",
+    data: { reason: "commit_unconfirmed" },
+  });
+  assert.equal(JSON.stringify(client.frames()).includes("private steer detail"), false);
 });
 
 test("an explicit Hermes prompt rejection remains a definitive generic rejection", async () => {

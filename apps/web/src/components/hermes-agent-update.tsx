@@ -4,6 +4,7 @@ import { loadHermesAgentUpdateStatus, startHermesAgentUpdate } from "../hermes-a
 import { locale, t, type TranslationKey } from "../i18n";
 import { CheckIcon, RefreshIcon, UploadIcon } from "./icons";
 import { InfoTip } from "./info-tip";
+import { useMobileOverlay } from "./use-mobile-overlay";
 import "./host-apps.css";
 
 const PHASE_LABELS: Record<HermesAgentUpdateStatus["phase"], TranslationKey> = {
@@ -29,8 +30,15 @@ export function HermesAgentUpdate({ permitted }: { permitted: boolean }) {
   const [status, setStatus] = useState<HermesAgentUpdateStatus | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(false);
+  const [confirmOpen, setConfirmOpen] = useState(false);
   const generation = useRef(0);
   const [, setLocaleRevision] = useState(0);
+  const confirmOverlay = useMobileOverlay<HTMLElement>({
+    kind: "modal",
+    open: confirmOpen,
+    onClose: () => setConfirmOpen(false),
+    viewport: "(min-width: 0px)",
+  });
 
   const reload = useCallback(async (showLoading = true, force = false) => {
     const currentGeneration = ++generation.current;
@@ -48,20 +56,40 @@ export function HermesAgentUpdate({ permitted }: { permitted: boolean }) {
   }, []);
 
   useEffect(() => {
-    void reload();
+    // Cached GETs remain side-effect free; an authorized owner explicitly
+    // starts the initial update check when this settings surface is opened.
+    void reload(true, permitted);
     const unsubscribe = locale.subscribe(() => setLocaleRevision((value) => value + 1));
     return () => { generation.current += 1; unsubscribe(); };
-  }, [reload]);
+  }, [permitted, reload]);
 
   useEffect(() => {
-    if (status?.phase !== "updating" && status?.phase !== "checking") return;
-    const timer = globalThis.setInterval(() => void reload(false), 1_500);
-    return () => globalThis.clearInterval(timer);
-  }, [reload, status?.phase]);
+    const settlingAfterFailure = status?.phase === "failed" && status.canUpdate !== true;
+    if (!error && status?.phase !== "updating" && status?.phase !== "checking" && !settlingAfterFailure) return;
+
+    // Poll serially. An interval can start a second desktop-authenticated fetch
+    // before the first one finishes; reload's generation guard then discards
+    // every late response and leaves the card stuck at "checking" forever.
+    let cancelled = false;
+    let timer: ReturnType<typeof globalThis.setTimeout> | undefined;
+    const schedule = (): void => {
+      timer = globalThis.setTimeout(() => {
+        if (cancelled) return;
+        void reload(false).finally(() => {
+          if (!cancelled) schedule();
+        });
+      }, 1_500);
+    };
+    schedule();
+    return () => {
+      cancelled = true;
+      if (timer !== undefined) globalThis.clearTimeout(timer);
+    };
+  }, [error, reload, status?.canUpdate, status?.phase]);
 
   const beginUpdate = useCallback(async () => {
     if (!permitted || status?.canUpdate !== true || status.phase === "updating") return;
-    if (!window.confirm(t("hermesUpdate.confirm"))) return;
+    setConfirmOpen(false);
     const currentGeneration = ++generation.current;
     setError(false);
     try {
@@ -85,6 +113,7 @@ export function HermesAgentUpdate({ permitted }: { permitted: boolean }) {
   const versionLabel = status?.currentVersion
     ? t("hermesUpdate.version", { version: status.currentVersion })
     : t("hermesUpdate.versionUnknown");
+  const retryFromCard = status === null && error;
 
   return (
     <section class="host-apps" aria-labelledby="hermes-update-title" aria-busy={loading || phase === "updating" || phase === "checking"}>
@@ -96,7 +125,7 @@ export function HermesAgentUpdate({ permitted }: { permitted: boolean }) {
         <button
           type="button"
           onClick={() => void reload(true, true)}
-          disabled={loading || phase === "updating"}
+          disabled={loading || !permitted || phase === "updating"}
           aria-label={t("hermesUpdate.reload")}
           title={t("hermesUpdate.reload")}
         >
@@ -122,12 +151,18 @@ export function HermesAgentUpdate({ permitted }: { permitted: boolean }) {
           ) : (
             <button
               type="button"
-              onClick={() => void beginUpdate()}
-              disabled={loading || !permitted || status?.canUpdate !== true || phase === "updating" || phase === "checking"}
-              aria-label={phase === "updating" ? t("hermesUpdate.updating") : t("hermesUpdate.update")}
-              title={phase === "updating" ? t("hermesUpdate.updating") : t("hermesUpdate.update")}
+              onClick={() => retryFromCard ? void reload(true, true) : setConfirmOpen(true)}
+              disabled={
+                loading
+                || !permitted
+                || status?.phase === "updating"
+                || status?.phase === "checking"
+                || (!retryFromCard && status?.canUpdate !== true)
+              }
+              aria-label={retryFromCard ? t("hermesUpdate.reload") : phase === "updating" ? t("hermesUpdate.updating") : t("hermesUpdate.update")}
+              title={retryFromCard ? t("hermesUpdate.reload") : phase === "updating" ? t("hermesUpdate.updating") : t("hermesUpdate.update")}
             >
-              <UploadIcon />
+              {retryFromCard ? <RefreshIcon /> : <UploadIcon />}
             </button>
           )}
         </div>
@@ -135,6 +170,50 @@ export function HermesAgentUpdate({ permitted }: { permitted: boolean }) {
 
       {!permitted && <p class="host-apps__notice">{t("hermesUpdate.ownerRequired")}</p>}
       {error && <p class="host-apps__notice is-error" role="alert">{t("hermesUpdate.loadFailed")}</p>}
+      {confirmOpen && (
+        <div
+          class="host-update-dialog-layer"
+          role="presentation"
+          onPointerDown={(event) => event.stopPropagation()}
+          onClick={(event) => event.stopPropagation()}
+        >
+          <button
+            type="button"
+            class="host-update-dialog-scrim"
+            aria-label={t("common.cancel")}
+            onClick={() => setConfirmOpen(false)}
+          />
+          <section
+            ref={confirmOverlay.ref}
+            class="host-update-dialog"
+            role="alertdialog"
+            aria-modal="true"
+            aria-labelledby="hermes-update-confirm-title"
+            aria-describedby="hermes-update-confirm-message"
+            tabIndex={-1}
+          >
+            <header>
+              <UploadIcon />
+              <h2 id="hermes-update-confirm-title">{t("hermesUpdate.confirmTitle")}</h2>
+            </header>
+            <p id="hermes-update-confirm-message">{t("hermesUpdate.confirm")}</p>
+            <footer>
+              <button
+                type="button"
+                class="quiet-button"
+                data-mobile-overlay-initial-focus
+                onClick={() => setConfirmOpen(false)}
+              >
+                {t("common.cancel")}
+              </button>
+              <button type="button" class="host-update-dialog-confirm" onClick={() => void beginUpdate()}>
+                <UploadIcon />
+                <span>{t("hermesUpdate.confirmAction")}</span>
+              </button>
+            </footer>
+          </section>
+        </div>
+      )}
     </section>
   );
 }

@@ -41,6 +41,7 @@ export class KanbanMutationFailure extends Error {
  */
 export function classifyKanbanMutationFailure(error: unknown): KanbanMutationFailureKind {
   if (error instanceof KanbanMutationFailure) return error.kind;
+  if (error instanceof OfficeHttpError && error.code === "commit_unconfirmed") return "commit-unknown";
   if (error instanceof OfficeHttpError && error.status >= 400 && error.status < 500 && error.status !== 408) {
     return "rejected";
   }

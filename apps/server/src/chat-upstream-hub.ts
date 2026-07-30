@@ -1,3 +1,4 @@
+import { createHash, randomUUID } from "node:crypto";
 import type { HermesRuntimeSource } from "./hermes-backend.js";
 import { HermesChatTransportError } from "./hermes-chat.js";
 import type {
@@ -22,7 +23,12 @@ const MAX_UNBOUND_EVENTS = 128;
 const MAX_EVENTS_PER_SESSION = 32;
 const MAX_UNBOUND_BYTES = 256 * 1024;
 const MAX_PENDING_SESSION_SETTLEMENT_MS = 16_000;
-const OWNED_LIVE_METHODS = new Set<HermesChatRequest["method"]>(["prompt.submit", "session.steer", "session.interrupt"]);
+const MAX_CORRELATED_SESSIONS = 256;
+const MAX_RECENT_COMPLETED_RUNS = 64;
+const MAX_RECENT_TOOL_OCCURRENCES = 128;
+const MESSAGE_EVENT_TYPES = new Set(["message.start", "message.delta", "message.interim", "message.complete"]);
+const TOOL_EVENT_TYPES = new Set(["tool.start", "tool.generating", "tool.progress", "tool.complete"]);
+const OWNED_LIVE_METHODS = new Set<HermesChatRequest["method"]>(["prompt.submit", "session.steer", "session.interrupt", "slash.exec"]);
 const OWNED_SESSION_REQUEST_METHODS = new Set<HermesChatRequest["method"]>([
   ...OWNED_LIVE_METHODS, "approval.respond", "clarify.respond",
 ]);
@@ -54,10 +60,44 @@ type BufferedEvents = {
   dropped: boolean;
 };
 
-/** A prompt may have reached Hermes, but Office could not observe its authoritative result. */
+type ToolOccurrence = {
+  id: string;
+  runId?: string;
+  runSequence?: number;
+  upstreamIds: Set<string>;
+  name?: string;
+  fingerprints: Set<string>;
+  sawStart: boolean;
+  open: boolean;
+  completionFingerprint?: string;
+};
+
+type CompletedRun = {
+  id: string;
+  sequence: number;
+  fingerprints: Set<string>;
+  sources: Set<string>;
+  usedAnonymousMessageIdentity: boolean;
+};
+
+type SessionEventCorrelation = {
+  activeRunId?: string;
+  activeRunSequence?: number;
+  activeRunObserved?: boolean;
+  activeRunSources: Set<string>;
+  activeRunFingerprints: Set<string>;
+  activeRunUsedAnonymousMessageIdentity?: boolean;
+  completedAnonymousMessageHistory: boolean;
+  messageReplayFence: ReplayFence;
+  toolReplayFence: ReplayFence;
+  completedRuns: CompletedRun[];
+  tools: ToolOccurrence[];
+};
+
+/** A mutation may have reached Hermes, but Office could not observe its authoritative result. */
 export class ChatCommitUnconfirmedError extends Error {
   constructor() {
-    super("Hermes prompt commit could not be confirmed.");
+    super("Hermes mutation commit could not be confirmed.");
     this.name = "ChatCommitUnconfirmedError";
   }
 }
@@ -82,6 +122,11 @@ export class ChatUpstreamHub {
   #connecting: Promise<HermesChatConnection> | undefined;
   #resetting: Promise<void> | undefined;
   #generation = 0;
+  readonly #correlationEpoch = randomUUID();
+  #eventSequence = 0;
+  #runSequence = 0;
+  #toolSequence = 0;
+  readonly #eventCorrelations = new Map<string, SessionEventCorrelation>();
   #cleanupEpoch = 0;
   #stopping = false;
 
@@ -178,6 +223,7 @@ export class ChatUpstreamHub {
     expectedLeaseToken: symbol,
     request: HermesChatRequest,
     authorize?: () => boolean,
+    internal?: HermesChatInternalRequestOptions,
   ): Promise<HermesChatResult> {
     if (this.#stopping) throw new Error("Chat hub is stopping.");
     if (!OWNED_SESSION_REQUEST_METHODS.has(request.method)) {
@@ -199,7 +245,7 @@ export class ChatUpstreamHub {
     const authorizeSettlement = (): boolean => this.#coordinator.routingLeaseToken(owner, liveSessionId)
       === expectedLeaseToken;
     return await this.#requestUnchecked(
-      request, undefined,
+      request, internal,
       authorizeCommand,
       authorizeSettlement,
     );
@@ -214,16 +260,23 @@ export class ChatUpstreamHub {
     const connection = await this.#ensureConnection();
     if (authorize !== undefined && !authorize()) throw new Error("Hermes live session ownership changed.");
     const generation = this.#generation;
+    const promptSessionId = request.method === "prompt.submit" && typeof request.params?.session_id === "string"
+      ? request.params.session_id
+      : undefined;
+    const expectedRunId = promptSessionId === undefined ? undefined : this.#expectPromptRun(promptSessionId);
     try {
       const result = await connection.request(request, internal);
       if (generation !== this.#generation || connection !== this.#connection) {
-        if (request.method === "prompt.submit") throw new ChatCommitUnconfirmedError();
+        if (commitSensitiveRequest(request)) throw new ChatCommitUnconfirmedError();
         throw new Error("Hermes chat generation changed.");
       }
       if (authorizeSettlement !== undefined && OWNED_SESSION_REQUEST_METHODS.has(request.method)
         && !authorizeSettlement()) {
-        if (request.method === "prompt.submit") {
-          this.#resetGeneration(generation);
+        if (commitSensitiveRequest(request)) {
+          // Session-local mutations such as steer/slash never start a
+          // close-on-disconnect run. Losing the downstream owner must not tear
+          // down the process-wide transport used by unrelated conversations.
+          if (request.method === "prompt.submit") this.#resetGeneration(generation);
           throw new ChatCommitUnconfirmedError();
         }
         throw new Error("Hermes live session ownership changed.");
@@ -231,18 +284,21 @@ export class ChatUpstreamHub {
       this.#observeRequestUsage(request);
       return result;
     } catch (error) {
+      if (promptSessionId !== undefined && expectedRunId !== undefined) {
+        this.#rollbackExpectedPromptRun(promptSessionId, expectedRunId);
+      }
       if ((request.method === "session.create" || request.method === "session.resume")
         && error instanceof HermesChatTransportError && error.code === "timed_out"
         && generation === this.#generation) {
         try { await connection.close(); } finally { this.#upstreamUnavailable(generation); }
       }
-      if (request.method === "prompt.submit" && promptCommitCouldBeUnconfirmed(error)) {
-        // A malformed/ambiguous success can leave the live session running even
-        // though the downstream socket received no authoritative result. Reset
-        // the shared generation before reporting ambiguity: this releases all
-        // Office leases synchronously, closes every close-on-disconnect Hermes
-        // session, and makes a replacement resume wait for reset completion.
-        this.#resetGeneration(generation);
+      if (commitSensitiveRequest(request) && commitCouldBeUnconfirmed(request.method, error)) {
+        if (request.method === "prompt.submit") {
+          // A malformed/ambiguous prompt success can leave a live run active.
+          // Reset before reporting ambiguity so all close-on-disconnect runs
+          // settle before any replacement resume.
+          this.#resetGeneration(generation);
+        }
         throw new ChatCommitUnconfirmedError();
       }
       throw error;
@@ -273,6 +329,9 @@ export class ChatUpstreamHub {
   discardBufferedSession(liveSessionId: string): void {
     this.#discardBuffered(liveSessionId);
     this.#droppedUnbound.delete(liveSessionId);
+    if (this.#coordinator.ownerForLive(liveSessionId) === undefined) {
+      this.#eventCorrelations.delete(liveSessionId);
+    }
   }
 
   closeOwnerSessions(owner: ChatSessionOwner): Promise<boolean> {
@@ -385,6 +444,7 @@ export class ChatUpstreamHub {
         throw new Error("Hermes duplicate session close was not authoritative.");
       }
       this.discardBufferedSession(liveSessionId);
+      this.#eventCorrelations.delete(liveSessionId);
       return "closed";
     } catch (error) {
       if (generation === this.#generation) this.#resetGeneration(generation);
@@ -430,7 +490,10 @@ export class ChatUpstreamHub {
       }
       if (remaining.size > 0) return { completed: false, results };
       this.#coordinator.releaseLease(owner, lease.token);
-      for (const liveId of lease.liveSessionIds) this.discardBufferedSession(liveId);
+      for (const liveId of lease.liveSessionIds) {
+        this.discardBufferedSession(liveId);
+        this.#eventCorrelations.delete(liveId);
+      }
       return { completed: true, results };
     })().finally(() => {
       if (this.#leaseCloseOperations.get(lease.token) === operation) {
@@ -496,15 +559,493 @@ export class ChatUpstreamHub {
 
   #routeEvent(generation: number, event: HermesChatEvent): void {
     if (this.#stopping || generation !== this.#generation || event.sessionId === undefined) return;
+    const correlatedEvent = this.#correlateEvent(generation, event);
     // Count once at the shared choke point (before fan-out or unbound buffering).
-    this.#observeEventUsage(event);
-    const owner = this.#coordinator.ownerForLive(event.sessionId);
+    this.#observeEventUsage(correlatedEvent);
+    const owner = this.#coordinator.ownerForLive(correlatedEvent.sessionId!);
     if (owner !== undefined) {
-      try { this.#subscribers.get(owner)?.onEvent(event); }
+      try { this.#subscribers.get(owner)?.onEvent(correlatedEvent); }
       catch { /* One Browser listener cannot break shared upstream routing. */ }
       return;
     }
-    this.#bufferUnbound(event.sessionId, event);
+    this.#bufferUnbound(correlatedEvent.sessionId!, correlatedEvent);
+  }
+
+  #correlateEvent(generation: number, event: HermesChatEvent): HermesChatEvent {
+    if (event.sessionId === undefined) return event;
+    const state = this.#correlationState(event.sessionId);
+    const eventSequence = ++this.#eventSequence;
+    const upstreamEventId = stringPayload(event.payload, "eventId", "event_id");
+    const payload: HermesChatEvent["payload"] = {
+      ...event.payload,
+      ...(upstreamEventId === undefined ? {} : { upstreamEventId }),
+      eventId: `event-${this.#correlationEpoch}-${eventSequence}`,
+      correlationEpoch: this.#correlationEpoch,
+      eventSequence,
+    };
+
+    if (MESSAGE_EVENT_TYPES.has(event.type)) {
+      const fingerprint = eventFingerprint(event);
+      const sources = messageSourceIds(event.payload);
+      const preferredSource = sources[0];
+      const completedByFingerprint = [...state.completedRuns].reverse()
+        .find((run) => run.fingerprints.has(fingerprint));
+      const completedBySource = sources.length === 0 ? undefined : [...state.completedRuns].reverse()
+        .find((run) => sources.some((source) => run.sources.has(source)));
+      const recentCompleted = completedByFingerprint;
+      const seenFingerprint = state.messageReplayFence.has(`frame:${fingerprint}`);
+      const seenSource = sources.some((source) => state.messageReplayFence.has(`source:${source}`));
+      const seenPreferredSource = preferredSource !== undefined
+        && state.messageReplayFence.has(`source:${preferredSource}`);
+      const seenAnonymous = sources.length === 0 && state.messageReplayFence.has("anonymous");
+      const replayKeys = [
+        `frame:${fingerprint}`,
+        ...(sources.length === 0 ? ["anonymous"] : sources.map((source) => `source:${source}`)),
+      ];
+      if (!state.messageReplayFence.canRecord(replayKeys)) {
+        state.messageReplayFence.exhaust();
+        return resyncRequiredEvent(
+          event,
+          payload,
+          "The message replay ledger reached its safety limit. Reload session history.",
+        );
+      }
+      const matchesCurrentFingerprint = state.activeRunFingerprints.has(fingerprint);
+      const matchesCurrentSource = sources.some((source) => state.activeRunSources.has(source));
+      if (state.activeRunId !== undefined && state.activeRunObserved !== true
+        && (recentCompleted !== undefined || seenFingerprint || seenPreferredSource || seenAnonymous)) {
+        return resyncRequiredEvent(
+          event,
+          payload,
+          "The first message frame could not be correlated to the new run safely. Reload session history.",
+        );
+      }
+      const startIntroducesUnlinkedIdentity = event.type === "message.start"
+        && state.activeRunId !== undefined
+        && state.activeRunObserved === true
+        && (sources.length > 0
+          ? state.activeRunSources.size > 0 && !matchesCurrentSource
+          : (state.activeRunSources.size > 0 || state.activeRunUsedAnonymousMessageIdentity === true)
+            && !matchesCurrentFingerprint);
+      if (startIntroducesUnlinkedIdentity) {
+        return resyncRequiredEvent(
+          event,
+          payload,
+          "A message start introduced an identity unrelated to the active run. Reload session history.",
+        );
+      }
+      if (state.activeRunId !== undefined && state.activeRunObserved === true
+        && ((completedByFingerprint !== undefined && !matchesCurrentFingerprint)
+          || (completedBySource !== undefined && !matchesCurrentSource)
+          || (seenFingerprint && !matchesCurrentFingerprint)
+          || (seenSource && !matchesCurrentSource)
+          || (sources.length === 0 && state.completedAnonymousMessageHistory && !matchesCurrentFingerprint))) {
+        return resyncRequiredEvent(
+          event,
+          payload,
+          "A message frame matched a different completed run. Reload session history.",
+        );
+      }
+      let runId = state.activeRunId;
+      let runSequence = state.activeRunSequence;
+      let replayedPreviousRun = false;
+      if (runId === undefined && recentCompleted !== undefined) {
+        runId = recentCompleted.id;
+        runSequence = recentCompleted.sequence;
+        replayedPreviousRun = true;
+      } else if (runId === undefined && (seenFingerprint || seenSource || seenAnonymous)) {
+        return resyncRequiredEvent(
+          event,
+          payload,
+          "A message frame matched an older run outside the recent correlation window. Reload session history.",
+        );
+      }
+      if (runId === undefined || runSequence === undefined) {
+        const created = this.#newRunIdentity();
+        runId = created.id;
+        runSequence = created.sequence;
+      }
+      payload.runId = runId;
+      payload.runSequence = runSequence;
+      payload.messageOccurrenceId = runId;
+      if (replayedPreviousRun) {
+        // Preserve an already-prepared prompt run while tagging the delayed
+        // frame with the occurrence that originally produced it.
+      } else {
+        state.activeRunId = runId;
+        state.activeRunSequence = runSequence;
+        state.activeRunFingerprints.add(fingerprint);
+        state.messageReplayFence.record(replayKeys);
+        if (sources.length === 0) {
+          state.activeRunUsedAnonymousMessageIdentity = true;
+        } else {
+          for (const source of sources) state.activeRunSources.add(source);
+        }
+      }
+      if (!replayedPreviousRun && event.type === "message.complete") {
+        const completedRun: CompletedRun = {
+          id: runId,
+          sequence: runSequence,
+          fingerprints: new Set(state.activeRunFingerprints),
+          sources: new Set(state.activeRunSources),
+          usedAnonymousMessageIdentity: state.activeRunUsedAnonymousMessageIdentity === true,
+        };
+        state.completedRuns = [
+          ...state.completedRuns.filter((run) => run.id !== runId),
+          completedRun,
+        ].slice(-MAX_RECENT_COMPLETED_RUNS);
+        if (completedRun.usedAnonymousMessageIdentity) {
+          state.completedAnonymousMessageHistory = true;
+        }
+        if (state.activeRunId === runId) state.activeRunId = undefined;
+        state.activeRunSequence = undefined;
+        state.activeRunObserved = undefined;
+        state.activeRunSources = new Set();
+        state.activeRunFingerprints = new Set();
+        state.activeRunUsedAnonymousMessageIdentity = undefined;
+      } else if (!replayedPreviousRun) {
+        state.activeRunObserved = true;
+      }
+    }
+
+    if (TOOL_EVENT_TYPES.has(event.type)) {
+      const upstreamIds = toolSourceIds(event.payload);
+      const preferredUpstreamId = upstreamIds[0];
+      const name = stringPayload(event.payload, "name");
+      const fingerprint = eventFingerprint(event);
+      const seenFingerprint = state.toolReplayFence.has(`frame:${fingerprint}`);
+      const seenUpstreamId = upstreamIds.some((id) => state.toolReplayFence.has(`source:${id}`));
+      const seenAnonymous = upstreamIds.length === 0 && state.toolReplayFence.has("anonymous");
+      const replayKeys = [
+        `frame:${fingerprint}`,
+        ...(upstreamIds.length === 0 ? ["anonymous"] : upstreamIds.map((id) => `source:${id}`)),
+      ];
+      if (!state.toolReplayFence.canRecord(replayKeys)) {
+        state.toolReplayFence.exhaust();
+        return resyncRequiredEvent(
+          event,
+          payload,
+          "The tool replay ledger reached its safety limit. Reload session history.",
+        );
+      }
+      let occurrence: ToolOccurrence | undefined;
+      if (upstreamIds.length > 0) {
+        const matching = state.tools.filter((item) => (
+          upstreamIds.some((id) => item.upstreamIds.has(id))
+        ));
+        const preferredMatching = preferredUpstreamId === undefined
+          ? []
+          : matching.filter((item) => item.upstreamIds.has(preferredUpstreamId));
+        // A start's preferred id identifies the occurrence. Secondary aliases
+        // may be shared by sequential calls and must not merge a new start into
+        // an older call. Later phases may use any known alias.
+        const candidates = event.type === "tool.start"
+          ? preferredMatching
+          : preferredMatching.length > 0 ? preferredMatching : matching;
+        const openCandidates = [...candidates].reverse().filter((item) => item.open);
+        const completedCandidates = [...candidates].reverse().filter((item) => !item.open);
+        if (event.type === "tool.start") {
+          const currentOpen = openCandidates.filter((item) => item.runId === state.activeRunId);
+          if (currentOpen.length > 1) {
+            return resyncRequiredEvent(
+              event,
+              payload,
+              "A tool start matched multiple open occurrences. Reload session history.",
+            );
+          }
+          occurrence = currentOpen[0];
+          if (occurrence?.sawStart === true) {
+            return resyncRequiredEvent(
+              event,
+              payload,
+              "A repeated tool start could not be distinguished from a concurrent call. Reload session history.",
+            );
+          }
+          const preferredIdSeen = preferredUpstreamId !== undefined
+            && state.toolReplayFence.has(`source:${preferredUpstreamId}`);
+          if (occurrence === undefined && (seenFingerprint || preferredIdSeen)) {
+            return resyncRequiredEvent(
+              event,
+              payload,
+              "A reused tool id could not establish a new occurrence safely. Reload session history.",
+            );
+          }
+        } else {
+          if (openCandidates.length > 1) {
+            return resyncRequiredEvent(
+              event,
+              payload,
+              "A tool frame matched multiple open occurrences. Reload session history.",
+            );
+          }
+          occurrence = openCandidates[0];
+          const openInActiveRun = occurrence === undefined ? state.tools.filter((item) => (
+            item.open && item.runId === state.activeRunId
+            && toolNamesMayMatch(item.name, name)
+          )) : [];
+          if (occurrence === undefined && openInActiveRun.length > 1) {
+            return resyncRequiredEvent(
+              event,
+              payload,
+              "A tool frame matched multiple open occurrences in the active run. Reload session history.",
+            );
+          }
+          if (occurrence === undefined && completedCandidates.length > 0 && openInActiveRun.length > 0) {
+            return resyncRequiredEvent(
+              event,
+              payload,
+              "A tool frame could belong to either the active run or a completed occurrence. Reload session history.",
+            );
+          }
+          if (occurrence === undefined && matching.length === 0 && openInActiveRun.length > 0) {
+            return resyncRequiredEvent(
+              event,
+              payload,
+              "A tool frame introduced an unlinked id while a plausible occurrence was open. Reload session history.",
+            );
+          }
+          if (occurrence === undefined && completedCandidates.length === 1) {
+            const completed = completedCandidates[0]!;
+            if (!completed.fingerprints.has(fingerprint)) {
+              return resyncRequiredEvent(
+                event,
+                payload,
+                "A new tool frame reused an id from a completed occurrence. Reload session history.",
+              );
+            }
+            occurrence = completed;
+          } else if (occurrence === undefined && completedCandidates.length > 1) {
+            const exactReplay = completedCandidates.filter((item) => item.fingerprints.has(fingerprint));
+            if (exactReplay.length !== 1) {
+              return resyncRequiredEvent(
+                event,
+                payload,
+                "A tool frame matched multiple completed occurrences. Reload session history.",
+              );
+            }
+            occurrence = exactReplay[0];
+          }
+        }
+        if (occurrence === undefined) {
+          // A novel preferred id may legitimately reuse a secondary alias
+          // (for example a tool definition id shared by sequential calls).
+          // Non-start phases cannot establish that distinction on their own.
+          if (seenFingerprint || (event.type !== "tool.start" && seenUpstreamId)) {
+            return resyncRequiredEvent(
+              event,
+              payload,
+              "A tool frame matched an older occurrence outside the recent correlation window. Reload session history.",
+            );
+          }
+          occurrence = {
+            id: `tool-${generation}-${++this.#toolSequence}`,
+            ...(state.activeRunId ? { runId: state.activeRunId } : {}),
+            ...(state.activeRunSequence === undefined ? {} : { runSequence: state.activeRunSequence }),
+            upstreamIds: new Set(upstreamIds),
+            ...(name ? { name } : {}),
+            fingerprints: new Set([fingerprint]),
+            sawStart: event.type === "tool.start",
+            open: true,
+          };
+          state.tools.push(occurrence);
+        }
+        for (const id of upstreamIds) occurrence.upstreamIds.add(id);
+        if (event.type === "tool.start") occurrence.sawStart = true;
+      } else if (event.type === "tool.start") {
+        const matchingOpen = [...state.tools].reverse().find((item) => (
+          item.open && item.upstreamIds.size === 0 && toolNamesMayMatch(item.name, name)
+        ));
+        const matchingCompleted = [...state.tools].reverse().find((item) => (
+          !item.open && item.upstreamIds.size === 0 && toolNamesMayMatch(item.name, name)
+        ));
+        if (matchingOpen === undefined && seenFingerprint) {
+          return resyncRequiredEvent(
+            event,
+            payload,
+            "An anonymous tool start repeated without a stable occurrence id. Reload session history.",
+          );
+        }
+        if (state.activeRunId !== undefined && state.activeRunObserved !== true && matchingCompleted !== undefined) {
+          return resyncRequiredEvent(
+            event,
+            payload,
+            "An anonymous tool could not establish a new run safely. Reload session history.",
+          );
+        }
+        if (matchingOpen?.sawStart === true) {
+          return {
+            type: "error",
+            sessionId: event.sessionId,
+            ...(event.profile === undefined ? {} : { profile: event.profile }),
+            payload: {
+              eventId: payload.eventId!,
+              status: "resync_required",
+              message: "Concurrent anonymous tools cannot be correlated safely. Reload session history.",
+              originalType: event.type,
+            },
+          };
+        }
+        if (matchingOpen === undefined && matchingCompleted === undefined
+          && state.activeRunObserved !== true && seenAnonymous) {
+          return resyncRequiredEvent(
+            event,
+            payload,
+            "An anonymous tool frame matched an older occurrence outside the recent correlation window. Reload session history.",
+          );
+        }
+        occurrence = matchingOpen ?? {
+          id: `tool-${generation}-${++this.#toolSequence}`,
+          ...(state.activeRunId ? { runId: state.activeRunId } : {}),
+          ...(state.activeRunSequence === undefined ? {} : { runSequence: state.activeRunSequence }),
+          upstreamIds: new Set(),
+          ...(name ? { name } : {}),
+          fingerprints: new Set([fingerprint]),
+          sawStart: true,
+          open: true,
+        };
+        occurrence.sawStart = true;
+        if (matchingOpen === undefined) state.tools.push(occurrence);
+      } else {
+        const open = state.tools.filter((item) => (
+          item.open && item.upstreamIds.size === 0 && toolNamesMayMatch(item.name, name)
+        ));
+        if (open.length > 1) {
+          return resyncRequiredEvent(
+            event,
+            payload,
+            "An anonymous tool frame matched multiple open occurrences. Reload session history.",
+          );
+        }
+        occurrence = event.type === "tool.complete" ? open[0] : open.at(-1);
+        if (occurrence === undefined && event.type === "tool.complete") {
+          occurrence = [...state.tools].reverse().find((item) => item.completionFingerprint === fingerprint);
+        }
+        if (occurrence === undefined) {
+          if (seenFingerprint || seenAnonymous) {
+            return resyncRequiredEvent(
+              event,
+              payload,
+              "An anonymous tool frame matched an older occurrence outside the recent correlation window. Reload session history.",
+            );
+          }
+          occurrence = {
+            id: `tool-${generation}-${++this.#toolSequence}`,
+            ...(state.activeRunId ? { runId: state.activeRunId } : {}),
+            ...(state.activeRunSequence === undefined ? {} : { runSequence: state.activeRunSequence }),
+            upstreamIds: new Set(),
+            ...(name ? { name } : {}),
+            fingerprints: new Set([fingerprint]),
+            sawStart: false,
+            open: true,
+          };
+          state.tools.push(occurrence);
+        }
+      }
+      if (occurrence.name === undefined && name !== undefined) occurrence.name = name;
+      if (occurrence.runId === undefined && occurrence.open) {
+        if (state.activeRunId === undefined || state.activeRunSequence === undefined) {
+          const created = this.#newRunIdentity();
+          state.activeRunId = created.id;
+          state.activeRunSequence = created.sequence;
+        }
+        occurrence.runId = state.activeRunId;
+        occurrence.runSequence = state.activeRunSequence;
+      }
+      if (occurrence.open && occurrence.runId === state.activeRunId
+        && seenFingerprint && !occurrence.fingerprints.has(fingerprint)) {
+        return resyncRequiredEvent(
+          event,
+          payload,
+          "A tool frame matched a different completed occurrence. Reload session history.",
+        );
+      }
+      if (occurrence.open && occurrence.runId === state.activeRunId) state.activeRunObserved = true;
+      occurrence.fingerprints.add(fingerprint);
+      state.toolReplayFence.record(replayKeys);
+      payload.toolOccurrenceId = occurrence.id;
+      if (occurrence.runId !== undefined) payload.runId = occurrence.runId;
+      if (occurrence.runSequence !== undefined) payload.runSequence = occurrence.runSequence;
+      if (event.type === "tool.complete") {
+        occurrence.open = false;
+        occurrence.completionFingerprint = fingerprint;
+      }
+      while (state.tools.length > MAX_RECENT_TOOL_OCCURRENCES) {
+        const closedIndex = state.tools.findIndex((item) => !item.open);
+        if (closedIndex < 0) {
+          return {
+            type: "error",
+            sessionId: event.sessionId,
+            ...(event.profile === undefined ? {} : { profile: event.profile }),
+            payload: {
+              eventId: payload.eventId!,
+              status: "resync_required",
+              message: "Concurrent tool correlation limit exceeded. Reload session history.",
+              originalType: event.type,
+            },
+          };
+        }
+        state.tools.splice(closedIndex, 1);
+      }
+    }
+    return { ...event, payload };
+  }
+
+  #correlationState(sessionId: string): SessionEventCorrelation {
+    const existing = this.#eventCorrelations.get(sessionId);
+    if (existing !== undefined) return existing;
+    if (this.#eventCorrelations.size >= MAX_CORRELATED_SESSIONS) {
+      const evictable = [...this.#eventCorrelations].find(([candidateId, candidate]) => (
+        candidate.activeRunId === undefined
+        && this.#coordinator.ownerForLive(candidateId) === undefined
+        && !this.#unbound.has(candidateId)
+      ))?.[0];
+      if (evictable !== undefined) this.#eventCorrelations.delete(evictable);
+      // If every candidate still owns an undelivered buffer, temporarily grow
+      // the map. Forgetting its replay fence would be less safe than exceeding
+      // this soft cache target; the unbound buffer limits keep growth bounded.
+    }
+    const created: SessionEventCorrelation = {
+      activeRunSources: new Set(),
+      activeRunFingerprints: new Set(),
+      completedAnonymousMessageHistory: false,
+      messageReplayFence: new ReplayFence(),
+      toolReplayFence: new ReplayFence(),
+      completedRuns: [],
+      tools: [],
+    };
+    this.#eventCorrelations.set(sessionId, created);
+    return created;
+  }
+
+  #newRunIdentity(): { id: string; sequence: number } {
+    const sequence = ++this.#runSequence;
+    return { id: `run-${this.#correlationEpoch}-${sequence}`, sequence };
+  }
+
+  #expectPromptRun(sessionId: string): string {
+    const state = this.#correlationState(sessionId);
+    if (state.activeRunUsedAnonymousMessageIdentity === true) {
+      state.completedAnonymousMessageHistory = true;
+    }
+    const run = this.#newRunIdentity();
+    state.activeRunId = run.id;
+    state.activeRunSequence = run.sequence;
+    state.activeRunObserved = false;
+    state.activeRunSources = new Set();
+    state.activeRunFingerprints = new Set();
+    state.activeRunUsedAnonymousMessageIdentity = undefined;
+    return run.id;
+  }
+
+  #rollbackExpectedPromptRun(sessionId: string, runId: string): void {
+    const state = this.#eventCorrelations.get(sessionId);
+    if (state?.activeRunId !== runId || state.activeRunObserved === true) return;
+    state.activeRunId = undefined;
+    state.activeRunSequence = undefined;
+    state.activeRunObserved = undefined;
+    state.activeRunSources = new Set();
+    state.activeRunFingerprints = new Set();
+    state.activeRunUsedAnonymousMessageIdentity = undefined;
   }
 
   /**
@@ -607,10 +1148,14 @@ export class ChatUpstreamHub {
 
   #discardBuffered(liveSessionId: string): void {
     const buffered = this.#unbound.get(liveSessionId);
-    if (buffered === undefined) return;
-    this.#unbound.delete(liveSessionId);
-    this.#unboundEventCount -= buffered.events.length;
-    this.#unboundBytes -= buffered.bytes;
+    if (buffered !== undefined) {
+      this.#unbound.delete(liveSessionId);
+      this.#unboundEventCount -= buffered.events.length;
+      this.#unboundBytes -= buffered.bytes;
+    }
+    if (this.#coordinator.ownerForLive(liveSessionId) === undefined) {
+      this.#eventCorrelations.delete(liveSessionId);
+    }
   }
 
   #clearBuffered(): void {
@@ -656,6 +1201,7 @@ export class ChatUpstreamHub {
     this.#connection = undefined;
     this.#connecting = undefined;
     this.#clearBuffered();
+    this.#eventCorrelations.clear();
     const affected = new Map<ChatSessionOwner, string[]>();
     for (const owner of this.#subscribers.keys()) affected.set(owner, this.#coordinator.ownedLiveSessionIds(owner));
     this.#coordinator.releaseAll();
@@ -666,11 +1212,125 @@ export class ChatUpstreamHub {
   }
 }
 
-function promptCommitCouldBeUnconfirmed(error: unknown): boolean {
+const MAX_REPLAY_FENCE_ENTRIES = 16_384;
+
+class ReplayFence {
+  readonly #hashes = new Set<string>();
+  #exhausted = false;
+
+  has(value: string): boolean {
+    return this.#hashes.has(replayFenceHash(value));
+  }
+
+  canRecord(values: readonly string[]): boolean {
+    if (this.#exhausted) return false;
+    const additions = new Set(values.map(replayFenceHash));
+    let newEntries = 0;
+    for (const hash of additions) {
+      if (!this.#hashes.has(hash)) newEntries += 1;
+    }
+    return this.#hashes.size + newEntries <= MAX_REPLAY_FENCE_ENTRIES;
+  }
+
+  record(values: readonly string[]): void {
+    for (const value of values) this.#hashes.add(replayFenceHash(value));
+  }
+
+  exhaust(): void {
+    this.#exhausted = true;
+  }
+}
+
+function replayFenceHash(value: string): string {
+  return createHash("sha256").update(value).digest("base64url");
+}
+
+function resyncRequiredEvent(
+  event: HermesChatEvent,
+  payload: HermesChatEvent["payload"],
+  message: string,
+): HermesChatEvent {
+  return {
+    type: "error",
+    sessionId: event.sessionId!,
+    ...(event.profile === undefined ? {} : { profile: event.profile }),
+    payload: {
+      eventId: payload.eventId!,
+      correlationEpoch: payload.correlationEpoch!,
+      eventSequence: payload.eventSequence!,
+      status: "resync_required",
+      message,
+      originalType: event.type,
+    },
+  };
+}
+
+function stringPayload(payload: HermesChatEvent["payload"], ...keys: string[]): string | undefined {
+  for (const key of keys) {
+    const value = payload[key];
+    if (typeof value === "string" && value.length > 0) return value;
+  }
+  return undefined;
+}
+
+function toolNamesMayMatch(stored: string | undefined, incoming: string | undefined): boolean {
+  return stored === undefined || incoming === undefined || stored === incoming;
+}
+
+function messageSourceIds(payload: HermesChatEvent["payload"]): string[] {
+  const ids = new Set<string>();
+  const primary = stringPayload(payload, "messageId", "message_id");
+  if (primary !== undefined) ids.add(primary);
+  for (const key of ["messageIds", "message_ids"]) {
+    const aliases = payload[key];
+    if (!Array.isArray(aliases)) continue;
+    for (const alias of aliases) {
+      if (typeof alias === "string" && alias.length > 0) ids.add(alias);
+    }
+  }
+  return [...ids];
+}
+
+function toolSourceIds(payload: HermesChatEvent["payload"]): string[] {
+  const ids = new Set<string>();
+  const primary = stringPayload(payload, "toolId", "tool_id");
+  if (primary !== undefined) ids.add(primary);
+  for (const key of ["toolIds", "tool_ids"]) {
+    const aliases = payload[key];
+    if (!Array.isArray(aliases)) continue;
+    for (const alias of aliases) {
+      if (typeof alias === "string" && alias.length > 0) ids.add(alias);
+    }
+  }
+  return [...ids];
+}
+
+function eventFingerprint(event: HermesChatEvent): string {
+  return replayFenceHash(JSON.stringify([
+    event.type,
+    messageSourceIds(event.payload),
+    toolSourceIds(event.payload),
+    stringPayload(event.payload, "name"),
+    stringPayload(event.payload, "text"),
+    stringPayload(event.payload, "summary"),
+    stringPayload(event.payload, "status"),
+  ]));
+}
+
+function commitSensitiveRequest(request: HermesChatRequest): boolean {
+  if (request.method === "prompt.submit" || request.method === "session.steer"
+    || request.method === "approval.respond" || request.method === "clarify.respond") return true;
+  if (request.method !== "slash.exec" || typeof request.params?.command !== "string") return false;
+  return /^\/(?:compact|undo|model|reasoning)(?:\s|$)/i.test(request.params.command.trim());
+}
+
+function commitCouldBeUnconfirmed(method: HermesChatRequest["method"], error: unknown): boolean {
   if (error instanceof ChatCommitUnconfirmedError) return true;
   if (!(error instanceof HermesChatTransportError)) return true;
   if (error.code === "invalid_request" || error.code === "connection_failed") return false;
-  return error.code !== "backend_rejected" || error.rpcCode === undefined;
+  if (error.code !== "backend_rejected" || error.rpcCode === undefined) return true;
+  if (method !== "slash.exec") return false;
+  return !new Set([-32601, 4001, 4002, 4004, 4007, 4009, 4018, 4090]).has(error.rpcCode);
 }
 
 function closeResult(

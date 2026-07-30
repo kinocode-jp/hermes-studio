@@ -122,6 +122,73 @@
 .host-apps__notice { margin: 12px 0 0; color: var(--ink-muted); font-size: var(--text-sm); }
 .host-apps__notice.is-error { color: var(--coral); }
 
+.host-update-dialog-layer {
+  position: fixed;
+  inset: 0;
+  z-index: 230;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+}
+
+.host-update-dialog-scrim {
+  position: absolute;
+  inset: 0;
+  border: 0;
+  background: var(--scrim);
+  cursor: pointer;
+}
+
+.host-update-dialog {
+  position: relative;
+  display: grid;
+  gap: 16px;
+  width: min(460px, 100%);
+  padding: 20px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-lg);
+  color: var(--ink);
+  background: var(--surface);
+  box-shadow: var(--shadow-lg);
+}
+
+.host-update-dialog > header {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  color: var(--accent);
+}
+
+.host-update-dialog > header svg { width: 20px; height: 20px; }
+.host-update-dialog h2 { margin: 0; color: var(--ink); font-size: var(--text-lg); }
+.host-update-dialog > p { margin: 0; color: var(--ink-muted); line-height: 1.5; }
+.host-update-dialog > footer { display: flex; justify-content: flex-end; gap: 8px; }
+.host-update-dialog > footer button {
+  display: inline-flex;
+  min-height: 38px;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  padding: 0 14px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-md);
+  font: 700 var(--text-sm)/1 var(--font-sans);
+  cursor: pointer;
+}
+
+.host-update-dialog-confirm {
+  border-color: var(--accent) !important;
+  color: var(--surface);
+  background: var(--accent);
+}
+
+.host-update-dialog-confirm:hover,
+.host-update-dialog-confirm:focus-visible {
+  background: color-mix(in srgb, var(--accent) 88%, var(--ink));
+}
+
+.host-update-dialog-confirm svg { width: 15px; height: 15px; }
+
 @media (max-width: 768px) {
   .host-apps { padding: 12px; }
   .host-apps__header button,

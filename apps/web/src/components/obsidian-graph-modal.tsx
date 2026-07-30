@@ -6,12 +6,13 @@ import {
   appModalSizes,
   createModalResizeHandlers,
   getAppModalSize,
-  shouldIgnoreModalOutsideClose,
 } from "../app-modal-layout";
 import { loadObsidianGraph, loadObsidianVaults } from "../obsidian-api";
 import { t } from "../i18n";
 import { CloseIcon, RefreshIcon } from "./icons";
 import { InfoTip } from "./info-tip";
+import { useMobileOverlay } from "./use-mobile-overlay";
+import { useModalOutsideClose } from "./use-modal-outside-close";
 import "./obsidian-graph-modal.css";
 
 const SETTINGS_KEY = "hermes-studio:obsidian-graph-settings:v1";
@@ -40,12 +41,19 @@ export function ObsidianGraphModal({ open, onClose }: { open: boolean; onClose: 
   const _sizes = appModalSizes.value;
   const modalSize = getAppModalSize("obsidian-graph");
   const resize = useMemo(() => createModalResizeHandlers("obsidian-graph"), []);
+  const outsideClose = useModalOutsideClose(onClose);
   const [settings, setSettings] = useState<GraphSettings>(() => readSettings());
   const [vaults, setVaults] = useState<readonly ObsidianVaultSummary[]>([]);
   const [graph, setGraph] = useState<ObsidianGraph | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [selectedNode, setSelectedNode] = useState<ObsidianGraphNode | null>(null);
+  const overlay = useMobileOverlay<HTMLElement>({
+    kind: "modal",
+    open,
+    onClose,
+    viewport: "(min-width: 0px)",
+  });
 
   const patchSettings = (patch: Partial<GraphSettings>) => {
     setSettings((current) => {
@@ -131,18 +139,15 @@ export function ObsidianGraphModal({ open, onClose }: { open: boolean; onClose: 
       class="obsidian-graph-layer"
       role="presentation"
       data-modal-affordance="true"
-      onPointerDown={(event) => {
-        if (!shouldIgnoreModalOutsideClose() && event.target === event.currentTarget) onClose();
-      }}
-      onClick={(event) => {
-        if (!shouldIgnoreModalOutsideClose() && event.target === event.currentTarget) onClose();
-      }}
+      {...outsideClose}
     >
       <section
+        ref={overlay.ref}
         class="obsidian-graph-modal"
         role="dialog"
         aria-modal="true"
         aria-labelledby="obsidian-graph-title"
+        tabIndex={-1}
         style={{ width: `${modalSize.width}px`, height: `${modalSize.height}px` }}
         onPointerDown={(event) => event.stopPropagation()}
         onClick={(event) => event.stopPropagation()}

@@ -98,7 +98,7 @@
   border-radius: 0;
   color: var(--md-on-surface-variant);
   background: transparent;
-  font: 600 13px/1 var(--font-sans, system-ui, sans-serif);
+  font: 600 var(--ls-text-sm)/1 var(--font-sans, system-ui, sans-serif);
   letter-spacing: .02em;
   cursor: pointer;
   white-space: nowrap;
@@ -502,12 +502,12 @@
   color: var(--md-on-surface);
   background: transparent;
   box-shadow: none;
-  font: 400 14px/1.5 var(--font-sans, system-ui, sans-serif);
+  font: 400 var(--ls-text-label)/1.5 var(--font-sans, system-ui, sans-serif);
 }
 .settings-ledger textarea {
   min-height: 180px;
   resize: vertical;
-  font: 400 14px/1.55 var(--font-sans, system-ui, sans-serif);
+  font: 400 var(--ls-text-label)/1.55 var(--font-sans, system-ui, sans-serif);
 }
 .settings-ledger textarea:focus,
 .settings-field input:not([type="checkbox"]):focus,

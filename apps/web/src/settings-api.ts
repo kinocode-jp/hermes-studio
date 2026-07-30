@@ -140,12 +140,14 @@ export type ProfileAgentBehavior = {
 };
 
 export type AgentBehaviorSnapshot = {
+  sharedRevision: number;
   sharedCandidates: SharedSubagentCandidate[];
   profile: ProfileAgentBehavior;
 };
 
 export type ProfileAgentBehaviorUpdate = {
   expectedRevision: number;
+  expectedSharedRevision?: number;
   subagentMode?: SubagentMode;
   preferredSubagent?: string;
   preferredCandidateIds?: string[];
@@ -702,8 +704,13 @@ function validateProjects(value: unknown): ProfileProjects {
 }
 
 function validateAgentBehaviorSnapshot(value: unknown): AgentBehaviorSnapshot {
-  if (!isRecord(value) || !Array.isArray(value.sharedCandidates) || !isRecord(value.profile)) throw incompatible();
+  if (!isRecord(value)
+    || !Number.isInteger(value.sharedRevision)
+    || (value.sharedRevision as number) < 0
+    || !Array.isArray(value.sharedCandidates)
+    || !isRecord(value.profile)) throw incompatible();
   return {
+    sharedRevision: value.sharedRevision as number,
     sharedCandidates: value.sharedCandidates.map(validateSharedSubagentCandidate),
     profile: validateAgentBehavior(value.profile),
   };

@@ -6,8 +6,10 @@ import { chatMessageBody, chatSessionTitle, locale, localizeRuntimeMessage, offi
 import { buildChatTimeline, chatComposerState, formatChatMessageTime, nextOperationAnnouncement, operationAnnouncementText, presentedOperationEvidence, shouldSubmitComposerKey } from "../src/components/chat-pane.tsx";
 import { canSteerChatSession, canSubmitChatPrompt, isChatRunActive, mergeGatewayStatusUpdate, mergeServerSessionStatus } from "../src/session-runtime.ts";
 import { boundedSteerEvidence, MAX_STEER_EVIDENCE_BYTES, MAX_STEER_EVIDENCE_COUNT } from "../src/chat-run-actions.ts";
+import { commitUnconfirmedRpcError, explicitRpcRejection } from "../src/chat-rpc-results.ts";
 import {
   applyChatHistory,
+  cancelSessionModelChange,
   closeSession,
   interruptSession,
   openSessionIds,
@@ -19,6 +21,7 @@ import {
   setChatHistoryLoading,
   setChatSessionDisconnected,
   setChatSessionReady,
+  stageSessionModelChange,
   steerSession,
 } from "../src/store.ts";
 
@@ -76,6 +79,656 @@ test("sendMessage rejects every in-flight shape and atomically blocks a second p
   assert.deepEqual(submitted, ["first"]);
 });
 
+test("only allowlisted slash names use slash.exec and a slash command is single-flight", async () => {
+  const slash = deferred<import("../src/chat-api.ts").ChatSlashResult>();
+  const slashCommands: string[] = [];
+  const prompts: string[] = [];
+  registerChatRuntime({
+    ensureSession() {}, releaseSession() {}, async steer() { return { status: "queued" }; }, interrupt() {},
+    submitPrompt(_sessionId, text) { prompts.push(text); },
+    execSlash(_sessionId, command) { slashCommands.push(command); return slash.promise; },
+    async respondClarify() {}, async respondApproval() {},
+  });
+  sessions.value = [{ ...ready }];
+  const first = sendMessage(ready.id, "/undo");
+  assert.equal(sendMessage(ready.id, "/undo"), false);
+  assert.deepEqual(slashCommands, ["/undo"]);
+  slash.resolve({ status: "ok", output: "undone", warning: "", action: "prefill", message: "edit me" });
+  assert.equal(await first, true);
+  assert.equal(sessions.value[0]?.composerPrefill?.text, "edit me");
+
+  sessions.value = [{ ...ready }];
+  assert.equal(sendMessage(ready.id, "/tmp/output"), true);
+  assert.deepEqual(prompts, ["/tmp/output"]);
+});
+
+test("a commit-unconfirmed slash mutation is recorded as ambiguous rather than rejected", async () => {
+  let calls = 0;
+  registerChatRuntime({
+    ensureSession() {}, releaseSession() {}, async steer() { return { status: "queued" }; }, interrupt() {},
+    submitPrompt() {},
+    async execSlash() {
+      calls += 1;
+      throw commitUnconfirmedRpcError("slash acknowledgement lost");
+    },
+    async respondClarify() {}, async respondApproval() {},
+  });
+  sessions.value = [{ ...ready }];
+
+  assert.equal(await sendMessage(ready.id, "/undo"), false);
+  assert.equal(calls, 1);
+  assert.deepEqual(
+    sessions.value[0]?.operationEvidence?.map(({ body, state, message }) => ({ body, state, message })),
+    [{ body: "/undo", state: "unconfirmed", message: "slash acknowledgement lost" }],
+  );
+});
+
+test("an expensive model confirmation is reissued only after operator approval", async () => {
+  const calls: Array<{ command: string; confirmed: boolean | undefined }> = [];
+  const originalConfirm = globalThis.confirm;
+  globalThis.confirm = () => true;
+  try {
+    registerChatRuntime({
+      ensureSession() {}, releaseSession() {}, async steer() { return { status: "queued" }; }, interrupt() {},
+      submitPrompt() {},
+      async execSlash(_sessionId, command, confirmed) {
+        calls.push({ command, confirmed });
+        return confirmed
+          ? { status: "ok", output: "switched", warning: "", key: "model", value: "costly-model" }
+          : { status: "confirm-required", output: "", warning: "High known pricing", confirmMessage: "Continue with costly-model?" };
+      },
+      async respondClarify() {}, async respondApproval() {},
+    });
+    sessions.value = [{ ...ready, provider: "old-provider", model: "old-model" }];
+
+    assert.equal(await sendMessage(ready.id, "/model costly-model --provider costly --session"), true);
+    assert.deepEqual(calls, [
+      { command: "/model costly-model --provider costly --session", confirmed: undefined },
+      { command: "/model costly-model --provider costly --session", confirmed: true },
+    ]);
+    assert.equal(sessions.value[0]?.model, "costly-model");
+    assert.equal(sessions.value[0]?.provider, "costly");
+  } finally {
+    globalThis.confirm = originalConfirm;
+  }
+});
+
+test("message.complete strips streamed follow-up envelopes when the terminal event omits text", () => {
+  const streamed = {
+    ...ready,
+    status: "streaming" as const,
+    streamingMessageId: "reply",
+    messages: [{
+      id: "reply", from: "agent" as const,
+      body: "Visible answer\n<studio-followups>\n- Next question?\n</studio-followups>",
+      at: "00:00", status: "streaming" as const,
+    }],
+  };
+  const completed = reduceChatGatewayEvent(streamed, {
+    type: "message.complete", liveSessionId: "live", payload: { messageId: "reply" },
+  });
+  assert.equal(completed.messages[0]?.body, "Visible answer");
+  assert.deepEqual(completed.followUpSuggestions, ["Next question?"]);
+});
+
+test("message.interim seals streamed commentary so message.complete cannot wipe it", () => {
+  let session = {
+    ...ready,
+    status: "streaming" as const,
+    streamingMessageId: "stream-1",
+    messages: [{
+      id: "stream-1", from: "agent" as const,
+      body: "Let me start by planning the approach.",
+      at: "00:00", status: "streaming" as const,
+    }],
+  };
+  session = reduceChatGatewayEvent(session, {
+    type: "message.interim", liveSessionId: "live",
+    payload: { messageId: "stream-1", text: "Let me start by planning the approach." },
+  });
+  assert.equal(session.messages[0]?.status, "complete");
+  assert.equal(session.streamingMessageId, undefined);
+  assert.equal(session.status, "streaming");
+
+  session = reduceChatGatewayEvent(session, {
+    type: "message.delta", liveSessionId: "live",
+    payload: { text: "All done! Here is the complete summary." },
+  });
+  assert.equal(session.messages.length, 2);
+  assert.equal(session.messages[0]?.body, "Let me start by planning the approach.");
+  assert.equal(session.messages[1]?.status, "streaming");
+
+  const completed = reduceChatGatewayEvent(session, {
+    type: "message.complete", liveSessionId: "live",
+    payload: { messageId: session.streamingMessageId, text: "All done! Here is the complete summary." },
+  });
+  assert.deepEqual(completed.messages.map((message) => message.body), [
+    "Let me start by planning the approach.",
+    "All done! Here is the complete summary.",
+  ]);
+  assert.equal(completed.status, "ready");
+});
+
+test("message.complete without text keeps sealed interim replies", () => {
+  const sealed = {
+    ...ready,
+    status: "streaming" as const,
+    messages: [{
+      id: "interim-1", from: "agent" as const,
+      body: "Progress update while tools run.",
+      at: "00:00", status: "complete" as const,
+    }],
+  };
+  const completed = reduceChatGatewayEvent(sealed, {
+    type: "message.complete", liveSessionId: "live", payload: {},
+  });
+  assert.equal(completed.messages[0]?.body, "Progress update while tools run.");
+  assert.equal(completed.status, "ready");
+});
+
+test("reused upstream message ids append later turns without rewriting chronology", () => {
+  let session: ChatSession = {
+    ...ready,
+    messages: [{ id: "user-1", from: "user", body: "first prompt", at: "23:26", status: "complete" }],
+  };
+
+  session = reduceChatGatewayEvent(session, {
+    type: "message.start", liveSessionId: "live", payload: { messageId: "assistant" },
+  });
+  session = reduceChatGatewayEvent(session, {
+    type: "message.interim", liveSessionId: "live", payload: { messageId: "assistant", text: "first progress" },
+  });
+  session = reduceChatGatewayEvent(session, {
+    type: "message.delta", liveSessionId: "live", payload: { text: "first answer" },
+  });
+  session = reduceChatGatewayEvent(session, {
+    type: "message.complete", liveSessionId: "live", payload: { text: "first answer" },
+  });
+  session = {
+    ...session,
+    messages: [...session.messages, { id: "user-2", from: "user", body: "second prompt", at: "01:12", status: "complete" }],
+  };
+
+  session = reduceChatGatewayEvent(session, {
+    type: "message.start", liveSessionId: "live", payload: { messageId: "assistant" },
+  });
+  session = reduceChatGatewayEvent(session, {
+    type: "message.interim", liveSessionId: "live", payload: { messageId: "assistant", text: "second progress" },
+  });
+  session = reduceChatGatewayEvent(session, {
+    type: "message.delta", liveSessionId: "live", payload: { text: "second answer" },
+  });
+  session = reduceChatGatewayEvent(session, {
+    type: "message.complete", liveSessionId: "live", payload: { text: "second answer" },
+  });
+
+  assert.deepEqual(session.messages.map(({ body }) => body), [
+    "first prompt",
+    "first progress",
+    "first answer",
+    "second prompt",
+    "second progress",
+    "second answer",
+  ]);
+  assert.equal(new Set(session.messages.map(({ id }) => id)).size, session.messages.length);
+});
+
+test("an explicit source id cannot redirect a delayed event into the current stream", () => {
+  const active: ChatSession = {
+    ...ready,
+    status: "streaming",
+    streamingMessageId: "current#2",
+    streamingSourceMessageId: "current",
+    messages: [{ id: "current#2", from: "agent", body: "current text", at: "01:12", status: "streaming" }],
+  };
+  const afterDelayedDelta = reduceChatGatewayEvent(active, {
+    type: "message.delta", liveSessionId: "live", payload: { messageId: "previous", text: "delayed text" },
+  });
+
+  assert.equal(afterDelayedDelta, active);
+  assert.deepEqual(afterDelayedDelta.messages.map(({ body }) => body), ["current text"]);
+  assert.equal(afterDelayedDelta.streamingMessageId, "current#2");
+  assert.equal(afterDelayedDelta.streamingSourceMessageId, "current");
+  const afterDelayedComplete = reduceChatGatewayEvent(active, {
+    type: "message.complete", liveSessionId: "live", payload: { messageId: "previous", text: "old answer" },
+  });
+  assert.equal(afterDelayedComplete, active);
+  assert.equal(afterDelayedComplete.status, "streaming");
+
+  const unclaimed: ChatSession = {
+    ...active,
+    streamingMessageId: "stream-live",
+    streamingSourceMessageId: undefined,
+    messages: [{ id: "stream-live", from: "agent", body: "current text", at: "01:12", status: "streaming" }],
+  };
+  const afterExplicitAgainstUnclaimed = reduceChatGatewayEvent(unclaimed, {
+    type: "message.complete", liveSessionId: "live", payload: { messageId: "current-late-id", text: "current answer" },
+  });
+  assert.equal(afterExplicitAgainstUnclaimed.status, "ready");
+  assert.equal(afterExplicitAgainstUnclaimed.messages[0]?.body, "current answer");
+});
+
+test("a server message occurrence keeps upstream aliases on one assistant row", () => {
+  let session = reduceChatGatewayEvent(ready, {
+    type: "message.start", liveSessionId: "live",
+    payload: { messageOccurrenceId: "message-occurrence-1", messageId: "alias-start", runId: "run-alias", runSequence: 1 },
+  });
+  session = reduceChatGatewayEvent(session, {
+    type: "message.delta", liveSessionId: "live",
+    payload: { messageOccurrenceId: "message-occurrence-1", messageId: "alias-delta", text: "aliased answer", runId: "run-alias", runSequence: 1 },
+  });
+  session = reduceChatGatewayEvent(session, {
+    type: "message.complete", liveSessionId: "live",
+    payload: { messageOccurrenceId: "message-occurrence-1", messageId: "alias-complete", text: "aliased answer", runId: "run-alias", runSequence: 1 },
+  });
+
+  assert.equal(session.status, "ready");
+  assert.equal(session.messages.length, 1);
+  assert.equal(session.messages[0]?.id, "message-occurrence-1");
+  assert.equal(session.messages[0]?.body, "aliased answer");
+  assert.equal(session.messages[0]?.status, "complete");
+});
+
+test("a repeated terminal message is idempotent after the run completes", () => {
+  let session = reduceChatGatewayEvent(ready, {
+    type: "message.start", liveSessionId: "live", payload: { messageId: "reply", runId: "run-1" },
+  });
+  session = reduceChatGatewayEvent(session, {
+    type: "message.complete", liveSessionId: "live", payload: { messageId: "reply", text: "done", runId: "run-1" },
+  });
+  const replayed = reduceChatGatewayEvent(session, {
+    type: "message.complete", liveSessionId: "live", payload: { messageId: "reply", text: "done", runId: "run-1" },
+  });
+
+  assert.equal(replayed, session);
+  assert.deepEqual(replayed.messages.map(({ body }) => body), ["done"]);
+});
+
+test("a replay from more than one completed run ago remains stale", () => {
+  let session = ready;
+  for (const [runId, body] of [["run-1", "first"], ["run-2", "second"], ["run-3", "third"]] as const) {
+    session = reduceChatGatewayEvent(session, {
+      type: "message.start", liveSessionId: "live", payload: { messageId: `reply-${runId}`, runId },
+    });
+    session = reduceChatGatewayEvent(session, {
+      type: "message.complete", liveSessionId: "live", payload: { messageId: `reply-${runId}`, text: body, runId },
+    });
+  }
+  const replayed = reduceChatGatewayEvent(session, {
+    type: "message.start", liveSessionId: "live", payload: { messageId: "reply-run-1", runId: "run-1" },
+  });
+
+  assert.equal(replayed, session);
+  assert.deepEqual(replayed.messages.map(({ body }) => body), ["first", "second", "third"]);
+});
+
+test("a completed run below the high-water mark stays stale without an id retention window", () => {
+  const session: ChatSession = {
+    ...ready,
+    chatCorrelationEpoch: "epoch",
+    completedChatRunServerSequence: 10_000,
+    processedChatEventSequence: 20_000,
+  };
+  const replayed = reduceChatGatewayEvent(session, {
+    type: "message.start",
+    liveSessionId: "live",
+    payload: {
+      correlationEpoch: "epoch",
+      eventId: "event-epoch-20001",
+      eventSequence: 20_001,
+      messageId: "ancient-reply",
+      runId: "run-epoch-1",
+      runSequence: 1,
+    },
+  });
+
+  assert.equal(replayed.messages, session.messages);
+  assert.equal(replayed.completedChatRunServerSequence, 10_000);
+  assert.equal(replayed.processedChatEventSequence, 20_001);
+});
+
+test("a processed gateway event cannot reopen the transcript after its run completes", () => {
+  let session = reduceChatGatewayEvent(ready, {
+    type: "message.start", liveSessionId: "live",
+    payload: { correlationEpoch: "epoch", eventId: "event-epoch-1", eventSequence: 1, runId: "run-epoch-1", runSequence: 1 },
+  });
+  session = reduceChatGatewayEvent(session, {
+    type: "message.complete", liveSessionId: "live",
+    payload: { correlationEpoch: "epoch", eventId: "event-epoch-2", eventSequence: 2, runId: "run-epoch-1", runSequence: 1, text: "done" },
+  });
+  const replayed = reduceChatGatewayEvent(session, {
+    type: "message.start", liveSessionId: "live",
+    payload: { correlationEpoch: "epoch", eventId: "event-epoch-1", eventSequence: 1, runId: "run-epoch-1", runSequence: 1 },
+  });
+
+  assert.equal(replayed, session);
+  assert.deepEqual(replayed.messages.map(({ body }) => body), ["done"]);
+});
+
+test("a terminal event from the previous run cannot finish a newly submitted prompt", () => {
+  let session = reduceChatGatewayEvent(ready, {
+    type: "message.start", liveSessionId: "live", payload: { messageId: "reply", runId: "run-epoch-1", runSequence: 1 },
+  });
+  session = reduceChatGatewayEvent(session, {
+    type: "message.complete", liveSessionId: "live", payload: { messageId: "reply", text: "old answer", runId: "run-epoch-1", runSequence: 1 },
+  });
+  const awaitingNewRun = { ...session, status: "streaming" as const };
+  const delayed = reduceChatGatewayEvent(awaitingNewRun, {
+    type: "message.complete", liveSessionId: "live", payload: { messageId: "reply", text: "old answer", runId: "run-epoch-1", runSequence: 1 },
+  });
+  assert.equal(delayed, awaitingNewRun);
+  const delayedStart = reduceChatGatewayEvent(awaitingNewRun, {
+    type: "message.start", liveSessionId: "live", payload: { messageId: "reply", runId: "run-epoch-1", runSequence: 1 },
+  });
+  assert.equal(delayedStart, awaitingNewRun);
+  const delayedTool = reduceChatGatewayEvent(awaitingNewRun, {
+    type: "tool.complete", liveSessionId: "live",
+    payload: { toolOccurrenceId: "old-tool", runId: "run-epoch-1", runSequence: 1, name: "Shell", summary: "old done" },
+  });
+  assert.equal(delayedTool, awaitingNewRun);
+
+  const next = reduceChatGatewayEvent(delayedTool, {
+    type: "message.start", liveSessionId: "live", payload: { messageId: "reply", runId: "run-epoch-2", runSequence: 2 },
+  });
+  assert.equal(next.status, "streaming");
+  assert.equal(next.chatRunId, "run-epoch-2");
+  assert.equal(next.messages.length, 2);
+});
+
+test("a repeated message.start reuses the active assistant row", () => {
+  const started = reduceChatGatewayEvent(ready, {
+    type: "message.start", liveSessionId: "live", payload: {},
+  });
+  const replayed = reduceChatGatewayEvent(started, {
+    type: "message.start", liveSessionId: "live", payload: { messageId: "reply-late-id" },
+  });
+
+  assert.equal(replayed.messages.length, 1);
+  assert.equal(replayed.streamingMessageId, started.streamingMessageId);
+  assert.equal(replayed.streamingSourceMessageId, "reply-late-id");
+  assert.equal(replayed.chatRunSequence, started.chatRunSequence);
+});
+
+test("a repeated message.start after an interim seal cannot create another run", () => {
+  let session = reduceChatGatewayEvent(ready, {
+    type: "message.start", liveSessionId: "live", payload: { messageId: "reply" },
+  });
+  session = reduceChatGatewayEvent(session, {
+    type: "message.interim", liveSessionId: "live", payload: { messageId: "reply", text: "progress" },
+  });
+  const replayed = reduceChatGatewayEvent(session, {
+    type: "message.start", liveSessionId: "live", payload: { messageId: "reply" },
+  });
+
+  assert.equal(replayed.messages.length, 1);
+  assert.equal(replayed.messages[0]?.body, "progress");
+  assert.equal(replayed.streamingMessageId, undefined);
+  assert.equal(replayed.chatRunSequence, session.chatRunSequence);
+  assert.deepEqual(replayed.interimMessageIds, session.interimMessageIds);
+});
+
+test("a repeated completed tool id creates a later row instead of rewriting the old event", () => {
+  let session = reduceChatGatewayEvent(ready, {
+    type: "message.start", liveSessionId: "live", payload: { messageId: "reply-1" },
+  });
+  session = reduceChatGatewayEvent(session, {
+    type: "tool.start", liveSessionId: "live", payload: { toolId: "tool-1", summary: "first run" },
+  });
+  session = reduceChatGatewayEvent(session, {
+    type: "tool.complete", liveSessionId: "live", payload: { toolId: "tool-1", summary: "first complete" },
+  });
+  const replayed = reduceChatGatewayEvent(session, {
+    type: "tool.complete", liveSessionId: "live", payload: { toolId: "tool-1", summary: "first complete" },
+  });
+  assert.equal(replayed, session);
+  session = reduceChatGatewayEvent(session, {
+    type: "message.complete", liveSessionId: "live", payload: { messageId: "reply-1", text: "first answer" },
+  });
+  session = reduceChatGatewayEvent(session, {
+    type: "message.start", liveSessionId: "live", payload: { messageId: "reply-2" },
+  });
+  session = reduceChatGatewayEvent(session, {
+    type: "tool.start", liveSessionId: "live", payload: { toolId: "tool-1", summary: "second run" },
+  });
+  session = reduceChatGatewayEvent(session, {
+    type: "tool.complete", liveSessionId: "live", payload: { toolId: "tool-1", summary: "first complete" },
+  });
+
+  const toolMessages = session.messages.filter(({ from }) => from === "tool");
+  assert.deepEqual(toolMessages.map(({ body }) => body), ["Tool: first complete", "Tool: first complete"]);
+  assert.deepEqual(toolMessages.map(({ status }) => status), ["complete", "complete"]);
+  assert.notEqual(toolMessages[0]?.id, toolMessages[1]?.id);
+});
+
+test("sequential tools without upstream ids remain separate within one run", () => {
+  let session = reduceChatGatewayEvent(ready, {
+    type: "message.start", liveSessionId: "live", payload: { messageId: "reply" },
+  });
+  session = reduceChatGatewayEvent(session, {
+    type: "tool.start", liveSessionId: "live", payload: { name: "First", summary: "running" },
+  });
+  session = reduceChatGatewayEvent(session, {
+    type: "tool.complete", liveSessionId: "live", payload: { name: "First", summary: "done" },
+  });
+  session = reduceChatGatewayEvent(session, {
+    type: "tool.start", liveSessionId: "live", payload: { name: "Second", summary: "running" },
+  });
+  session = reduceChatGatewayEvent(session, {
+    type: "tool.complete", liveSessionId: "live", payload: { name: "Second", summary: "done" },
+  });
+
+  const tools = session.messages.filter(({ from }) => from === "tool");
+  assert.deepEqual(tools.map(({ body }) => body), ["First: done", "Second: done"]);
+  assert.equal(new Set(tools.map(({ id }) => id)).size, 2);
+});
+
+test("overlapping tool starts without upstream ids never overwrite one another", () => {
+  let session = reduceChatGatewayEvent(ready, {
+    type: "message.start", liveSessionId: "live", payload: { messageId: "reply", runId: "run-tools" },
+  });
+  session = reduceChatGatewayEvent(session, {
+    type: "tool.start", liveSessionId: "live", payload: { toolOccurrenceId: "occ-first", runId: "run-tools", name: "First", summary: "first running" },
+  });
+  session = reduceChatGatewayEvent(session, {
+    type: "tool.start", liveSessionId: "live", payload: { toolOccurrenceId: "occ-second", runId: "run-tools", name: "Second", summary: "second running" },
+  });
+  const replayedStart = reduceChatGatewayEvent(session, {
+    type: "tool.start", liveSessionId: "live", payload: { toolOccurrenceId: "occ-second", runId: "run-tools", name: "Second", summary: "second running" },
+  });
+  assert.equal(replayedStart.messages.length, session.messages.length);
+  session = reduceChatGatewayEvent(replayedStart, {
+    type: "tool.complete", liveSessionId: "live", payload: { toolOccurrenceId: "occ-first", runId: "run-tools", name: "First", summary: "first done" },
+  });
+  session = reduceChatGatewayEvent(session, {
+    type: "tool.complete", liveSessionId: "live", payload: { toolOccurrenceId: "occ-second", runId: "run-tools", name: "Second", summary: "second done" },
+  });
+
+  const tools = session.messages.filter(({ from }) => from === "tool");
+  assert.deepEqual(tools.map(({ body }) => body), ["First: first done", "Second: second done"]);
+  assert.equal(new Set(tools.map(({ id }) => id)).size, 2);
+  assert.deepEqual(tools.map(({ status }) => status), ["complete", "complete"]);
+});
+
+test("a tool event can claim a run before message.start without splitting its run sequence", () => {
+  let session = reduceChatGatewayEvent({ ...ready, status: "streaming" }, {
+    type: "tool.start", liveSessionId: "live",
+    payload: { toolOccurrenceId: "early-tool", runId: "run-early", name: "Shell", summary: "running" },
+  });
+  const claimedSequence = session.chatRunSequence;
+  session = reduceChatGatewayEvent(session, {
+    type: "tool.progress", liveSessionId: "live",
+    payload: { toolOccurrenceId: "early-tool", runId: "run-early", name: "Shell", summary: "working" },
+  });
+  session = reduceChatGatewayEvent(session, {
+    type: "message.start", liveSessionId: "live", payload: { messageId: "reply", runId: "run-early" },
+  });
+
+  assert.equal(session.chatRunSequence, claimedSequence);
+  assert.equal(session.messages.filter(({ from }) => from === "tool").length, 1);
+  assert.equal(session.messages.filter(({ from }) => from === "agent").length, 1);
+});
+
+test("history reload restores authored follow-ups and clears suggestions when the reply is undone", () => {
+  sessions.value = [{ ...ready, followUpSuggestions: ["stale suggestion"] }];
+  applyChatHistory(ready.id, [{
+    id: "saved-reply",
+    from: "agent",
+    body: "Saved answer\n<studio-followups>\n- Continue from history?\n</studio-followups>",
+    at: "00:00",
+    status: "complete",
+  }]);
+  assert.equal(sessions.value[0]?.messages[0]?.body, "Saved answer");
+  assert.deepEqual(sessions.value[0]?.followUpSuggestions, ["Continue from history?"]);
+
+  setChatHistoryLoading(ready.id, true);
+  applyChatHistory(ready.id, []);
+  assert.equal(sessions.value[0]?.followUpSuggestions, undefined);
+});
+
+test("a model switch stays cancellable until send and remains retryable after failure", async () => {
+  const slashCommands: string[] = [];
+  const submitted: string[] = [];
+  let rejectSlash = true;
+  registerChatRuntime({
+    ensureSession() {}, releaseSession() {}, async steer() { return { status: "queued" }; }, interrupt() {},
+    submitPrompt(_sessionId, text) { submitted.push(text); },
+    async execSlash(_sessionId, command) {
+      slashCommands.push(command);
+      if (rejectSlash) throw new Error("model unavailable");
+      return { status: "ok", output: "switched", warning: "" };
+    },
+    async respondClarify() {}, async respondApproval() {},
+  });
+
+  sessions.value = [{ ...ready, provider: "old-provider", model: "old-model" }];
+  stageSessionModelChange(ready.id, "new-provider", "new-model");
+  assert.equal(sessions.value[0]?.pendingModelChange?.applying, undefined);
+  assert.deepEqual(slashCommands, []);
+
+  assert.equal(await sendMessage(ready.id, "keep this prompt"), false);
+  assert.equal(sessions.value[0]?.pendingModelChange?.applying, false);
+  assert.equal(sessions.value[0]?.model, "new-model");
+  assert.deepEqual(submitted, []);
+
+  rejectSlash = false;
+  assert.equal(await sendMessage(ready.id, "keep this prompt"), true);
+  assert.equal(sessions.value[0]?.pendingModelChange, undefined);
+  assert.deepEqual(slashCommands, [
+    "/model new-model --provider new-provider --session",
+    "/model new-model --provider new-provider --session",
+  ]);
+  assert.equal(submitted.length, 1);
+  assert.match(submitted[0]!, /^keep this prompt/);
+});
+
+test("a rejected manual model command rolls back an unsent staged picker change", async () => {
+  registerChatRuntime({
+    ensureSession() {}, releaseSession() {}, async steer() { return { status: "queued" }; }, interrupt() {},
+    submitPrompt() {},
+    async execSlash() { throw new Error("model unavailable"); },
+    async respondClarify() {}, async respondApproval() {},
+  });
+  sessions.value = [{ ...ready, provider: "old-provider", model: "old-model", reasoningEffort: "low" }];
+
+  stageSessionModelChange(ready.id, "staged-provider", "staged-model", "high");
+  assert.equal(sessions.value[0]?.model, "staged-model");
+  assert.equal(await sendMessage(ready.id, "/model invalid-model --provider invalid --session"), false);
+  assert.equal(sessions.value[0]?.pendingModelChange, undefined);
+  assert.equal(sessions.value[0]?.provider, "old-provider");
+  assert.equal(sessions.value[0]?.model, "old-model");
+  assert.equal(sessions.value[0]?.reasoningEffort, "low");
+});
+
+test("a reasoning failure never rolls back an already applied model in local state", async () => {
+  const slashCommands: string[] = [];
+  registerChatRuntime({
+    ensureSession() {}, releaseSession() {}, async steer() { return { status: "queued" }; }, interrupt() {},
+    submitPrompt() {},
+    async execSlash(_sessionId, command) {
+      slashCommands.push(command);
+      if (command.startsWith("/reasoning")) throw new Error("reasoning unavailable");
+      return { status: "ok", output: "switched", warning: "", key: "model", value: "new-model" };
+    },
+    async respondClarify() {}, async respondApproval() {},
+  });
+  sessions.value = [{ ...ready, provider: "old-provider", model: "old-model", reasoningEffort: "low" }];
+
+  stageSessionModelChange(ready.id, "new-provider", "new-model", "high");
+  assert.equal(await sendMessage(ready.id, "after switch"), false);
+  assert.equal(sessions.value[0]?.pendingModelChange?.applying, false);
+  assert.equal(sessions.value[0]?.pendingModelChange?.modelApplied, true);
+
+  cancelSessionModelChange(ready.id);
+  assert.equal(sessions.value[0]?.pendingModelChange, undefined);
+  assert.equal(sessions.value[0]?.model, "new-model");
+  assert.equal(sessions.value[0]?.provider, "new-provider");
+  assert.equal(sessions.value[0]?.reasoningEffort, "low");
+  assert.deepEqual(slashCommands, [
+    "/model new-model --provider new-provider --session",
+    "/reasoning high",
+  ]);
+});
+
+test("selecting model-default reasoning clears the live session override before the prompt", async () => {
+  const slashCommands: string[] = [];
+  const submitted: string[] = [];
+  registerChatRuntime({
+    ensureSession() {}, releaseSession() {}, async steer() { return { status: "queued" }; }, interrupt() {},
+    submitPrompt(_sessionId, text) { submitted.push(text); },
+    async execSlash(_sessionId, command) {
+      slashCommands.push(command);
+      return command.startsWith("/reasoning")
+        ? { status: "ok", output: "", warning: "", key: "reasoning", value: "" }
+        : { status: "ok", output: "", warning: "", key: "model", value: "same-model" };
+    },
+    async respondClarify() {}, async respondApproval() {},
+  });
+  sessions.value = [{ ...ready, provider: "same-provider", model: "same-model", reasoningEffort: "high" }];
+
+  stageSessionModelChange(ready.id, "same-provider", "same-model", "");
+  assert.equal(sessions.value[0]?.pendingModelChange?.reasoningCommand, "/reasoning default");
+  assert.equal(await sendMessage(ready.id, "use the default"), true);
+  assert.deepEqual(slashCommands, [
+    "/model same-model --provider same-provider --session",
+    "/reasoning default",
+  ]);
+  assert.equal(sessions.value[0]?.reasoningEffort, undefined);
+  assert.deepEqual(submitted, ["use the default"]);
+});
+
+test("re-picking after partial model success promotes the applied model to the rollback baseline", async () => {
+  registerChatRuntime({
+    ensureSession() {}, releaseSession() {}, async steer() { return { status: "queued" }; }, interrupt() {},
+    submitPrompt() {},
+    async execSlash(_sessionId, command) {
+      if (command.startsWith("/reasoning") || command.includes("next-model")) {
+        throw new Error("switch unavailable");
+      }
+      return { status: "ok", output: "switched", warning: "", key: "model", value: "new-model" };
+    },
+    async respondClarify() {}, async respondApproval() {},
+  });
+  sessions.value = [{ ...ready, provider: "old-provider", model: "old-model", reasoningEffort: "low" }];
+
+  stageSessionModelChange(ready.id, "new-provider", "new-model", "high");
+  assert.equal(await sendMessage(ready.id, "first attempt"), false);
+  assert.equal(sessions.value[0]?.pendingModelChange?.modelApplied, true);
+
+  stageSessionModelChange(ready.id, "next-provider", "next-model", "medium");
+  assert.equal(await sendMessage(ready.id, "second attempt"), false);
+  assert.deepEqual(sessions.value[0]?.pendingModelChange?.baseline, {
+    provider: "new-provider",
+    model: "new-model",
+    reasoningEffort: "low",
+  });
+  assert.equal(sessions.value[0]?.pendingModelChange?.modelApplied, undefined);
+
+  cancelSessionModelChange(ready.id);
+  assert.equal(sessions.value[0]?.model, "new-model");
+  assert.equal(sessions.value[0]?.provider, "new-provider");
+  assert.equal(sessions.value[0]?.reasoningEffort, "low");
+});
+
 test("prompt submissions expose pending, accepted, rejected, and commit-unknown states without automatic replay", async () => {
   const submission = deferred<ChatPromptResult>();
   const calls: Array<{ text: string; operationId: string }> = [];
@@ -107,8 +760,8 @@ test("prompt submissions expose pending, accepted, rejected, and commit-unknown 
       ensureSession() {}, releaseSession() {}, interrupt() {}, async steer() { return { status: "queued" }; },
       async submitPrompt() { return result; }, async respondClarify() {}, async respondApproval() {},
     });
-    sendMessage(ready.id, result.status);
-    await Promise.resolve();
+    const sent = await sendMessage(ready.id, result.status);
+    assert.equal(sent, result.status !== "rejected");
     assert.equal(sessions.value[0]!.operationEvidence![0]!.state, result.status);
     assert.equal(sessions.value[0]!.messages.length, 0);
   }
@@ -174,6 +827,51 @@ test("separate operation evidence is presented in conversation chronology withou
 
   const mixedClock = buildChatTimeline(messages, [{ ...evidence[0]!, at: "10:01" }]);
   assert.deepEqual(mixedClock.map((item) => item.kind), ["message", "message", "operation"], "incomparable timestamp families preserve source order instead of guessing causality");
+});
+
+test("shared timeline sequence preserves order across midnight", () => {
+  const messages = [
+    { id: "before-midnight", timelineSequence: 0, from: "agent" as const, body: "before", at: "23:26" },
+    { id: "after-prompt", timelineSequence: 2, from: "agent" as const, body: "after", at: "00:45" },
+    { id: "later", timelineSequence: 3, from: "agent" as const, body: "later", at: "01:12" },
+  ];
+  const evidence = [
+    { id: "operation-after-midnight", timelineSequence: 1, kind: "prompt" as const, body: "prompt", at: "00:31", state: "accepted" as const },
+  ];
+  assert.deepEqual(
+    buildChatTimeline(messages, evidence).map((item) => item.kind === "message" ? item.message.id : item.operation.id),
+    ["before-midnight", "operation-after-midnight", "after-prompt", "later"],
+  );
+});
+
+test("shared timeline sequence wins over sparse clock values", () => {
+  const messages = [
+    { id: "morning", timelineSequence: 10, from: "agent" as const, body: "morning", at: "08:00" },
+    { id: "night", timelineSequence: 12, from: "agent" as const, body: "night", at: "21:00" },
+  ];
+  const evidence = [
+    { id: "evening", timelineSequence: 11, kind: "prompt" as const, body: "evening", at: "20:00", state: "accepted" as const },
+  ];
+  assert.deepEqual(
+    buildChatTimeline(messages, evidence).map((item) => item.kind === "message" ? item.message.id : item.operation.id),
+    ["morning", "evening", "night"],
+  );
+});
+
+test("one legacy row without a sequence cannot disable shared chronology", () => {
+  const messages = [
+    { id: "before-midnight", timelineSequence: 10, from: "agent" as const, body: "before", at: "23:26" },
+    { id: "after-prompt", timelineSequence: 12, from: "agent" as const, body: "after", at: "00:45" },
+    { id: "new-format", timelineSequence: 13, from: "agent" as const, body: "new", at: "2026-07-30T01:00:00.000Z" },
+  ];
+  const evidence = [
+    { id: "legacy-operation", kind: "prompt" as const, body: "prompt", at: "00:31", state: "accepted" as const },
+  ];
+
+  assert.deepEqual(
+    buildChatTimeline(messages, evidence).map((item) => item.kind === "message" ? item.message.id : item.operation.id),
+    ["before-midnight", "legacy-operation", "after-prompt", "new-format"],
+  );
 });
 
 test("operation live announcements emit only the latest changed id/state", () => {
@@ -358,6 +1056,41 @@ test("failed steering keeps the run active and reports failure without a local m
   assert.equal(await steerSession(ready.id, "keep going"), false);
   assert.equal(isChatRunActive(sessions.value[0]!), true);
   assert.equal(sessions.value[0]?.messages.length, 0);
+  assert.match(localizeRuntimeMessage(sessions.value[0]!.errorMessage!), /追加指示/);
+});
+
+test("commit-unconfirmed steering clears the composer once and records ambiguity without replay", async () => {
+  let calls = 0;
+  registerChatRuntime({
+    ensureSession() {}, releaseSession() {}, submitPrompt() {}, interrupt() {},
+    async steer() {
+      calls += 1;
+      throw commitUnconfirmedRpcError("steer acknowledgement lost");
+    },
+    async respondClarify() {}, async respondApproval() {},
+  });
+  sessions.value = [{ ...ready, status: "streaming" }];
+
+  assert.equal(await steerSession(ready.id, "keep going once"), true);
+  assert.equal(calls, 1);
+  assert.equal(sessions.value[0]?.steerPending, false);
+  assert.equal(sessions.value[0]?.errorMessage, undefined);
+  assert.deepEqual(
+    sessions.value[0]?.operationEvidence?.map(({ kind, body, state, message }) => ({ kind, body, state, message })),
+    [{ kind: "steer", body: "keep going once", state: "unconfirmed", message: "steer acknowledgement lost" }],
+  );
+});
+
+test("an explicit steering rejection keeps the composer input retryable", async () => {
+  registerChatRuntime({
+    ensureSession() {}, releaseSession() {}, submitPrompt() {}, interrupt() {},
+    async steer() { throw explicitRpcRejection("steer rejected"); },
+    async respondClarify() {}, async respondApproval() {},
+  });
+  sessions.value = [{ ...ready, status: "streaming" }];
+
+  assert.equal(await steerSession(ready.id, "retry me"), false);
+  assert.equal(sessions.value[0]?.operationEvidence, undefined);
   assert.match(localizeRuntimeMessage(sessions.value[0]!.errorMessage!), /追加指示/);
 });
 

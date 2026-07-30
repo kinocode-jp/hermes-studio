@@ -5,7 +5,7 @@ import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { HermesBackend } from "./hermes-backend.js";
+import { HermesBackend, HermesProfileError } from "./hermes-backend.js";
 
 test("inventory reaches the 101st session and profile through bounded continuation pages", async () => {
   const sessionRows = Array.from({ length: 101 }, (_, index) => sessionRow(index));
@@ -35,6 +35,67 @@ test("inventory reaches the 101st session and profile through bounded continuati
     assert.deepEqual(profilesPage.profiles.map((profile) => profile.id), ["profile-100"]);
   } finally {
     await backend.close();
+    await fixture.close();
+  }
+});
+
+test("session deletion uses Hermes bulk-delete with an explicit profile", async () => {
+  const deletes: Array<{ method: string | undefined; path: string; body: string }> = [];
+  const fixture = await startHermesFixture((request, response, url) => {
+    if (url.pathname === "/api/status") return writeJson(response, { version: "0.18.2" });
+    if (request.method === "POST" && url.pathname === "/api/sessions/bulk-delete") {
+      let body = "";
+      request.setEncoding("utf8");
+      request.on("data", (chunk) => { body += chunk; });
+      request.on("end", () => {
+        deletes.push({ method: request.method, path: url.pathname, body });
+        writeJson(response, { ok: true, deleted: 2 });
+      });
+      return;
+    }
+    if (request.method === "DELETE" && url.pathname.startsWith("/api/profiles/")) {
+      response.writeHead(404);
+      response.end();
+      return;
+    }
+    return defaultFixtureRoute(request, response, url);
+  });
+  try {
+    assert.equal((await fixture.backend.start()).state, "ready");
+    await fixture.backend.deleteSessions("mamoswine", ["first-session", "missing-session"]);
+    await assert.rejects(
+      fixture.backend.deleteProfile("missing-profile"),
+      (error: unknown) => error instanceof HermesProfileError && error.code === "not_found",
+    );
+    assert.deepEqual(deletes, [{
+      method: "POST",
+      path: "/api/sessions/bulk-delete",
+      body: JSON.stringify({ ids: ["first-session", "missing-session"], profile: "mamoswine" }),
+    }]);
+  } finally {
+    await fixture.backend.close();
+    await fixture.close();
+  }
+});
+
+test("session deletion rejects an invalid Hermes bulk acknowledgement", async () => {
+  const fixture = await startHermesFixture((request, response, url) => {
+    if (url.pathname === "/api/status") return writeJson(response, { version: "0.18.2" });
+    if (request.method === "POST" && url.pathname === "/api/sessions/bulk-delete") {
+      request.resume();
+      request.on("end", () => writeJson(response, { ok: true, deleted: "one" }));
+      return;
+    }
+    return defaultFixtureRoute(request, response, url);
+  });
+  try {
+    assert.equal((await fixture.backend.start()).state, "ready");
+    await assert.rejects(
+      fixture.backend.deleteSession("default", "incomplete-session"),
+      /did not confirm durable session deletion/,
+    );
+  } finally {
+    await fixture.backend.close();
     await fixture.close();
   }
 });
@@ -301,6 +362,14 @@ test("an explicitly missing status route remains incompatible", async () => {
   });
   try {
     assert.equal((await fixture.backend.start()).state, "incompatible");
+    const snapshot = await fixture.backend.snapshot();
+    assert.equal(snapshot.capabilities.runtime.state, "incompatible");
+    assert.deepEqual(snapshot.profiles, []);
+    assert.deepEqual(snapshot.sessions, []);
+    assert.equal(snapshot.inventory.profiles.truncated, true);
+    assert.equal(snapshot.inventory.profiles.partialFailures, 1);
+    assert.equal(snapshot.inventory.sessions.truncated, true);
+    assert.equal(snapshot.inventory.sessions.partialFailures, 1);
   } finally {
     await fixture.backend.close();
     await fixture.close();
@@ -381,6 +450,55 @@ for (const transientStatus of [408, 425, 429]) {
     }
   });
 }
+
+test("initial managed CLI probe failure starts background recovery instead of staying incompatible", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "hermes-studio-initial-cli-recovery-"));
+  const executable = join(directory, "fake-hermes.mjs");
+  const probePath = join(directory, "probe-count.txt");
+  const servePath = join(directory, "serve-count.txt");
+  await writeFile(executable, `#!/usr/bin/env node
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { createServer } from "node:http";
+if (process.argv.includes("--version")) {
+  const current = existsSync(${JSON.stringify(probePath)}) ? Number(readFileSync(${JSON.stringify(probePath)}, "utf8")) : 0;
+  writeFileSync(${JSON.stringify(probePath)}, String(current + 1));
+  process.exit(1);
+}
+const current = existsSync(${JSON.stringify(servePath)}) ? Number(readFileSync(${JSON.stringify(servePath)}, "utf8")) : 0;
+writeFileSync(${JSON.stringify(servePath)}, String(current + 1));
+const server = createServer((request, response) => {
+  response.setHeader("Content-Type", "application/json");
+  if (request.url === "/api/status") response.end(JSON.stringify({ version: "0.19.0" }));
+  else if (request.url === "/api/profiles") response.end(JSON.stringify({ profiles: [{ name: "recovered" }] }));
+  else if (request.url?.startsWith("/api/profiles/sessions")) response.end(JSON.stringify({ sessions: [], total: 0, errors: [] }));
+  else if (request.url === "/api/plugins/kanban/board") response.end(JSON.stringify({ columns: [], latest_event_id: 0 }));
+  else { response.statusCode = 404; response.end(); }
+});
+server.listen(0, "127.0.0.1", () => {
+  process.stdout.write("HERMES_BACKEND_READY port=" + server.address().port + "\\n");
+});
+process.on("SIGTERM", () => server.close(() => process.exit(0)));
+`, "utf8");
+  await chmod(executable, 0o755);
+  const backend = new HermesBackend({
+    executable,
+    startTimeoutMs: 1_000,
+    requestTimeoutMs: 500,
+    managedRestartAttempts: 1,
+    managedRestartBackoffMs: 10,
+    globalSettingsPath: join(directory, "global-settings.json"),
+  });
+  try {
+    assert.equal((await backend.start()).state, "unreachable");
+    await waitForCondition(() => backend.status().state === "ready", 2_000);
+    assert.equal((await readFile(probePath, "utf8")).trim(), "2");
+    assert.equal((await readFile(servePath, "utf8")).trim(), "1");
+    assert.deepEqual((await backend.snapshot()).profiles.map((profile) => profile.id), ["recovered"]);
+  } finally {
+    await backend.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
 
 test("managed backend invalidates a crashed generation, recovers once, and never respawns during shutdown", async () => {
   const directory = await mkdtemp(join(tmpdir(), "hermes-studio-recovery-"));
@@ -669,7 +787,16 @@ async function startHermesFixture(handler: (request: IncomingMessage, response: 
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
   const address = server.address() as AddressInfo;
   return {
-    backend: new HermesBackend({ baseUrl: `http://127.0.0.1:${address.port}`, sessionToken: "fixture-session-token-0123456789", requestTimeoutMs }), // gitleaks:allow -- synthetic test credential
+    backend: new HermesBackend({
+      baseUrl: `http://127.0.0.1:${address.port}`,
+      sessionToken: "fixture-session-token-0123456789", // gitleaks:allow -- synthetic test credential
+      requestTimeoutMs,
+      resolveProfileBackend: async () => ({
+        baseUrl: `http://127.0.0.1:${address.port}`,
+        sessionToken: "fixture-profile-token-0123456789", // gitleaks:allow -- synthetic test credential
+        release: () => undefined,
+      }),
+    }),
     close: async () => await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve())),
   };
 }

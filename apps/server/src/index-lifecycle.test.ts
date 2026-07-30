@@ -64,6 +64,31 @@ if (process.argv.includes("--version")) {
   }
 });
 
+test("desktop parent pipe EOF shuts down the owned server", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "hermes-studio-parent-pipe-"));
+  const office = spawn(process.execPath, [join(import.meta.dirname, "index.js")], {
+    env: {
+      ...process.env,
+      HERMES_STUDIO_HERMES_MODE: "demo",
+      HERMES_STUDIO_PORT: "0",
+      HERMES_STUDIO_DESKTOP_PARENT_PIPE: "true",
+      HERMES_STUDIO_DEVICE_REGISTRY_PATH: join(directory, "devices.json"),
+      HERMES_STUDIO_TEAMS_PATH: join(directory, "teams.json"),
+    },
+    stdio: ["pipe", "ignore", "ignore"],
+  });
+  try {
+    assert.ok(office.stdin);
+    office.stdin.end();
+    const result = await waitForExit(office, 3_000);
+    assert.equal(result.signal, null);
+    assert.equal(result.code, 0);
+  } finally {
+    if (office.exitCode === null && office.signalCode === null) office.kill("SIGKILL");
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 async function waitForFile(path: string, timeoutMs: number): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {

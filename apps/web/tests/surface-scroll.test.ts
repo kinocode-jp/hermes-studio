@@ -21,8 +21,19 @@ test("main surfaces retain independent scroll positions instead of inheriting th
   assert.deepEqual(stage, { scrollTop: 0, scrollLeft: 0 });
 });
 
-test("App remembers scroll events and restores the active surface during layout", async () => {
-  const source = await readFile(new URL("../src/app.tsx", import.meta.url), "utf8");
-  assert.match(source, /useLayoutEffect\(\(\) => \{[\s\S]*restoreSurfaceScroll\([^)]*activeSurface\.value/);
-  assert.match(source, /onScroll=\{\(event\) => rememberSurfaceScroll\([^)]*activeSurface\.value/);
+test("dashboard panels own their scroll containers instead of sharing an active-surface offset", async () => {
+  const [app, dashboard, chat, styles] = await Promise.all([
+    readFile(new URL("../src/app.tsx", import.meta.url), "utf8"),
+    readFile(new URL("../src/components/dashboard-view.tsx", import.meta.url), "utf8"),
+    readFile(new URL("../src/components/chat-pane.tsx", import.meta.url), "utf8"),
+    readFile(new URL("../src/styles.css", import.meta.url), "utf8"),
+  ]);
+  assert.match(app, /<DashboardView \/>/);
+  assert.match(dashboard, /class="dashboard-panel-body"/);
+  assert.match(styles, /\.dashboard-panel-body \{[^}]*overflow: auto/);
+  assert.match(styles, /\.dashboard-view \{[^}]*overflow: hidden auto/);
+  assert.match(chat, /class="message-list-content"/);
+  assert.match(styles, /--chat-content-max-width: 720px/);
+  assert.match(styles, /\.message-list-content \{[^}]*width: min\(100%, var\(--chat-content-max-width\)\)[^}]*margin-inline: auto/);
+  assert.match(styles, /\.chat-suggestions,[\s\S]*\.composer \{[^}]*width: min\(100%, var\(--chat-content-max-width\)\)[^}]*margin-inline: auto/);
 });

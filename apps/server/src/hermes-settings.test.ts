@@ -81,6 +81,8 @@ test("profile settings use a profile-pinned backend and expose secret-safe DTOs"
 });
 
 test("skill and memory mutations are validated and use official Hermes routes", async (t) => {
+  const memoryRoot = await mkdtemp(join(tmpdir(), "hermes-studio-settings-mutation-memory-"));
+  t.after(() => rm(memoryRoot, { recursive: true, force: true }));
   const mutations: Array<{ body: unknown; method: string; url: string }> = [];
   const server = createServer(async (request, response) => {
     if (request.method === "GET" && request.url === "/api/memory/providers/honcho/config?surface=declared") {
@@ -111,6 +113,18 @@ test("skill and memory mutations are validated and use official Hermes routes", 
       writeJson(response, { name: "local", content: `# Skill\ndatabase_password: >-\n  ${PASSWORD_SECRET}\n  second secret line\nsafe: visible`, path: "/private/SKILL.md" });
       return;
     }
+    if (request.method === "GET" && request.url === "/api/memory") {
+      writeJson(response, {
+        active_provider: "honcho",
+        providers: [{ name: "honcho", description: "Configured", configured: true }],
+        builtin: { memory_bytes: 0, user_bytes: 0, has_memory: false, has_user: false },
+      });
+      return;
+    }
+    if (request.method === "GET" && request.url === "/api/profiles/coder/soul") {
+      writeJson(response, { content: "You are a careful coding agent.", exists: true });
+      return;
+    }
     mutations.push({ method: request.method ?? "", url: request.url ?? "", body: await readJson(request) });
     writeJson(response, { ok: true, path: "/private/result", secret: "hidden" });
   });
@@ -118,6 +132,7 @@ test("skill and memory mutations are validated and use official Hermes routes", 
   t.after(() => server.close());
   const adapter = createHermesSettingsAdapter({
     resolveProfileBackend: async () => ({ baseUrl: origin, sessionToken: TOKEN, release: () => undefined }),
+    builtinMemoryFiles: { hermesRoot: memoryRoot, resolveProfileHome: () => memoryRoot },
   });
 
   const content = await adapter.getSkillContent("coder", "local");
@@ -470,7 +485,7 @@ function countWrite(writes: Map<string, number>, path: string): void {
   writes.set(path, (writes.get(path) ?? 0) + 1);
 }
 
-async function assertOneConflict(operations: [Promise<void>, Promise<void>]): Promise<void> {
+async function assertOneConflict<T>(operations: [Promise<T>, Promise<T>]): Promise<void> {
   const results = await Promise.allSettled(operations);
   assert.equal(results.filter((result) => result.status === "fulfilled").length, 1);
   const rejected = results.filter((result): result is PromiseRejectedResult => result.status === "rejected");

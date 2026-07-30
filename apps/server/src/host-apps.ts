@@ -11,6 +11,8 @@ const OBSIDIAN_APP_PATHS = [
 const HOMEBREW_PATHS = ["/opt/homebrew/bin/brew", "/usr/local/bin/brew"] as const;
 const INSTALL_TIMEOUT_MS = 20 * 60 * 1_000;
 const INSTALL_KILL_GRACE_MS = 5_000;
+const SHUTDOWN_KILL_GRACE_MS = 2_000;
+const SHUTDOWN_SETTLEMENT_GRACE_MS = 500;
 const HOMEBREW_PATH = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin";
 const HOMEBREW_ENV_KEYS = ["HOME", "USER", "LOGNAME", "SHELL", "TMPDIR", "LANG", "LC_ALL", "LC_CTYPE"] as const;
 
@@ -24,6 +26,7 @@ export class HostAppManager {
   #installer: ChildProcess | undefined;
   #timeout: ReturnType<typeof setTimeout> | undefined;
   #killTimeout: ReturnType<typeof setTimeout> | undefined;
+  #closeFlight: Promise<void> | undefined;
 
   obsidianStatus(): HostAppStatus {
     if (OBSIDIAN_APP_PATHS.some((candidate) => existsSync(candidate))) {
@@ -72,13 +75,18 @@ export class HostAppManager {
     return this.obsidianStatus();
   }
 
-  close(): void {
+  close(): Promise<void> {
+    if (this.#closeFlight !== undefined) return this.#closeFlight;
     if (this.#timeout !== undefined) clearTimeout(this.#timeout);
     if (this.#killTimeout !== undefined) clearTimeout(this.#killTimeout);
     this.#timeout = undefined;
     this.#killTimeout = undefined;
-    this.#installer?.kill("SIGTERM");
-    this.#installer = undefined;
+    const child = this.#installer;
+    const flight = terminateChild(child, SHUTDOWN_KILL_GRACE_MS, SHUTDOWN_SETTLEMENT_GRACE_MS).finally(() => {
+      if (this.#installer === child) this.#installer = undefined;
+    });
+    this.#closeFlight = flight;
+    return flight;
   }
 
   #finish(child: ChildProcess, succeeded: boolean): void {
@@ -96,6 +104,33 @@ export class HostAppManager {
     this.#phase = "failed";
     this.#failure ??= "install_failed";
   }
+}
+
+async function terminateChild(
+  child: ChildProcess | undefined,
+  termGraceMs: number,
+  settlementGraceMs: number,
+): Promise<void> {
+  if (child === undefined || child.exitCode !== null || child.signalCode !== null) return;
+  await new Promise<void>((resolve) => {
+    let settled = false;
+    let killTimer: ReturnType<typeof setTimeout> | undefined;
+    let settlementTimer: ReturnType<typeof setTimeout> | undefined;
+    const finish = (): void => {
+      if (settled) return;
+      settled = true;
+      if (killTimer !== undefined) clearTimeout(killTimer);
+      if (settlementTimer !== undefined) clearTimeout(settlementTimer);
+      child.off("close", finish);
+      resolve();
+    };
+    child.once("close", finish);
+    child.kill("SIGTERM");
+    killTimer = setTimeout(() => {
+      if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+      settlementTimer = setTimeout(finish, settlementGraceMs);
+    }, termGraceMs);
+  });
 }
 
 function homebrewPath(): string | undefined {

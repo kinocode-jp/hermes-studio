@@ -6,16 +6,16 @@ import {
   readUiNavPreferences,
 } from "../src/ui-nav-prefs.ts";
 
-test("normalizeUiNavPreferences keeps valid surfaces and falls back safely", () => {
+test("normalizeUiNavPreferences keeps restorable dashboard state and folds modal-only state safely", () => {
   assert.deepEqual(normalizeUiNavPreferences({
     version: 1,
     surface: "kanban",
-    settingsTab: "memory",
+    settingsTab: "global",
     selectedProfileId: "coder",
   }), {
     version: 1,
     surface: "kanban",
-    settingsTab: "memory",
+    settingsTab: "global",
     selectedProfileId: "coder",
   });
   assert.equal(normalizeUiNavPreferences({ version: 1, surface: "nope" }).surface, "office");
@@ -26,7 +26,7 @@ test("normalizeUiNavPreferences keeps valid surfaces and falls back safely", () 
     settingsTab: "skills",
     selectedProfileId: "",
   });
-  assert.equal(migrated.surface, "settings");
+  assert.equal(migrated.surface, "office");
   assert.equal(migrated.settingsTab, "global");
 });
 

@@ -19,6 +19,9 @@ const parsedTrustedProxyHops = Number.parseInt(brandEnv("TRUSTED_PROXY_HOPS") ??
 const trustedProxyHops = Number.isInteger(parsedTrustedProxyHops) && parsedTrustedProxyHops >= 0 && parsedTrustedProxyHops <= 8
   ? parsedTrustedProxyHops
   : 0;
+const maxChatSessionLeasesPerOwner = positiveBrandInteger("CHAT_SESSION_LEASES_PER_OWNER");
+const maxChatSessionLeasesPerProfile = positiveBrandInteger("CHAT_SESSION_LEASES_PER_PROFILE");
+const maxChatSessionLeasesTotal = positiveBrandInteger("CHAT_SESSION_LEASES_TOTAL");
 
 const teamsPath = brandEnv("TEAMS_PATH") ?? brandStatePath("teams.json");
 const teamsStore = new OfficeTeamsStore(teamsPath);
@@ -50,8 +53,20 @@ function shutdown(): Promise<void> {
   if (shutdownFlight !== undefined) return shutdownFlight;
   shuttingDown = true;
   const flight = (async () => {
-    await runtimeSource?.close();
-    await initialization?.catch(() => undefined);
+    const activeServer = server;
+    if (activeServer !== undefined) {
+      // The server owns the bounded shutdown order: persistence and listener
+      // closure start immediately while managed Hermes children stop in parallel.
+      await activeServer.close();
+      return;
+    }
+    // During startup there may be no server object yet. Abort the runtime and
+    // wait for initialization together; a candidate that wins the race checks
+    // shuttingDown and closes itself before publishing the listener.
+    await Promise.allSettled([
+      runtimeSource?.close(),
+      initialization,
+    ]);
     await server?.close();
   })();
   shutdownFlight = flight;
@@ -66,6 +81,18 @@ process.once("SIGINT", () => {
 process.once("SIGTERM", () => {
   void shutdown().finally(() => process.exit(0));
 });
+
+// The packaged desktop launcher owns this server through a private stdin pipe.
+// If the native parent crashes or is force-quit, the kernel closes the pipe;
+// follow the same cleanup path as SIGTERM so port 4317 is not orphaned.
+if (brandEnvIsTrue("DESKTOP_PARENT_PIPE")) {
+  process.stdin.resume();
+  const parentPipeClosed = (): void => {
+    void shutdown().finally(() => process.exit(0));
+  };
+  process.stdin.once("end", parentPipeClosed);
+  process.stdin.once("error", parentPipeClosed);
+}
 
 initialization = (async () => {
   try {
@@ -92,6 +119,9 @@ initialization = (async () => {
       // Fail closed unless the Tailscale launcher (or operator) sets this explicitly.
       // Accepts HERMES_STUDIO_REMOTE_PRIVILEGED or deprecated HERMES_OFFICE_REMOTE_PRIVILEGED.
       remotePrivilegedEnabled: brandEnvIsTrue("REMOTE_PRIVILEGED"),
+      ...(maxChatSessionLeasesPerOwner === undefined ? {} : { maxChatSessionLeasesPerOwner }),
+      ...(maxChatSessionLeasesPerProfile === undefined ? {} : { maxChatSessionLeasesPerProfile }),
+      ...(maxChatSessionLeasesTotal === undefined ? {} : { maxChatSessionLeasesTotal }),
       ...(runtimeSource === undefined ? {} : { runtimeSource }),
       hermesAgentUpdate,
     });
@@ -105,6 +135,13 @@ initialization = (async () => {
   }
 })();
 await initialization;
+
+function positiveBrandInteger(name: string): number | undefined {
+  const raw = brandEnv(name);
+  if (raw === undefined) return undefined;
+  const parsed = Number.parseInt(raw, 10);
+  return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : undefined;
+}
 
 export { createOfficeServer } from "./server.js";
 export { HermesBackend } from "./hermes-backend.js";

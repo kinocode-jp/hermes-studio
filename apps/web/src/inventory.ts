@@ -7,7 +7,7 @@ import { isScheduledSessionHidden } from "./scheduled-sessions";
 import { mergeServerSessionStatus } from "./session-runtime";
 import { reconcileDefaultAvatarProfiles, registerDefaultAvatarProfiles } from "./avatar-preferences";
 import { ensurePokemonDisplayNames } from "./profile-names";
-import { activeSessionId, closeSession, openSessionIds, profileList, selectedProfileId, sessions } from "./store";
+import { activeSessionId, dismissSessions, openSessionIds, profileList, selectedProfileId, sessions } from "./store";
 
 type InventoryKind = "profiles" | "sessions";
 type InventoryPage = {
@@ -29,6 +29,10 @@ type SnapshotRefresh = (expected: Pick<OfficeSnapshotRequestIdentity, "serverUrl
 const emptyState: InventoryLoadState = { returned: 0, available: 0, total: 0, hasMore: false, truncated: false, partialFailures: 0, loading: false };
 export const profileInventoryState = signal<InventoryLoadState>({ ...emptyState });
 export const sessionInventoryState = signal<InventoryLoadState>({ ...emptyState });
+/** True only after every page in the current session inventory was reliable. */
+export const sessionInventoryComplete = signal(false);
+/** Identity of the snapshot that initialized the exported inventory states. */
+export const inventorySnapshotIdentity = signal<OfficeSnapshotRequestIdentity | undefined>(undefined);
 let nextInventoryGeneration = 0;
 let nextLegacyRequestGeneration = 0;
 let inventoryIdentity: InventoryIdentity | undefined;
@@ -39,6 +43,10 @@ export function initializeInventory(snapshot: OfficeSnapshot, source: string | O
   const snapshotIdentity = typeof source === "string"
     ? { serverUrl: source, connectionGeneration: 0, requestGeneration: ++nextLegacyRequestGeneration }
     : source;
+  // Fence reactive consumers before replacing pagination. This also protects
+  // legacy/string callers whose synthetic identities all use generation 0.
+  inventorySnapshotIdentity.value = undefined;
+  sessionInventoryComplete.value = false;
   inventoryIdentity = {
     ...snapshotIdentity,
     inventoryGeneration: ++nextInventoryGeneration,
@@ -49,6 +57,10 @@ export function initializeInventory(snapshot: OfficeSnapshot, source: string | O
   };
   profileInventoryState.value = { ...snapshot.inventory.profiles, loading: false };
   sessionInventoryState.value = { ...snapshot.inventory.sessions, loading: false };
+  sessionInventoryComplete.value = isReliablePage(snapshot.inventory.sessions)
+    && isTerminal(snapshot.inventory.sessions);
+  // Publish identity last so consumers never pair a new identity with stale pagination.
+  inventorySnapshotIdentity.value = snapshotIdentity;
 }
 
 export function registerInventorySnapshotRefresh(action: SnapshotRefresh | undefined): void {
@@ -68,6 +80,37 @@ export async function requestInventorySnapshotRefresh(): Promise<void> {
 
 export async function loadMoreProfiles(): Promise<void> { await loadMore("profiles"); }
 export async function loadMoreSessions(): Promise<void> { await loadMore("sessions"); }
+
+/** Load every reliable session-inventory page before destructive "delete all" actions. */
+export async function loadAllSessions(maxPages = 1_000): Promise<boolean> {
+  let loadedPages = 0;
+  while (sessionInventoryState.value.hasMore) {
+    if (loadedPages >= maxPages) return false;
+    if (sessionInventoryState.value.loading) {
+      let settled = false;
+      for (let attempt = 0; attempt < 400; attempt += 1) {
+        await new Promise<void>((resolve) => window.setTimeout(resolve, 50));
+        if (!sessionInventoryState.value.loading) {
+          settled = true;
+          break;
+        }
+      }
+      if (!settled) return false;
+      continue;
+    }
+    const cursor = sessionInventoryState.value.nextCursor;
+    if (!cursor) return false;
+    await loadMoreSessions();
+    loadedPages += 1;
+    const next = sessionInventoryState.value;
+    if (next.error !== undefined) return false;
+    if (next.hasMore && next.nextCursor === cursor) return false;
+  }
+  // A Hermes snapshot may be marked truncated because one row was malformed
+  // even after every exposed page was consumed. Destructive callers can still
+  // safely delete the concrete IDs that were returned, refresh, and repeat.
+  return !sessionInventoryState.value.hasMore && sessionInventoryState.value.error === undefined;
+}
 
 async function loadMore(kind: InventoryKind, retriedAfterRefresh = false): Promise<void> {
   const stateSignal = kind === "profiles" ? profileInventoryState : sessionInventoryState;
@@ -136,6 +179,8 @@ function isCurrentSnapshot(identity: OfficeSnapshotRequestIdentity): boolean {
 function invalidateInventoryAuthentication(serverUrl: string): void {
   if (inventoryIdentity?.serverUrl !== serverUrl) return;
   inventoryIdentity = undefined;
+  inventorySnapshotIdentity.value = undefined;
+  sessionInventoryComplete.value = false;
   profileInventoryState.value = invalidatedState(profileInventoryState.value);
   sessionInventoryState.value = invalidatedState(sessionInventoryState.value);
 }
@@ -161,7 +206,8 @@ function commitInventoryPage(page: InventoryPage, identity: InventoryIdentity): 
   } else {
     identity.sessionsReliable &&= isReliablePage(page.pagination);
     mergeSessions(page.sessions, identity.seenSessions);
-    if (identity.sessionsReliable && isTerminal(page.pagination)) pruneSessions(identity.seenSessions);
+    sessionInventoryComplete.value = identity.sessionsReliable && isTerminal(page.pagination);
+    if (sessionInventoryComplete.value) pruneSessions(identity.seenSessions);
   }
 }
 
@@ -210,10 +256,10 @@ function mergeSessions(rows: OfficeSnapshot["sessions"], seen?: Set<string>): vo
     const status = mergeServerSessionStatus(previous, live.activity);
     if (index === undefined || previous === undefined) {
       existing.set(key, next.length);
-      next.push({ id: storedSessionClientId(live.profileId, live.id), storedSessionId: live.id, profileId: live.profileId, title: live.title, ...(live.createdAt === undefined ? {} : { createdAt: live.createdAt }), ...(live.updatedAt === undefined ? {} : { updatedAt: live.updatedAt }), ...(live.lastMessagePreview === undefined ? {} : { lastMessagePreview: live.lastMessagePreview }), status, messages: [], connectionState: "disconnected", historyState: "unloaded", remoteKind: "stored", readOnly: true });
+      next.push({ id: storedSessionClientId(live.profileId, live.id), storedSessionId: live.id, profileId: live.profileId, title: live.title, ...(live.createdAt === undefined ? {} : { createdAt: live.createdAt }), ...(live.updatedAt === undefined ? {} : { updatedAt: live.updatedAt }), ...(live.lastMessagePreview === undefined ? {} : { lastMessagePreview: live.lastMessagePreview }), ...(live.conversationKind === undefined ? {} : { conversationKind: live.conversationKind }), ...(live.delegationTaskId === undefined ? {} : { delegationTaskId: live.delegationTaskId }), ...(live.delegatedByProfileId === undefined ? {} : { delegatedByProfileId: live.delegatedByProfileId }), status, messages: [], connectionState: "disconnected", historyState: "unloaded", remoteKind: "stored", readOnly: true });
       continue;
     }
-    next[index] = { ...previous, storedSessionId: live.id, profileId: live.profileId, title: live.title, titlePresentation: undefined, ...(live.createdAt === undefined ? {} : { createdAt: live.createdAt }), ...(live.updatedAt === undefined ? {} : { updatedAt: live.updatedAt }), ...(live.lastMessagePreview === undefined ? {} : { lastMessagePreview: live.lastMessagePreview }), status, remoteKind: "stored" };
+    next[index] = { ...previous, storedSessionId: live.id, profileId: live.profileId, title: live.title, titlePresentation: undefined, ...(live.createdAt === undefined ? {} : { createdAt: live.createdAt }), ...(live.updatedAt === undefined ? {} : { updatedAt: live.updatedAt }), ...(live.lastMessagePreview === undefined ? {} : { lastMessagePreview: live.lastMessagePreview }), ...(live.conversationKind === undefined ? {} : { conversationKind: live.conversationKind }), ...(live.delegationTaskId === undefined ? {} : { delegationTaskId: live.delegationTaskId }), ...(live.delegatedByProfileId === undefined ? {} : { delegatedByProfileId: live.delegatedByProfileId }), status, remoteKind: "stored" };
   }
   sessions.value = next.filter((session) => !isScheduledSessionHidden(session));
   updateProfileSessionCounts();
@@ -228,10 +274,7 @@ function pruneProfiles(seen: ReadonlySet<string>): void {
 function pruneSessions(seen: ReadonlySet<string>): void {
   const removedIds = new Set(sessions.value.flatMap((session) => session.remoteKind === "stored" && !seen.has(sessionKey(session)) ? [session.id] : []));
   if (removedIds.size === 0) return;
-  sessions.value = sessions.value.filter((session) => session.remoteKind !== "stored" || !removedIds.has(session.id));
-  for (const sessionId of openSessionIds.value.filter((id) => removedIds.has(id))) closeSession(sessionId);
-  if (removedIds.has(activeSessionId.value)) activeSessionId.value = openSessionIds.value.at(-1) ?? "";
-  updateProfileSessionCounts();
+  dismissSessions([...removedIds]);
 }
 
 function updateProfileSessionCounts(): void {

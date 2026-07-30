@@ -23,6 +23,8 @@ export type Profile = {
 
 export type ChatMessage = {
   id: string;
+  /** Monotonic order shared with operation evidence inside one session. */
+  timelineSequence?: number | undefined;
   from: "user" | "agent" | "tool";
   kind?: "steer" | undefined;
   body: string;
@@ -40,6 +42,8 @@ export type ChatMessage = {
 
 export type ChatOperationEvidence = {
   id: string;
+  /** Monotonic order shared with transcript messages inside one session. */
+  timelineSequence?: number | undefined;
   kind: "prompt" | "steer";
   body: string;
   at: string;
@@ -47,7 +51,7 @@ export type ChatOperationEvidence = {
   message?: string | undefined;
 };
 
-export type ChatConnectionState = "disconnected" | "connecting" | "ready" | "error";
+export type ChatConnectionState = "disconnected" | "connecting" | "queued" | "ready" | "error";
 export type ChatHistoryState = "unloaded" | "loading" | "loaded" | "error";
 
 export type ApprovalChoice = "once" | "session" | "always" | "deny";
@@ -88,6 +92,12 @@ export type ChatSession = {
   createdAt?: string | undefined;
   updatedAt?: string | undefined;
   lastMessagePreview?: string | undefined;
+  /** Studio-visible origin. Delegated chats are durable worker conversations. */
+  conversationKind?: "direct" | "delegated" | undefined;
+  /** Shared Kanban task that created a delegated profile conversation. */
+  delegationTaskId?: string | undefined;
+  /** Profile that created the delegated task, when known. */
+  delegatedByProfileId?: string | undefined;
   status: "streaming" | "ready" | "waiting";
   messages: ChatMessage[];
   /** Bounded local RPC evidence. It is deliberately separate from Hermes' durable transcript. */
@@ -99,11 +109,40 @@ export type ChatSession = {
   errorMessage?: RuntimeMessage | undefined;
   remoteKind?: "demo" | "stored" | "draft" | undefined;
   streamingMessageId?: string | undefined;
+  /** Upstream identity for streamingMessageId; separate from its unique UI id. */
+  streamingSourceMessageId?: string | undefined;
+  /** Completed interim assistant rows created during the current run only. */
+  interimMessageIds?: string[] | undefined;
+  /** True after the run's first assistant frame until its terminal fence. */
+  chatRunStarted?: boolean | undefined;
+  /** Server-assigned occurrence identity for the active assistant run. */
+  chatRunId?: string | undefined;
+  /** Process-unique server correlation epoch for sequence comparisons. */
+  chatCorrelationEpoch?: string | undefined;
+  /** Server sequence for the active assistant run. */
+  chatRunServerSequence?: number | undefined;
+  /** High-water mark for terminal runs; rejects every older run without an LRU window. */
+  completedChatRunServerSequence?: number | undefined;
+  /** High-water mark for delivered gateway events; makes replay rejection independent of count. */
+  processedChatEventSequence?: number | undefined;
+  /** Upstream assistant identity retained even while no stream bubble is open. */
+  chatRunSourceMessageId?: string | undefined;
+  /** Monotonic client-side occurrence number advanced by a run's first assistant frame. */
+  chatRunSequence?: number | undefined;
+  /** Recent upstream tool occurrences used to distinguish reuse from replay. */
+  toolMessageBindings?: Array<{
+    runSequence: number;
+    sourceId: string;
+    messageId: string;
+  }> | undefined;
   pendingInteraction?: ChatPendingInteraction | undefined;
   steerPending?: boolean | undefined;
   steerOperationId?: string | undefined;
   interruptPending?: boolean | undefined;
   interruptOperationId?: string | undefined;
+  slashPending?: boolean | undefined;
+  slashOperationId?: string | undefined;
+  composerPrefill?: { id: string; text: string } | undefined;
   readOnly?: boolean;
   /** Preferred model for session.create / display. */
   model?: string | undefined;
@@ -111,6 +150,21 @@ export type ChatSession = {
   provider?: string | undefined;
   /** Preferred reasoning_effort for new Hermes sessions (omit when empty/default). */
   reasoningEffort?: string | undefined;
+  /**
+   * Deferred model switch: staged when the user picks a model mid-session and
+   * sent as a /model command right before the next outbound prompt.
+   * `baseline` remembers the prefs before the first staged pick so re-selecting
+   * the original model cancels the pending switch.
+   */
+  pendingModelChange?: {
+    command: string;
+    reasoningCommand?: string | undefined;
+    model: string;
+    applying?: boolean;
+    /** The model RPC settled successfully; only the reasoning follow-up remains. */
+    modelApplied?: boolean;
+    baseline: { provider?: string | undefined; model?: string | undefined; reasoningEffort?: string | undefined };
+  } | undefined;
   /** Local follow-up chips after the latest assistant reply. */
   followUpSuggestions?: string[] | undefined;
   /**
@@ -221,7 +275,7 @@ export type OfficeSnapshot = {
     features: Array<"chat" | "profiles" | "skills" | "memory" | "kanban" | "teams" | "global-inheritance" | "demo">;
   };
   profiles: OfficeSnapshotProfile[];
-  sessions: Array<{ id: string; profileId: string; title: string; activity: string; createdAt?: string; updatedAt?: string; lastMessagePreview?: string }>;
+  sessions: Array<{ id: string; profileId: string; title: string; activity: string; createdAt?: string; updatedAt?: string; lastMessagePreview?: string; conversationKind?: "direct" | "delegated"; delegationTaskId?: string; delegatedByProfileId?: string }>;
   inventory: { profiles: OfficeInventoryPagination; sessions: OfficeInventoryPagination };
   boards: Array<{ id: string; name: string; cardCount: number }>;
 };

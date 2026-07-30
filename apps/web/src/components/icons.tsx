@@ -139,6 +139,15 @@ export function CloseIcon(props: IconProps) {
   );
 }
 
+export function CopyIcon(props: IconProps) {
+  return (
+    <Icon {...props}>
+      <rect x="5.2" y="5.2" width="7.8" height="7.8" rx="1.2" />
+      <path d="M10.8 5.2V3.8A1.8 1.8 0 0 0 9 2H3.8A1.8 1.8 0 0 0 2 3.8V9a1.8 1.8 0 0 0 1.8 1.8h1.4" />
+    </Icon>
+  );
+}
+
 export function AttachIcon(props: IconProps) {
   return (
     <Icon {...props}>

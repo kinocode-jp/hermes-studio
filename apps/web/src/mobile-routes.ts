@@ -13,7 +13,7 @@ let historyArmed = false;
 let ignorePopCount = 0;
 let historyInstalled = false;
 
-const PHONE_VIEWPORT = "(max-width: 767px)";
+const PHONE_VIEWPORT = "(max-width: 768px)";
 const COMPACT_VIEWPORT = "(max-width: 1279px)";
 
 function matchesViewport(query: string): boolean {

@@ -10,6 +10,7 @@ export type KanbanSubmissionOutcome = "success" | "rejected" | "commit-unknown" 
 export type UnconfirmedSubmission = { input: string; operation: number; checked: boolean; checking: boolean };
 
 export const tasks = signal<WorkTask[]>([]);
+export const focusedKanbanTaskId = signal("");
 export const kanbanAssignees = signal<string[]>([]);
 export const kanbanState = signal<KanbanState>({
   state: "idle",
@@ -26,6 +27,7 @@ let demoRuntimeActive = false;
 let kanbanRefresh: Promise<void> | undefined;
 let kanbanRefreshRequested = 0;
 let kanbanRefreshCompleted = 0;
+let kanbanRefreshShowLoadingRequested = false;
 const kanbanRefreshOutcomes = new Map<number, boolean>();
 let boardGeneration = 0;
 let runtimeGeneration = 0;
@@ -45,6 +47,14 @@ export const retryTaskComments = taskComments.retry;
 
 export function registerKanbanProfileTaskUpdater(update: (counts: ReadonlyMap<string, number>) => void): void {
   updateProfileTaskCounts = update;
+}
+
+export function focusKanbanTask(taskId: string): void {
+  focusedKanbanTaskId.value = taskId.trim();
+}
+
+export function clearFocusedKanbanTask(taskId: string): void {
+  if (focusedKanbanTaskId.value === taskId) focusedKanbanTaskId.value = "";
 }
 
 export function registerKanbanRuntime(api: KanbanApi): void {
@@ -73,13 +83,16 @@ function activateRuntime(api: KanbanApi | undefined): void {
   unconfirmedTaskCreation.value = undefined;
   unconfirmedTaskComments.value = {};
   taskComments.collapse();
+  focusedKanbanTaskId.value = "";
+  kanbanRefreshShowLoadingRequested = false;
   tasks.value = [];
   kanbanAssignees.value = [];
 }
 
-export async function refreshKanbanBoard(options: { acknowledgeErrors?: boolean } = {}): Promise<boolean> {
+export async function refreshKanbanBoard(options: { acknowledgeErrors?: boolean; background?: boolean } = {}): Promise<boolean> {
   if (!kanbanApi) return false;
   const runtime = runtimeGeneration;
+  if (!options.background) kanbanRefreshShowLoadingRequested = true;
   if (options.acknowledgeErrors) {
     boardError = undefined;
     mutationError = undefined;
@@ -99,7 +112,9 @@ async function drainKanbanRefreshes(): Promise<void> {
     while (kanbanRefreshCompleted < kanbanRefreshRequested) {
       const previous = kanbanRefreshCompleted;
       const generation = kanbanRefreshRequested;
-      const succeeded = await loadKanbanBoard();
+      const showLoading = kanbanRefreshShowLoadingRequested;
+      kanbanRefreshShowLoadingRequested = false;
+      const succeeded = await loadKanbanBoard(showLoading);
       for (let request = previous + 1; request <= generation; request += 1) {
         kanbanRefreshOutcomes.set(request, succeeded);
       }
@@ -110,10 +125,10 @@ async function drainKanbanRefreshes(): Promise<void> {
   }
 }
 
-async function loadKanbanBoard(): Promise<boolean> {
+async function loadKanbanBoard(showLoading: boolean): Promise<boolean> {
   const api = kanbanApi!;
   const runtime = runtimeGeneration;
-  if (!hasCurrentMutations() && !currentError()) {
+  if (showLoading && !hasCurrentMutations() && !currentError()) {
     kanbanState.value = { ...kanbanState.value, state: "loading", message: officeMessage("runtime.kanban.loading") };
   }
   try {
@@ -195,6 +210,18 @@ export async function moveTask(taskId: string, status: TaskWritableStatus): Prom
   if (!isCurrent(context)) return;
   finishTaskOperation(taskId, context.operation);
   finishMutation(context);
+}
+
+/**
+ * Hermes Kanban's supported removal path is the archived status. Archived
+ * cards disappear from the active board without deleting related chats or
+ * durable conversation history.
+ */
+export async function deleteTask(taskId: string): Promise<boolean> {
+  const task = tasks.value.find((item) => item.id === taskId);
+  if (!task || task.pending) return false;
+  await moveTask(taskId, "archived");
+  return !tasks.value.some((item) => item.id === taskId && item.status !== "archived");
 }
 
 export async function createTask(title: string): Promise<KanbanSubmissionOutcome> {

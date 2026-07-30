@@ -2,8 +2,10 @@ import type { Signal } from "@preact/signals";
 import type { ChatMessage, ChatOperationEvidence, ChatSession } from "./domain";
 import type { ChatSteerResult } from "./chat-api";
 import { canSteerChatSession, isChatRunActive } from "./session-runtime";
-import { nowTimestamp } from "./chat-store-utils";
+import { nextChatTimelineSequence, nowTimestamp } from "./chat-store-utils";
 import { officeMessage } from "./i18n";
+import { isCommitUnconfirmedRpcError } from "./chat-rpc-results";
+import { advanceSequence } from "./chat-event-ledger";
 
 type SessionState = Signal<ChatSession[]>;
 
@@ -70,18 +72,56 @@ export async function steerChatRun(
       steerOperationId: undefined,
       operationEvidence: boundedOperationEvidence([
         ...(item.operationEvidence ?? []),
-        { id: operationId, kind: "steer", body: trimmed, at: nowTimestamp(), state: "accepted" },
+        {
+          id: operationId,
+          timelineSequence: nextChatTimelineSequence(item),
+          kind: "steer",
+          body: trimmed,
+          at: nowTimestamp(),
+          state: "accepted",
+        },
       ]),
     } : item);
     return state.value.some((item) => item.id === sessionId && item.operationEvidence?.some(({ id }) => id === operationId));
-  } catch {
-    updateSession(state, sessionId, (item) => item.steerOperationId === operationId ? {
-      ...item,
-      steerPending: false,
-      steerOperationId: undefined,
-      errorMessage: officeMessage("runtime.chat.steerSendFailed"),
-    } : item);
-    return false;
+  } catch (reason) {
+    const unconfirmed = isCommitUnconfirmedRpcError(reason);
+    let recorded = false;
+    updateSession(state, sessionId, (item) => {
+      const evidence = unconfirmed ? boundedOperationEvidence([
+        ...(item.operationEvidence ?? []),
+        {
+          id: operationId,
+          timelineSequence: nextChatTimelineSequence(item),
+          kind: "steer" as const,
+          body: trimmed,
+          at: nowTimestamp(),
+          state: "unconfirmed" as const,
+          message: reason.message,
+        },
+      ]) : undefined;
+      if (item.steerOperationId !== operationId) {
+        // A stop or terminal event may have cleared the pending marker while
+        // the ACK was in flight. Preserve ambiguity evidence without restoring
+        // any obsolete running/pending state.
+        if (!evidence || item.operationEvidence?.some(({ id }) => id === operationId)) return item;
+        recorded = true;
+        return { ...item, operationEvidence: evidence };
+      }
+      recorded = true;
+      return {
+        ...item,
+        steerPending: false,
+        steerOperationId: undefined,
+        ...(unconfirmed ? {
+          errorMessage: undefined,
+          operationEvidence: evidence,
+        } : { errorMessage: officeMessage("runtime.chat.steerSendFailed") }),
+      };
+    });
+    // An unknown commit outcome must never invite an automatic/user replay.
+    // Returning true lets the composer clear exactly as it does for accepted
+    // guidance while the evidence ledger communicates the ambiguity.
+    return unconfirmed && recorded;
   }
 }
 
@@ -104,6 +144,18 @@ export async function interruptChatRun(
         ...item,
         status: "ready",
         streamingMessageId: undefined,
+        streamingSourceMessageId: undefined,
+        interimMessageIds: undefined,
+        chatRunStarted: undefined,
+        chatRunId: undefined,
+        chatRunServerSequence: undefined,
+        completedChatRunServerSequence: advanceSequence(
+          item.completedChatRunServerSequence,
+          item.chatRunServerSequence,
+        ),
+        chatRunSourceMessageId: undefined,
+        chatRunSequence: undefined,
+        toolMessageBindings: undefined,
         pendingInteraction: undefined,
         steerPending: false,
         steerOperationId: undefined,
@@ -129,9 +181,9 @@ function updateSession(state: SessionState, sessionId: string, update: (session:
 }
 
 function steerEvidenceBytes(message: ChatMessage): number {
-  return new TextEncoder().encode(`${message.id}\0${message.body}\0${message.at}`).byteLength;
+  return new TextEncoder().encode(`${message.id}\0${message.timelineSequence ?? ""}\0${message.body}\0${message.at}`).byteLength;
 }
 
 function operationEvidenceBytes(operation: ChatOperationEvidence): number {
-  return new TextEncoder().encode(`${operation.id}\0${operation.kind}\0${operation.state}\0${operation.body}\0${operation.at}\0${operation.message ?? ""}`).byteLength;
+  return new TextEncoder().encode(`${operation.id}\0${operation.timelineSequence ?? ""}\0${operation.kind}\0${operation.state}\0${operation.body}\0${operation.at}\0${operation.message ?? ""}`).byteLength;
 }

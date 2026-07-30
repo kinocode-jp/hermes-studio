@@ -270,7 +270,7 @@ export function ChatWorkspace() {
                   <span>{dropTarget?.label}</span>
                 </div>
               )}
-              <ChatPane session={session} profile={profile} />
+              <ChatPane session={session} profile={profile} activateWorkspaceOnPointerDown />
               {showLineAfter && (
                 <div class="workspace-drop-line is-after" aria-hidden="true">
                   <span>{dropTarget?.label}</span>

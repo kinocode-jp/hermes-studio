@@ -4,6 +4,9 @@ import { createVersionProbeEnvironment, isRecognizedHermesVersion, probeHermesCl
 
 const UPDATE_TIMEOUT_MS = 20 * 60 * 1_000;
 const UPDATE_KILL_GRACE_MS = 5_000;
+const UPDATE_SETTLEMENT_GRACE_MS = 1_000;
+const SHUTDOWN_KILL_GRACE_MS = 2_000;
+const SHUTDOWN_SETTLEMENT_GRACE_MS = 500;
 const CHECK_TIMEOUT_MS = 30_000;
 const MAX_OUTPUT_BYTES = 16 * 1024;
 
@@ -21,7 +24,11 @@ export class HermesAgentUpdateManager {
   #timeout: ReturnType<typeof setTimeout> | undefined;
   #killTimeout: ReturnType<typeof setTimeout> | undefined;
   #checkFlight: Promise<HermesAgentUpdateStatus> | undefined;
+  #postUpdateProbe: Promise<void> | undefined;
+  #closeFlight: Promise<void> | undefined;
+  readonly #closeController = new AbortController();
   #lastCheckedAt = 0;
+  #closing = false;
 
   constructor(executable = "hermes") {
     this.#executable = executable.trim() || "hermes";
@@ -45,6 +52,7 @@ export class HermesAgentUpdateManager {
   }
 
   async refresh(options: { force?: boolean } = {}): Promise<HermesAgentUpdateStatus> {
+    if (this.#closing) return this.#statusDto();
     if (this.#updater !== undefined || this.#phase === "updating") return this.#statusDto();
     const force = options.force === true;
     const now = Date.now();
@@ -64,7 +72,7 @@ export class HermesAgentUpdateManager {
 
   startUpdate(): HermesAgentUpdateStatus {
     const current = this.#statusDto();
-    if (current.phase === "updating" || !current.canUpdate) return current;
+    if (this.#closing || current.phase === "updating" || !current.canUpdate) return current;
     if (this.#executable.includes("\0")) {
       this.#phase = "blocked";
       this.#failure = "executable_missing";
@@ -97,13 +105,26 @@ export class HermesAgentUpdateManager {
     return this.#statusDto();
   }
 
-  close(): void {
+  close(): Promise<void> {
+    if (this.#closeFlight !== undefined) return this.#closeFlight;
+    this.#closing = true;
+    this.#closeController.abort();
     if (this.#timeout !== undefined) clearTimeout(this.#timeout);
     if (this.#killTimeout !== undefined) clearTimeout(this.#killTimeout);
     this.#timeout = undefined;
     this.#killTimeout = undefined;
-    this.#updater?.kill("SIGTERM");
-    this.#updater = undefined;
+    const child = this.#updater;
+    const checkFlight = this.#checkFlight;
+    const postUpdateProbe = this.#postUpdateProbe;
+    const flight = terminateChild(child, SHUTDOWN_KILL_GRACE_MS, SHUTDOWN_SETTLEMENT_GRACE_MS).then(async () => {
+      if (this.#updater === child) this.#updater = undefined;
+      await Promise.allSettled([
+        ...(checkFlight === undefined ? [] : [checkFlight]),
+        ...(postUpdateProbe === undefined ? [] : [postUpdateProbe]),
+      ]);
+    });
+    this.#closeFlight = flight;
+    return flight;
   }
 
   async #runCheck(): Promise<HermesAgentUpdateStatus> {
@@ -118,7 +139,8 @@ export class HermesAgentUpdateManager {
       return this.#statusDto();
     }
 
-    const cli = await probeHermesCli(this.#executable, 5_000);
+    const cli = await probeHermesCli(this.#executable, 5_000, this.#closeController.signal);
+    if (this.#closing) return this.#statusDto();
     if (cli.state !== "available" || cli.version === undefined) {
       this.#phase = "blocked";
       this.#failure = "executable_missing";
@@ -128,7 +150,8 @@ export class HermesAgentUpdateManager {
     }
     this.#currentVersion = cli.version;
 
-    const check = await runHermesUpdateCheck(this.#executable, CHECK_TIMEOUT_MS);
+    const check = await runHermesUpdateCheck(this.#executable, CHECK_TIMEOUT_MS, this.#closeController.signal);
+    if (this.#closing) return this.#statusDto();
     if (check.outcome === "available") {
       this.#phase = "available";
       this.#failure = undefined;
@@ -154,14 +177,17 @@ export class HermesAgentUpdateManager {
     this.#killTimeout = undefined;
     this.#updater = undefined;
 
+    if (this.#closing) return;
+
     if (!succeeded) {
       this.#phase = "failed";
       this.#failure ??= "update_failed";
       return;
     }
 
-    void probeHermesCli(this.#executable, 5_000).then((cli) => {
-      if (this.#updater !== undefined) return;
+    let probe: Promise<void>;
+    probe = probeHermesCli(this.#executable, 5_000, this.#closeController.signal).then((cli) => {
+      if (this.#closing || this.#updater !== undefined) return;
       if (cli.state === "available" && cli.version !== undefined) {
         this.#currentVersion = cli.version;
         this.#phase = "updated";
@@ -172,10 +198,13 @@ export class HermesAgentUpdateManager {
       }
       this.#lastCheckedAt = 0;
     }).catch(() => {
-      if (this.#updater !== undefined) return;
+      if (this.#closing || this.#updater !== undefined) return;
       this.#phase = "failed";
       this.#failure = "update_failed";
+    }).finally(() => {
+      if (this.#postUpdateProbe === probe) this.#postUpdateProbe = undefined;
     });
+    this.#postUpdateProbe = probe;
   }
 
   #statusDto(): HermesAgentUpdateStatus {
@@ -190,19 +219,51 @@ export class HermesAgentUpdateManager {
   }
 }
 
+async function terminateChild(
+  child: ChildProcess | undefined,
+  termGraceMs: number,
+  settlementGraceMs: number,
+): Promise<void> {
+  if (child === undefined || child.exitCode !== null || child.signalCode !== null) return;
+  await new Promise<void>((resolve) => {
+    let settled = false;
+    let killTimer: ReturnType<typeof setTimeout> | undefined;
+    let settlementTimer: ReturnType<typeof setTimeout> | undefined;
+    const finish = (): void => {
+      if (settled) return;
+      settled = true;
+      if (killTimer !== undefined) clearTimeout(killTimer);
+      if (settlementTimer !== undefined) clearTimeout(settlementTimer);
+      child.off("close", finish);
+      resolve();
+    };
+    child.once("close", finish);
+    child.kill("SIGTERM");
+    killTimer = setTimeout(() => {
+      if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+      settlementTimer = setTimeout(finish, settlementGraceMs);
+    }, termGraceMs);
+  });
+}
+
 type UpdateCheckOutcome = "available" | "up_to_date" | "unsupported" | "failed";
 
 async function runHermesUpdateCheck(
   executable: string,
   timeoutMs: number,
+  signal?: AbortSignal,
 ): Promise<{ outcome: UpdateCheckOutcome }> {
+  if (signal?.aborted === true) return { outcome: "failed" };
   return await new Promise((resolve) => {
     let settled = false;
     let output = "";
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let stopping: Promise<void> | undefined;
     const finish = (outcome: UpdateCheckOutcome): void => {
       if (settled) return;
       settled = true;
-      clearTimeout(timer);
+      if (timer !== undefined) clearTimeout(timer);
+      signal?.removeEventListener("abort", abort);
       resolve({ outcome });
     };
 
@@ -212,10 +273,13 @@ async function runHermesUpdateCheck(
       windowsHide: true,
       env: createVersionProbeEnvironment(),
     });
-    const timer = setTimeout(() => {
-      child.kill("SIGKILL");
-      finish("failed");
-    }, timeoutMs);
+    const stop = (termGraceMs: number): void => {
+      stopping ??= terminateChild(child, termGraceMs, UPDATE_SETTLEMENT_GRACE_MS)
+        .finally(() => finish("failed"));
+    };
+    const abort = (): void => stop(UPDATE_KILL_GRACE_MS);
+    signal?.addEventListener("abort", abort, { once: true });
+    timer = setTimeout(() => stop(0), timeoutMs);
     timer.unref();
 
     const capture = (chunk: Buffer): void => {

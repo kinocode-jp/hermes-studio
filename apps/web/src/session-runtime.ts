@@ -10,16 +10,23 @@ export function mergeServerSessionStatus(previous: ChatSession | undefined, acti
 }
 
 export function canSubmitChatPrompt(session: ChatSession): boolean {
-  const connected = session.remoteKind === "demo" || session.connectionState === "ready";
-  return connected && session.status === "ready" && session.steerPending !== true && session.interruptPending !== true && !isChatRunActive(session);
+  const connected = session.remoteKind === "demo"
+    || session.connectionState === "ready"
+    || session.connectionState === "queued";
+  return connected && session.status === "ready" && session.steerPending !== true
+    && session.interruptPending !== true && session.pendingModelChange?.applying !== true
+    && session.slashPending !== true
+    && !isChatRunActive(session);
 }
 
 export function composerBlockedReason(session: ChatSession): "pending-interaction" | "connecting" | "disconnected" | "running" | "stopping" | undefined {
   if (session.pendingInteraction) return "pending-interaction";
   if (session.interruptPending) return "stopping";
+  if (session.slashPending) return "running";
   if (isChatRunActive(session) && !canSteerChatSession(session)) return "running";
   if (session.remoteKind === "demo") return undefined;
   if (session.connectionState === "connecting") return "connecting";
+  if (session.connectionState === "queued") return undefined;
   if (session.connectionState !== "ready") return "disconnected";
   return undefined;
 }

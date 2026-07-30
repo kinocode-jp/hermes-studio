@@ -3,10 +3,12 @@ import type { ChatPromptResult, ChatSteerResult } from "./chat-api";
 const RPC_REJECTED = Symbol("rpc-rejected");
 const RPC_COMMIT_UNCONFIRMED = Symbol("rpc-commit-unconfirmed");
 const RPC_SESSION_IN_USE = Symbol("rpc-session-in-use");
+const RPC_SESSION_LIMIT = Symbol("rpc-session-limit");
 
 type ExplicitRpcRejection = Error & { [RPC_REJECTED]: true };
 type CommitUnconfirmedRpcError = Error & { [RPC_COMMIT_UNCONFIRMED]: true };
 type SessionInUseRpcError = Error & { [RPC_REJECTED]: true; [RPC_SESSION_IN_USE]: true };
+type SessionLimitRpcError = Error & { [RPC_REJECTED]: true; [RPC_SESSION_LIMIT]: true };
 
 export function explicitRpcRejection(message: string): ExplicitRpcRejection {
   return Object.assign(new Error(message), { [RPC_REJECTED]: true as const });
@@ -20,6 +22,10 @@ export function sessionInUseRpcError(message: string): SessionInUseRpcError {
   return Object.assign(new Error(message), { [RPC_REJECTED]: true as const, [RPC_SESSION_IN_USE]: true as const });
 }
 
+export function sessionLimitRpcError(message: string): SessionLimitRpcError {
+  return Object.assign(new Error(message), { [RPC_REJECTED]: true as const, [RPC_SESSION_LIMIT]: true as const });
+}
+
 export function isExplicitRpcRejection(error: unknown): error is ExplicitRpcRejection {
   return typeof error === "object" && error !== null && RPC_REJECTED in error;
 }
@@ -30,6 +36,10 @@ export function isCommitUnconfirmedRpcError(error: unknown): error is CommitUnco
 
 export function isSessionInUseRpcError(error: unknown): error is SessionInUseRpcError {
   return typeof error === "object" && error !== null && RPC_SESSION_IN_USE in error;
+}
+
+export function isSessionLimitRpcError(error: unknown): error is SessionLimitRpcError {
+  return typeof error === "object" && error !== null && RPC_SESSION_LIMIT in error;
 }
 
 export function isCommitUnconfirmedRpcFrame(error: Record<string, unknown>): boolean {

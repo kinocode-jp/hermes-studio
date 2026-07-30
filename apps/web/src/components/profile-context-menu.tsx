@@ -1,6 +1,8 @@
 import { useEffect, useRef, useState } from "preact/hooks";
 import type { Ref } from "preact";
+import type { ChatSession } from "../domain";
 import { chatSessionTitle, locale, t } from "../i18n";
+import { loadAllSessions, requestInventorySnapshotRefresh } from "../inventory";
 import { profileDisplayName, profileSecondaryName } from "../profile-names";
 import {
   closeSession,
@@ -19,6 +21,7 @@ import {
   setSidebarProfileOpen,
 } from "../sidebar-layout";
 import { createProfileSession } from "./profile-panel";
+import { SessionsDeleteDialog } from "./session-delete-dialog";
 
 export type ProfileContextMenuState =
   | { kind: "profile"; profileId: string; left: number; top: number }
@@ -113,18 +116,31 @@ export function ProfileContextMenu({
   menuRef,
   onClose,
   onOpenSession,
+  onDeleteSession,
 }: {
   menu: ProfileContextMenuState;
   menuRef: Ref<HTMLDivElement>;
   onClose: () => void;
   onOpenSession: (sessionId: string) => void;
+  onDeleteSession?: (sessionId: string) => void;
 }) {
   void locale.value; // re-render when display language changes
+  const [selectedSessionIds, setSelectedSessionIds] = useState<string[]>([]);
+  const [deleteRequest, setDeleteRequest] = useState<{ sessions: readonly ChatSession[]; all: boolean } | null>(null);
+  const [deleteAllLoading, setDeleteAllLoading] = useState(false);
+  const [deleteAllLoadFailed, setDeleteAllLoadFailed] = useState(false);
   const profile = profileList.value.find((item) => item.id === menu.profileId);
   const displayName = profile ? profileDisplayName(profile) : menu.profileId;
   const secondaryName = profile ? profileSecondaryName(profile) : "";
   const profileSessions = sessions.value.filter((session) => session.profileId === menu.profileId && !isScheduledSessionHidden(session));
   const sessionsOpen = isSidebarProfileOpen(menu.profileId);
+
+  useEffect(() => {
+    setSelectedSessionIds([]);
+    setDeleteRequest(null);
+    setDeleteAllLoading(false);
+    setDeleteAllLoadFailed(false);
+  }, [menu.kind, menu.profileId, menu.kind === "session" ? menu.sessionId : ""]);
 
   if (menu.kind === "session") {
     const session = sessions.value.find((item) => item.id === menu.sessionId);
@@ -149,7 +165,7 @@ export function ProfileContextMenu({
           {t("profile.openInWorkspace")}
           {session.status === "streaming" ? <small>{t("profile.running")}</small> : isOpen ? <small>{t("profile.open")}</small> : null}
         </button>
-        <button type="button" role="menuitem" onClick={() => { openProfileChatModal(menu.profileId); onClose(); }}>
+        <button type="button" role="menuitem" onClick={() => { openProfileChatModal(menu.profileId, { sessionId: session.id }); onClose(); }}>
           {t("sidebar.openChat")}
         </button>
         {isOpen && (
@@ -164,6 +180,22 @@ export function ProfileContextMenu({
         <button type="button" role="menuitem" onClick={() => { openProfileSettingsModal(menu.profileId); onClose(); }}>
           {t("sidebar.menu.settings")}
         </button>
+        {onDeleteSession && (
+          <>
+            <div class="profile-context-menu-divider" role="separator" />
+            <button
+              type="button"
+              class="profile-context-menu-danger"
+              role="menuitem"
+              onClick={() => {
+                onDeleteSession(session.id);
+                onClose();
+              }}
+            >
+              {t("chat.sessionDelete")}
+            </button>
+          </>
+        )}
         <button type="button" role="menuitem" onClick={onClose}>
           {t("common.close")}
         </button>
@@ -173,15 +205,39 @@ export function ProfileContextMenu({
 
   const visibleSessions = profileSessions.slice(0, MAX_MENU_SESSIONS);
   const hiddenCount = Math.max(0, profileSessions.length - visibleSessions.length);
+  const selectedSessions = profileSessions.filter((session) => selectedSessionIds.includes(session.id));
+
+  const toggleSessionSelection = (sessionId: string) => {
+    setSelectedSessionIds((current) => current.includes(sessionId)
+      ? current.filter((id) => id !== sessionId)
+      : [...current, sessionId]);
+  };
+
+  const requestDeleteAll = async () => {
+    if (deleteAllLoading) return;
+    setDeleteAllLoading(true);
+    setDeleteAllLoadFailed(false);
+    await requestInventorySnapshotRefresh();
+    const complete = await loadAllSessions();
+    setDeleteAllLoading(false);
+    if (!complete) {
+      setDeleteAllLoadFailed(true);
+      return;
+    }
+    const allProfileSessions = sessions.value.filter((session) =>
+      session.profileId === menu.profileId && !isScheduledSessionHidden(session));
+    if (allProfileSessions.length > 0) setDeleteRequest({ sessions: allProfileSessions, all: true });
+  };
 
   return (
-    <div
-      ref={menuRef}
-      class="profile-context-menu"
-      role="menu"
-      aria-label={t("sidebar.menu.aria", { name: displayName })}
-      style={{ left: `${menu.left}px`, top: `${menu.top}px`, maxHeight: `${MENU_MAX_HEIGHT}px` }}
-    >
+    <>
+      <div
+        ref={menuRef}
+        class="profile-context-menu"
+        role="menu"
+        aria-label={t("sidebar.menu.aria", { name: displayName })}
+        style={{ left: `${menu.left}px`, top: `${menu.top}px`, maxHeight: `${MENU_MAX_HEIGHT}px` }}
+      >
       <p class="profile-context-menu-kicker">{t("sidebar.menu.profileLabel")}</p>
       <p class="profile-context-menu-title" title={displayName}>{displayName}</p>
       {secondaryName ? <p class="profile-context-menu-subtitle">{secondaryName}</p> : null}
@@ -216,17 +272,28 @@ export function ProfileContextMenu({
           {visibleSessions.map((session) => {
             const isOpen = openSessionIds.value.includes(session.id);
             return (
-              <button
-                key={session.id}
-                type="button"
-                role="menuitem"
-                aria-label={t("sidebar.menu.openSessionNamed", { title: chatSessionTitle(session) })}
-                onClick={() => onOpenSession(session.id)}
-              >
-                
-                <em>{chatSessionTitle(session)}</em>
-                <small>{session.status === "streaming" ? t("profile.running") : isOpen ? t("profile.open") : ""}</small>
-              </button>
+              <div class="profile-context-menu-session-row" key={session.id}>
+                <label
+                  class="profile-context-menu-session-check"
+                  aria-label={t("chat.sessionSelect", { title: chatSessionTitle(session) })}
+                >
+                  <input
+                    type="checkbox"
+                    checked={selectedSessionIds.includes(session.id)}
+                    onChange={() => toggleSessionSelection(session.id)}
+                  />
+                </label>
+                <button
+                  type="button"
+                  class="profile-context-menu-session-open"
+                  role="menuitem"
+                  aria-label={t("sidebar.menu.openSessionNamed", { title: chatSessionTitle(session) })}
+                  onClick={() => onOpenSession(session.id)}
+                >
+                  <em>{chatSessionTitle(session)}</em>
+                  <small>{session.status === "streaming" ? t("profile.running") : isOpen ? t("profile.open") : ""}</small>
+                </button>
+              </div>
             );
           })}
           {hiddenCount > 0 && (
@@ -244,9 +311,48 @@ export function ProfileContextMenu({
           )}
         </div>
       )}
-      <button type="button" role="menuitem" onClick={onClose}>
-        {t("common.close")}
-      </button>
-    </div>
+        {profileSessions.length > 0 && (
+          <>
+            <div class="profile-context-menu-divider" role="separator" />
+            <div class="profile-context-menu-delete-actions" role="group" aria-label={t("chat.sessionsDeleteTitle")}>
+              <button
+                type="button"
+                class="profile-context-menu-danger"
+                disabled={selectedSessions.length === 0}
+                onClick={() => setDeleteRequest({ sessions: selectedSessions, all: false })}
+              >
+                {t("chat.sessionsDeleteSelected", { count: selectedSessions.length })}
+              </button>
+              <button
+                type="button"
+                class="profile-context-menu-danger"
+                disabled={deleteAllLoading}
+                onClick={() => void requestDeleteAll()}
+              >
+                {deleteAllLoading
+                  ? t("chat.sessionsLoadingAll")
+                  : t("chat.sessionsDeleteAll", { count: profileSessions.length })}
+              </button>
+            </div>
+            {deleteAllLoadFailed && (
+              <p class="profile-context-menu-delete-error" role="alert">{t("chat.sessionsLoadFailed")}</p>
+            )}
+          </>
+        )}
+        <button type="button" role="menuitem" onClick={onClose}>
+          {t("common.close")}
+        </button>
+      </div>
+      {deleteRequest && (
+        <SessionsDeleteDialog
+          sessions={deleteRequest.sessions}
+          {...(deleteRequest.all ? { deleteAllProfileId: menu.profileId } : {})}
+          onClose={() => {
+            setDeleteRequest(null);
+            onClose();
+          }}
+        />
+      )}
+    </>
   );
 }

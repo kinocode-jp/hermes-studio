@@ -1,5 +1,6 @@
 import type { ChatSession, WorkTask } from "./domain";
 import { t } from "./i18n";
+import { isChatPromptWithinBudget } from "@hermes-studio/protocol";
 
 /** Soft cap for the auto seed prompt (user message). */
 export const CARD_SEED_MAX_CHARS = 6_000;
@@ -34,6 +35,18 @@ export function buildCardAskSeedPrompt(task: CardAskSeedInput): string {
   return `${text.slice(0, CARD_SEED_MAX_CHARS - 1)}…`;
 }
 
+/** Add one-shot card context and validate the exact prompt sent over chat RPC. */
+export function buildCardSeededUserPrompt(
+  cardContext: string,
+  userPrompt: string,
+): string | { error: "payload-too-large" } {
+  const outbound = `${cardContext}
+
+--- ${t("kanban.askSeed.userQuestion")} ---
+${userPrompt}`;
+  return isChatPromptWithinBudget(outbound) ? outbound : { error: "payload-too-large" };
+}
+
 export function findCardAskSession(
   allSessions: readonly ChatSession[],
   cardId: string,
@@ -47,8 +60,9 @@ export function findCardAskSession(
 export function sessionNeedsCardSeed(session: ChatSession): boolean {
   return Boolean(session.sourceCardId)
     && session.sourceCardSeeded !== true
-    && (session.messages?.length ?? 0) === 0
-    && (session.operationEvidence?.length ?? 0) === 0;
+    // Local slash output is a tool message but is not a user-authored turn and
+    // must not consume the card context before the first real question.
+    && !session.messages.some((message) => message.from === "user" || message.from === "agent");
 }
 
 export function cardAskSeedInputFromTask(task: WorkTask & { assigneeId: string }): CardAskSeedInput {

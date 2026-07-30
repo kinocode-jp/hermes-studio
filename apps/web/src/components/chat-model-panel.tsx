@@ -18,25 +18,25 @@ import {
   fetchLiveChatModels,
   isManualChatModelProvider,
   modelSelectValue,
-  modelSlashCommand,
   needsManualModelEntry,
   providerSelectValue,
   renameChatModelPreset,
   resolvedCreateModelPrefs,
   resolvedReasoningEffortForCreate,
+  reconcileReasoningEffortValue,
   sanitizeReasoningEffort,
   selectChatModelPreset,
-  setChatModelReasoningEffort,
   setChatModelSelection,
   setChatModelSubReasoningEffort,
   setChatModelSubSelection,
   type LiveChatModelOption,
   type LiveChatProviderOption,
 } from "../chat-model-prefs";
-import { applySessionModelPrefs, sendMessage } from "../store";
+import { cancelSessionModelChange, stageSessionModelChange } from "../store";
 import { InfoTip } from "./info-tip";
 
 type ModelsState = "idle" | "loading" | "ready" | "error";
+type MainSelection = { provider: string; model: string };
 
 const EFFORT_LABEL_KEYS: Record<string, TranslationKey> = {
   none: "chat.model.reasoning.none",
@@ -52,36 +52,75 @@ const EFFORT_LABEL_KEYS: Record<string, TranslationKey> = {
 export function ChatModelPanel({
   profileId,
   sessionId,
+  sessionProvider,
+  sessionModel,
+  sessionReasoningEffort,
+  initialProvider,
   canSend,
   onClose,
-  onQueued,
+  onQueued: _onQueued,
 }: {
   profileId: string;
   sessionId: string;
+  sessionProvider?: string | undefined;
+  sessionModel?: string | undefined;
+  sessionReasoningEffort?: string | undefined;
+  initialProvider?: string | undefined;
   canSend: boolean;
   onClose: () => void;
   onQueued: () => void;
 }) {
-  const [customModel, setCustomModel] = useState(chatModelName.value);
+  const providerWasPreselected = initialProvider !== undefined && initialProvider !== (sessionProvider ?? "");
+  const [mainProvider, setMainProvider] = useState(initialProvider ?? sessionProvider ?? "");
+  const [mainModel, setMainModel] = useState(providerWasPreselected ? "" : sessionModel ?? "");
+  const [mainReasoningEffort, setMainReasoningEffort] = useState(sessionReasoningEffort ?? "");
+  const [customModel, setCustomModel] = useState(providerWasPreselected ? "" : sessionModel ?? "");
   const [customSubModel, setCustomSubModel] = useState(chatModelSubName.value);
   const [presetNameDraft, setPresetNameDraft] = useState("");
   const [presetNote, setPresetNote] = useState<string | undefined>(undefined);
   const [liveProviders, setLiveProviders] = useState<LiveChatProviderOption[]>([]);
   const [liveModels, setLiveModels] = useState<LiveChatModelOption[]>([]);
   const [catalogProvider, setCatalogProvider] = useState("");
+  const [defaultProvider, setDefaultProvider] = useState("");
+  const [defaultModel, setDefaultModel] = useState("");
   const [modelsState, setModelsState] = useState<ModelsState>("idle");
   const [modelsError, setModelsError] = useState<string | undefined>(undefined);
   const generationRef = useRef(0);
+  const panelRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
-    const preferred = chatModelProvider.value;
+    const closeOnOutsidePointer = (event: PointerEvent) => {
+      const target = event.target instanceof Element ? event.target : null;
+      if (!target || panelRef.current?.contains(target)) return;
+      // InfoTip bubbles are portaled to document.body, but still belong to
+      // this panel from the user's point of view.
+      if (target.closest(".info-tip__bubble")) return;
+      onClose();
+    };
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") onClose();
+    };
+    window.addEventListener("pointerdown", closeOnOutsidePointer, true);
+    window.addEventListener("keydown", closeOnEscape);
+    return () => {
+      window.removeEventListener("pointerdown", closeOnOutsidePointer, true);
+      window.removeEventListener("keydown", closeOnEscape);
+    };
+  }, [onClose]);
+
+  useEffect(() => {
+    const preferred = mainProvider;
     const scope = preferred && !isManualChatModelProvider(preferred) ? preferred : undefined;
     // Prefer soft-cached catalog; Hermes refresh is reserved for explicit reload.
     void loadCatalog(scope, false);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [profileId]);
 
-  async function loadCatalog(providerScope?: string, forceRefresh = false): Promise<void> {
+  async function loadCatalog(
+    providerScope?: string,
+    forceRefresh = false,
+    selection: MainSelection = { provider: mainProvider, model: mainModel },
+  ): Promise<void> {
     const generation = ++generationRef.current;
     setModelsState("loading");
     setModelsError(undefined);
@@ -91,9 +130,13 @@ export function ChatModelPanel({
       setLiveProviders(catalog.providers);
       setLiveModels(catalog.models);
       setCatalogProvider(catalog.provider);
+      setDefaultProvider(catalog.defaultProvider);
+      setDefaultModel(catalog.defaultModel);
       setModelsState("ready");
-      const prefProvider = chatModelProvider.value;
-      const prefModel = chatModelName.value;
+      // Callers that just changed provider/model pass the intended selection;
+      // state setters do not update the closure that initiated this request.
+      const prefProvider = selection.provider;
+      const prefModel = selection.model;
       if (prefProvider && !isManualChatModelProvider(prefProvider)) {
         const missingProvider = catalog.providers.length === 0
           || !catalog.providers.some((item) => item.id === prefProvider);
@@ -106,12 +149,14 @@ export function ChatModelPanel({
         }
       }
       // Drop stored effort when the live model does not publish that level.
-      reconcileReasoningEffort(catalog.models, prefProvider, prefModel, "main");
-      reconcileReasoningEffort(
+      setMainReasoningEffort((current) => reconcileReasoningEffortValue(
+        current,
+        reasoningEffortsFor(catalog.models, prefProvider, prefModel, "ready"),
+      ));
+      reconcileSubReasoningEffort(
         catalog.models,
         chatModelSubProvider.value,
         chatModelSubName.value,
-        "sub",
       );
     } catch (error) {
       if (generation !== generationRef.current) return;
@@ -121,37 +166,37 @@ export function ChatModelPanel({
       setModelsState("error");
       setModelsError(catalogErrorMessage(error));
       // Fail closed: never send a stale effort without live capability.
-      setChatModelReasoningEffort("");
+      setMainReasoningEffort("");
       setChatModelSubReasoningEffort("");
     }
   }
 
   const noLiveProviders = modelsState === "ready" && liveProviders.length === 0;
-  const retainedProvider = chatModelProvider.value;
+  const retainedProvider = mainProvider;
   const providerInLiveList = liveProviders.some((item) => item.id === retainedProvider);
   const showModelSelect = !isManualChatModelProvider(retainedProvider)
     && retainedProvider !== ""
     && providerInLiveList;
   const emptyLiveModels = modelsState === "ready" && showModelSelect && liveModels.length === 0;
-  const showManual = needsManualModelEntry(retainedProvider, chatModelName.value, liveProviders, liveModels)
+  const showManual = needsManualModelEntry(retainedProvider, mainModel, liveProviders, liveModels)
     || isManualChatModelProvider(retainedProvider)
     || emptyLiveModels
     || noLiveProviders
     || (retainedProvider !== "" && !isManualChatModelProvider(retainedProvider) && !providerInLiveList);
   const selectedEfforts = reasoningEffortsFor(
     liveModels,
-    chatModelProvider.value,
-    chatModelName.value,
+    mainProvider,
+    mainModel,
     modelsState,
   );
   const showReasoning = selectedEfforts !== undefined && selectedEfforts.length > 0;
-  const effortValue = sanitizeReasoningEffort(chatModelReasoningEffort.value, selectedEfforts);
+  const effortValue = sanitizeReasoningEffort(mainReasoningEffort, selectedEfforts);
 
   const retainedSubProvider = chatModelSubProvider.value;
   const subProviderInLiveList = liveProviders.some((item) => item.id === retainedSubProvider);
   // Catalog models are scoped to the last main/provider load — only reuse them when sub matches.
   const subCatalogMatches = retainedSubProvider !== ""
-    && (retainedSubProvider === catalogProvider || retainedSubProvider === chatModelProvider.value);
+    && (retainedSubProvider === catalogProvider || retainedSubProvider === mainProvider);
   const showSubModelSelect = !isManualChatModelProvider(retainedSubProvider)
     && retainedSubProvider !== ""
     && subProviderInLiveList
@@ -183,17 +228,22 @@ export function ChatModelPanel({
   function applyMainToSession(provider: string, model: string, effort: string): void {
     const efforts = reasoningEffortsFor(liveModels, provider, model, modelsState);
     const createPrefs = resolvedCreateModelPrefs({ provider, model, reasoningEffort: effort }, efforts);
-    applySessionModelPrefs(sessionId, createPrefs.provider, createPrefs.model, createPrefs.reasoningEffort);
-    const command = modelSlashCommand({ provider, model, reasoningEffort: createPrefs.reasoningEffort });
-    if (command && canSend) sendMessage(sessionId, command);
-    else if (command && !canSend) onQueued();
+    // Deferred apply: the /model command is sent with the next outbound prompt.
+    stageSessionModelChange(sessionId, createPrefs.provider, createPrefs.model, createPrefs.reasoningEffort);
   }
 
   function apply(): void {
     if (modelsState === "loading") return;
-    let provider = chatModelProvider.value;
-    let model = chatModelName.value;
+    let provider = mainProvider;
+    let model = mainModel;
     const freeformModel = customModel.trim();
+    if (!provider && !model && !freeformModel) {
+      setChatModelSelection("", "", "");
+      if (defaultModel) applyMainToSession(defaultProvider, defaultModel, "");
+      else cancelSessionModelChange(sessionId);
+      onClose();
+      return;
+    }
     const explicitManual = isManualChatModelProvider(provider);
     const keepRealProvider = provider !== "" && !explicitManual;
     const useFreeformModel = explicitManual
@@ -213,7 +263,7 @@ export function ChatModelPanel({
     const efforts = reasoningEffortsFor(liveModels, provider, model, modelsState);
     // Fail-closed send gate: only a non-empty live enum can produce a real effort value.
     const effort = resolvedReasoningEffortForCreate(
-      { provider, model, reasoningEffort: chatModelReasoningEffort.value },
+      { provider, model, reasoningEffort: mainReasoningEffort },
       efforts,
     ) ?? "";
     setChatModelSelection(provider, model, effort);
@@ -261,15 +311,19 @@ export function ChatModelPanel({
       model: chatModelName.value,
       reasoningEffort: chatModelReasoningEffort.value,
     };
+    setMainProvider(main.provider);
+    setMainModel(main.model);
+    setMainReasoningEffort(main.reasoningEffort);
     applyMainToSession(main.provider, main.model, main.reasoningEffort);
     const preferred = chatModelProvider.value;
     if (preferred && !isManualChatModelProvider(preferred)) {
-      void loadCatalog(preferred);
+      void loadCatalog(preferred, false, { provider: main.provider, model: main.model });
     }
   }
 
   function onCreatePreset(): void {
     setPresetNote(undefined);
+    setChatModelSelection(mainProvider, mainModel, mainReasoningEffort);
     const created = createChatModelPreset(presetNameDraft);
     if (!created) {
       setPresetNote(t("chat.modelPreset.nameRequired"));
@@ -298,7 +352,7 @@ export function ChatModelPanel({
   }
 
   return (
-    <div class="composer-model-panel">
+    <div ref={panelRef} class="composer-model-panel">
       <section class="composer-model-section">
         <div class="composer-model-section-head">
           <span class="composer-model-section-label">{t("chat.modelPreset.label")}</span>
@@ -356,25 +410,31 @@ export function ChatModelPanel({
         <label>
           <span>{t("chat.provider.label")}</span>
           <select
-            value={providerSelectValue(chatModelProvider.value, liveProviders)}
+            value={providerSelectValue(mainProvider, liveProviders)}
             disabled={modelsState === "loading"}
             onChange={(event) => {
               const value = event.currentTarget.value;
               if (value === "default") {
-                setChatModelSelection("", "", "");
+                setMainProvider("");
+                setMainModel("");
+                setMainReasoningEffort("");
                 setCustomModel("");
-                void loadCatalog();
+                void loadCatalog(undefined, false, { provider: "", model: "" });
                 return;
               }
               if (value === CHAT_MODEL_MANUAL_PROVIDER) {
-                const freeform = customModel || chatModelName.value;
-                setChatModelSelection(CHAT_MODEL_MANUAL_PROVIDER, freeform, "");
+                const freeform = customModel || mainModel;
+                setMainProvider(CHAT_MODEL_MANUAL_PROVIDER);
+                setMainModel(freeform);
+                setMainReasoningEffort("");
                 setCustomModel(freeform);
                 return;
               }
-              setChatModelSelection(value, "", "");
+              setMainProvider(value);
+              setMainModel("");
+              setMainReasoningEffort("");
               setCustomModel("");
-              void loadCatalog(value);
+              void loadCatalog(value, false, { provider: value, model: "" });
             }}
           >
             <option value="default">{t(CHAT_MODEL_FIXED_OPTIONS[0].labelKey)}</option>
@@ -395,18 +455,21 @@ export function ChatModelPanel({
           <label>
             <span>{t("chat.model.label")}</span>
             <select
-              value={modelSelectValue(chatModelName.value, liveModels)}
+              value={modelSelectValue(mainModel, liveModels)}
               disabled={modelsState === "loading" || modelsState === "error"}
               onChange={(event) => {
                 const value = event.currentTarget.value;
                 if (!value) {
-                  setCustomModel(chatModelName.value);
-                  setChatModelReasoningEffort("");
+                  setCustomModel(mainModel);
+                  setMainReasoningEffort("");
                   return;
                 }
-                setChatModelSelection(chatModelProvider.value, value);
+                setMainModel(value);
                 setCustomModel(value);
-                reconcileReasoningEffort(liveModels, chatModelProvider.value, value, "main");
+                setMainReasoningEffort((current) => reconcileReasoningEffortValue(
+                  current,
+                  reasoningEffortsFor(liveModels, mainProvider, value, "ready"),
+                ));
               }}
             >
               <option value="">{modelsState === "loading" ? t("chat.model.loading") : t("chat.model.pick")}</option>
@@ -423,7 +486,7 @@ export function ChatModelPanel({
               value={effortValue}
               disabled={modelsState === "loading"}
               onChange={(event) => {
-                setChatModelReasoningEffort(event.currentTarget.value, selectedEfforts);
+                setMainReasoningEffort(sanitizeReasoningEffort(event.currentTarget.value, selectedEfforts));
               }}
             >
               <option value="">{t("chat.model.reasoning.default")}</option>
@@ -446,12 +509,15 @@ export function ChatModelPanel({
               onInput={(event) => {
                 const value = event.currentTarget.value;
                 setCustomModel(value);
-                const provider = chatModelProvider.value;
+                const provider = mainProvider;
                 if (provider && !isManualChatModelProvider(provider)) {
-                  setChatModelSelection(provider, value, "");
+                  setMainModel(value);
+                  setMainReasoningEffort("");
                   return;
                 }
-                setChatModelSelection(CHAT_MODEL_MANUAL_PROVIDER, value, "");
+                setMainProvider(CHAT_MODEL_MANUAL_PROVIDER);
+                setMainModel(value);
+                setMainReasoningEffort("");
               }}
             />
           </label>
@@ -514,7 +580,7 @@ export function ChatModelPanel({
                 }
                 setChatModelSubSelection(chatModelSubProvider.value, value);
                 setCustomSubModel(value);
-                reconcileReasoningEffort(liveModels, chatModelSubProvider.value, value, "sub");
+                reconcileSubReasoningEffort(liveModels, chatModelSubProvider.value, value);
               }}
             >
               <option value="">{modelsState === "loading" ? t("chat.model.loading") : t("chat.model.pick")}</option>
@@ -583,25 +649,14 @@ export function ChatModelPanel({
           class="secondary-button"
           disabled={modelsState === "loading"}
           onClick={() => {
-            const preferred = chatModelProvider.value;
+            const preferred = mainProvider;
             const scope = preferred && !isManualChatModelProvider(preferred) ? preferred : undefined;
             void loadCatalog(scope, true);
           }}
         >
           {t("chat.model.refresh")}
         </button>
-        <button
-          type="button"
-          disabled={modelsState === "loading"}
-          onClick={() => {
-            const preferred = chatModelProvider.value;
-            const scope = preferred && !isManualChatModelProvider(preferred)
-              ? preferred
-              : catalogProvider || undefined;
-            void loadCatalog(scope);
-          }}
-        >{t("chat.model.refresh")}</button>
-        <button type="button" disabled={modelsState === "loading"} onClick={apply}>{t("chat.model.apply")}</button>
+        <button type="button" disabled={modelsState === "loading" || !canSend} onClick={apply}>{t("chat.model.apply")}</button>
       </div>
     </div>
   );
@@ -620,19 +675,14 @@ function reasoningEffortsFor(
   return efforts && efforts.length > 0 ? efforts : undefined;
 }
 
-function reconcileReasoningEffort(
+function reconcileSubReasoningEffort(
   models: readonly LiveChatModelOption[],
   provider: string,
   model: string,
-  slot: "main" | "sub",
 ): void {
   const efforts = reasoningEffortsFor(models, provider, model, "ready");
   // undefined enum → pass [] so sanitize fail-closes and clears stale effort.
-  if (slot === "main") {
-    setChatModelReasoningEffort(chatModelReasoningEffort.value, efforts ?? []);
-  } else {
-    setChatModelSubReasoningEffort(chatModelSubReasoningEffort.value, efforts ?? []);
-  }
+  setChatModelSubReasoningEffort(chatModelSubReasoningEffort.value, efforts ?? []);
 }
 
 function catalogErrorMessage(error: unknown): string {

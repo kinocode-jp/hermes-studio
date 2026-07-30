@@ -13,6 +13,8 @@ export type SidebarMode = "cards" | "rows";
 type SidebarPreferences = {
   width: number;
   mode: SidebarMode;
+  tasksOpen: boolean;
+  teamsOpen: boolean;
   profilesOpen: boolean;
   openProfileIds: string[];
 };
@@ -21,6 +23,8 @@ const initial = readPreferences();
 
 export const sidebarWidth = signal(initial.width);
 export const sidebarMode = signal<SidebarMode>(initial.mode);
+export const sidebarTasksOpen = signal(initial.tasksOpen);
+export const sidebarTeamsOpen = signal(initial.teamsOpen);
 export const sidebarProfilesOpen = signal(initial.profilesOpen);
 export const sidebarOpenProfileIds = signal<string[]>(initial.openProfileIds);
 
@@ -35,6 +39,16 @@ export function setSidebarWidth(width: number): void {
 
 export function setSidebarMode(mode: SidebarMode): void {
   sidebarMode.value = mode;
+  persistPreferences();
+}
+
+export function setSidebarTasksOpen(open: boolean): void {
+  sidebarTasksOpen.value = open;
+  persistPreferences();
+}
+
+export function setSidebarTeamsOpen(open: boolean): void {
+  sidebarTeamsOpen.value = open;
   persistPreferences();
 }
 
@@ -76,6 +90,8 @@ function readPreferences(): SidebarPreferences {
   const fallback: SidebarPreferences = {
     width: SIDEBAR_DEFAULT_WIDTH,
     mode: "cards",
+    tasksOpen: true,
+    teamsOpen: true,
     // On phones the profile sheet overlays the whole screen, so it starts closed.
     profilesOpen: !isPhoneViewport(),
     openProfileIds: [],
@@ -86,6 +102,8 @@ function readPreferences(): SidebarPreferences {
     return {
       width: clampSidebarWidth(typeof parsed?.width === "number" ? parsed.width : fallback.width),
       mode: parsed?.mode === "rows" ? "rows" : fallback.mode,
+      tasksOpen: typeof parsed?.tasksOpen === "boolean" ? parsed.tasksOpen : fallback.tasksOpen,
+      teamsOpen: typeof parsed?.teamsOpen === "boolean" ? parsed.teamsOpen : fallback.teamsOpen,
       profilesOpen: typeof parsed?.profilesOpen === "boolean" ? parsed.profilesOpen : fallback.profilesOpen,
       openProfileIds: Array.isArray(parsed?.openProfileIds)
         ? parsed.openProfileIds.filter((id): id is string => typeof id === "string" && id.trim().length > 0)
@@ -102,6 +120,8 @@ function persistPreferences(): void {
     localStorage.setItem(STORAGE_KEY, JSON.stringify({
       width: sidebarWidth.value,
       mode: sidebarMode.value,
+      tasksOpen: sidebarTasksOpen.value,
+      teamsOpen: sidebarTeamsOpen.value,
       profilesOpen: sidebarProfilesOpen.value,
       openProfileIds: sidebarOpenProfileIds.value,
     } satisfies SidebarPreferences));

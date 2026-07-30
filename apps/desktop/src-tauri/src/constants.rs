@@ -13,7 +13,6 @@ pub(crate) const OWNED_SERVER_TRANSIENT_FAILURE_LIMIT: u8 = 3;
 pub(crate) const HTTP_READ_SLICE: Duration = Duration::from_millis(250);
 pub(crate) const CHILD_POLL_INTERVAL: Duration = Duration::from_millis(20);
 pub(crate) const MAX_VERSION_OUTPUT: u64 = 4096;
-pub(crate) const MAX_HTTP_HEADERS: usize = 8192;
 pub(crate) const MAX_HEALTH_RESPONSE: u64 = 4096;
 pub(crate) const MAX_WEB_UI_RESPONSE: usize = 128 * 1024;
 // Compatibility proof domain shared with the server HMAC. Do not rename without

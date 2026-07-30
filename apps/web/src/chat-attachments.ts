@@ -1,3 +1,5 @@
+import { isChatPromptWithinBudget } from "@hermes-studio/protocol";
+
 export type ChatAttachment = {
   id: string;
   name: string;
@@ -9,10 +11,11 @@ export type ChatAttachment = {
   textContent?: string;
 };
 
-const MAX_IMAGE_BYTES = 350_000;
+// Base64 expands raw image data by roughly 4/3. Keep enough room for the data
+// URL and Markdown envelope inside the shared Hermes prompt budget.
+const MAX_IMAGE_BYTES = 390_000;
 const MAX_TEXT_BYTES = 60_000;
 const MAX_ATTACHMENTS = 4;
-const MAX_TOTAL_INLINE_BYTES = 700_000;
 
 const IMAGE_EXTENSIONS = /\.(png|jpe?g|gif|webp|bmp|svg)$/i;
 
@@ -38,8 +41,9 @@ export async function fileToAttachment(file: File): Promise<ChatAttachment | { e
   const mime = file.type || "";
   if (isImageMime(mime, file.name)) {
     if (file.size > MAX_IMAGE_BYTES) return { error: "image-too-large" };
-    const dataUrl = await readAsDataUrl(file);
-    return { id, name: file.name, mime: mime.startsWith("image/") ? mime : "image/*", size: file.size, kind: "image", dataUrl };
+    const imageMime = imageMimeForFile(mime, file.name);
+    const dataUrl = normalizeImageDataUrl(await readAsDataUrl(file), imageMime);
+    return { id, name: file.name, mime: imageMime, size: file.size, kind: "image", dataUrl };
   }
   if (isTextMime(mime, file.name)) {
     if (file.size > MAX_TEXT_BYTES) return { error: "text-too-large" };
@@ -64,24 +68,23 @@ export function appendAttachments(
 
 export function buildPromptWithAttachments(text: string, attachments: readonly ChatAttachment[]): string | { error: "payload-too-large" } {
   const body = text.trim();
-  if (attachments.length === 0) return body;
+  if (attachments.length === 0) {
+    return isChatPromptWithinBudget(body) ? body : { error: "payload-too-large" };
+  }
   const blocks: string[] = [];
   if (body) blocks.push(body);
-  let inlineBytes = body.length;
   for (const item of attachments) {
     if (item.kind === "image" && item.dataUrl) {
-      inlineBytes += item.dataUrl.length;
-      if (inlineBytes > MAX_TOTAL_INLINE_BYTES) return { error: "payload-too-large" };
       blocks.push(`Attached image: ${item.name}\n![${item.name}](${item.dataUrl})`);
+      if (!isChatPromptWithinBudget(blocks.join("\n\n"))) return { error: "payload-too-large" };
       continue;
     }
     if (item.textContent !== undefined) {
-      inlineBytes += item.textContent.length;
-      if (inlineBytes > MAX_TOTAL_INLINE_BYTES) return { error: "payload-too-large" };
       const fence = uniqueFence(item.textContent);
       const lang = item.name.endsWith(".md") ? "markdown" : extensionLanguage(item.name);
       // CommonMark: opening fence, optional info string, newline, content, closing fence.
       blocks.push(`Attached file: ${item.name}\n${fence}${lang}\n${item.textContent}\n${fence}`);
+      if (!isChatPromptWithinBudget(blocks.join("\n\n"))) return { error: "payload-too-large" };
       continue;
     }
     blocks.push(`Attached file: ${item.name} (${item.mime}, ${formatBytes(item.size)}). Content could not be inlined.`);
@@ -92,14 +95,38 @@ export function buildPromptWithAttachments(text: string, attachments: readonly C
 /** Operation evidence should not store multi-MB data URLs. */
 export function summarizePromptForEvidence(text: string): string {
   return text
-    .replace(/!\[[^\]]*]\(data:image\/[a-zA-Z0-9.+-]+;base64,[A-Za-z0-9+/=\s]+\)/g, "![image](data:…)")
+    .replace(/data:[^,\s)]*;base64,[A-Za-z0-9+/=]+/gi, "data:…")
     .slice(0, 4_000);
 }
 
+export function imageMimeForFile(mime: string, name: string): string {
+  if (mime.startsWith("image/")) return mime;
+  const extension = /\.([a-z0-9]+)$/i.exec(name)?.[1]?.toLowerCase();
+  if (extension === "png") return "image/png";
+  if (extension === "jpg" || extension === "jpeg") return "image/jpeg";
+  if (extension === "gif") return "image/gif";
+  if (extension === "webp") return "image/webp";
+  if (extension === "bmp") return "image/bmp";
+  if (extension === "svg") return "image/svg+xml";
+  return "image/*";
+}
+
+export function normalizeImageDataUrl(dataUrl: string, mime: string): string {
+  return dataUrl.replace(/^data:[^;,]*;base64,/i, `data:${mime};base64,`);
+}
+
 function uniqueFence(content: string): string {
-  let fence = "```";
-  while (content.includes(fence)) fence += "`";
-  return fence;
+  let longestRun = 0;
+  let currentRun = 0;
+  for (let index = 0; index < content.length; index += 1) {
+    if (content.charCodeAt(index) === 0x60) {
+      currentRun += 1;
+      if (currentRun > longestRun) longestRun = currentRun;
+    } else {
+      currentRun = 0;
+    }
+  }
+  return "`".repeat(Math.max(3, longestRun + 1));
 }
 
 function extensionLanguage(name: string): string {

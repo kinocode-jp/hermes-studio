@@ -1,8 +1,9 @@
 import { useMemo, useState } from "preact/hooks";
 import { t } from "../i18n";
 import { profileDisplayName, profileSecondaryName } from "../profile-names";
-import { createHermesProfile, deleteHermesProfile, isValidProfileName } from "../profiles-api";
+import { createHermesProfile, deleteHermesProfile, isValidProfileName, ProfileCreateCommitUnconfirmedError } from "../profiles-api";
 import { requestInventorySnapshotRefresh } from "../inventory";
+import { invalidateSettingsPrefetch } from "../settings-prefetch";
 import { officeConnection, openProfileSettingsModal, profileList, selectProfile } from "../store";
 import { createProfileSession } from "./profile-panel";
 import { CharacterPortrait } from "./character-portrait";
@@ -43,11 +44,23 @@ export function ProfilesPanel() {
     setError(null);
     try {
       await createHermesProfile(name);
+      invalidateSettingsPrefetch(name);
       setDraftName("");
       setCreateOpen(false);
       await requestInventorySnapshotRefresh();
-    } catch {
-      setError(t("profilesPanel.createFailed"));
+    } catch (error) {
+      if (error instanceof ProfileCreateCommitUnconfirmedError) {
+        invalidateSettingsPrefetch(name);
+        await requestInventorySnapshotRefresh();
+        if (profileList.value.some((profile) => profile.id === name)) {
+          setDraftName("");
+          setCreateOpen(false);
+        } else {
+          setError(t("profilesPanel.createFailed"));
+        }
+      } else {
+        setError(t("profilesPanel.createFailed"));
+      }
     } finally {
       setBusy(null);
     }
@@ -60,6 +73,7 @@ export function ProfilesPanel() {
     setError(null);
     try {
       await deleteHermesProfile(profileId);
+      invalidateSettingsPrefetch(profileId);
       await requestInventorySnapshotRefresh();
     } catch {
       setError(t("profilesPanel.deleteFailed", { name: profileId }));

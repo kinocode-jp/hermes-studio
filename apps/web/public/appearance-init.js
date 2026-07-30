@@ -1,7 +1,7 @@
 (() => {
   // Bump when shipping UI that must not stick behind a stale service-worker precache.
   // First visit after a bump unregisters SW caches and reloads once.
-  const CLIENT_BUILD = "2026-07-22-login-webgl-v2";
+  const CLIENT_BUILD = "2026-07-27-desktop-cache-reset-v1";
   try {
     const key = "hermes-studio:client-build";
     const previous = localStorage.getItem(key) ?? localStorage.getItem("hermes-office:client-build");

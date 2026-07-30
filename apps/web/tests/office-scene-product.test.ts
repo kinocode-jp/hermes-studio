@@ -55,13 +55,15 @@ test("scene scaling and mobile fallback preserve accessible click targets", asyn
   assert.match(styles, /\.office-stage \{[^}]*overflow: auto/);
   assert.match(styles, /\.office-world-frame \{[^}]*min-width: 100%[^}]*min-height: 100%/);
   assert.match(styles, /\.ow-char \{[^}]*min-width: 84px[^}]*min-height: 84px/);
-  assert.match(styles, /\.office-row \{[^}]*min-height: max\(62px, var\(--target-mobile\)\)/);
+  assert.match(styles, /\.office-row \{[^}]*min-height: (?:max\(68px, var\(--target-mobile\)\)|68px)/);
   // Mobile must honor scene/list selection (no forced list-only fallback) and keep 44px toggles.
-  assert.doesNotMatch(styles, /@media \(max-width: 767px\)[\s\S]*\.office-seg--view,\s*\.office-seg--scene \{ display: none/);
-  assert.doesNotMatch(styles, /@media \(max-width: 767px\)[\s\S]*\.office-wrap\[data-view="scene"\] \.office-stage \{ display: none/);
-  assert.doesNotMatch(styles, /@media \(max-width: 767px\)[\s\S]*\.office-wrap\[data-view="scene"\] \.office-list \{ display: grid/);
-  assert.match(styles, /@media \(max-width: 767px\)[\s\S]*\.office-wrap\[data-view="scene"\] \.office-stage \{[\s\S]*min-height: clamp\(/);
-  assert.match(styles, /@media \(max-width: 767px\)[\s\S]*\.office-seg button \{[\s\S]*min-height: max\(44px/);
+  const phoneStyles = styles.match(/@media \(max-width: 768px\) \{([\s\S]*?)\n\}\n\n@media \(prefers-reduced-motion/di)?.[1] ?? "";
+  assert.ok(phoneStyles, "phone scene rules must exist at the shared 768px breakpoint");
+  assert.doesNotMatch(phoneStyles, /\.office-seg--view,\s*\.office-seg--scene \{ display: none/);
+  assert.doesNotMatch(phoneStyles, /\.office-wrap\[data-view="scene"\] \.office-stage \{ display: none/);
+  assert.doesNotMatch(phoneStyles, /\.office-wrap\[data-view="scene"\] \.office-list \{ display: grid/);
+  assert.match(phoneStyles, /\.office-wrap\[data-view="scene"\] \.office-stage \{[\s\S]*min-height: clamp\(/);
+  assert.match(phoneStyles, /\.office-seg button \{[\s\S]*min-height: max\(44px/);
   assert.match(source, /const effectiveView: OfficeView = groupMode === "teams" \? "list" : officeView\.value/);
   assert.match(source, /effectiveView === "scene" && \(/);
   assert.match(source, /effectiveView === "list" && \(/, "list content only mounts in list view");

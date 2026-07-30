@@ -6,7 +6,10 @@ import {
   activeSessionId,
   clearFollowUpSuggestions,
   closeSession,
+  cancelSessionModelChange,
   consumeCardSeed,
+  consumeChatComposerPrefill,
+  pendingCardSeedForPrompt,
   interruptSession,
   officeSnapshot,
   openSession,
@@ -15,9 +18,11 @@ import {
   respondToClarification,
   sendMessage,
   steerSession,
+  profileList,
 } from "../store";
 import { canSteerChatSession, canSubmitChatPrompt, composerBlockedReason, isChatRunActive } from "../session-runtime";
-import { profileDisplayName } from "../profile-names";
+import { isStudioSlashCommand, slashCatalogVersion, slashSuggestionsFor } from "../slash-commands";
+import { displayProfileReferences, profileDisplayName } from "../profile-names";
 import {
   appendAttachments,
   buildPromptWithAttachments,
@@ -25,11 +30,19 @@ import {
   type ChatAttachment,
 } from "../chat-attachments";
 import {
-  activeChatModelPreset,
+  chatComposerState as sessionChatComposerState,
+  clearAcknowledgedChatComposer,
+  setChatComposerAttachments,
+  setChatComposerDraft,
+} from "../chat-composer-state";
+import {
+  chatModelPresets,
+  matchingChatModelPresetName,
 } from "../chat-model-prefs";
+import { buildCardSeededUserPrompt, sessionNeedsCardSeed } from "../kanban-ask";
 import { ChatModelPanel } from "./chat-model-panel";
 import { ComposerModelPickers } from "./composer-model-pickers";
-import { AttachIcon, CloseIcon, MenuIcon, MicIcon, SendIcon, SteerIcon, StopIcon } from "./icons";
+import { AttachIcon, CloseIcon, CopyIcon, MenuIcon, MicIcon, SendIcon, SteerIcon, StopIcon } from "./icons";
 import {
   setWorkspacePlacement,
   workspacePlacement,
@@ -41,19 +54,27 @@ export function ChatPane({
   profile,
   onClosePane,
   hideHeader = false,
+  activateWorkspaceOnPointerDown = false,
 }: {
   session: ChatSession;
   profile: Profile;
   onClosePane?: () => void;
   hideHeader?: boolean;
+  /** Only panes already owned by the workspace/dashboard may activate it. */
+  activateWorkspaceOnPointerDown?: boolean;
 }) {
-  const [draft, setDraft] = useState("");
-  const [attachments, setAttachments] = useState<ChatAttachment[]>([]);
+  const composer = sessionChatComposerState(session.id);
+  const { draft, attachments } = composer.value;
+  const setDraft = (next: string | ((current: string) => string)) => setChatComposerDraft(session.id, next);
+  const setAttachments = (next: ChatAttachment[] | ((current: ChatAttachment[]) => ChatAttachment[])) => setChatComposerAttachments(session.id, next);
   const [attachError, setAttachError] = useState<string | undefined>(undefined);
   const [modelNote, setModelNote] = useState<string | undefined>(undefined);
   const [modelOpen, setModelOpen] = useState(false);
+  const [modelProviderHint, setModelProviderHint] = useState<string | undefined>(undefined);
   const [composerMenuOpen, setComposerMenuOpen] = useState(false);
   const [voiceListening, setVoiceListening] = useState(false);
+  const [slashDismissed, setSlashDismissed] = useState(false);
+  const [slashIndex, setSlashIndex] = useState(-1);
   const voiceRecognitionRef = useRef<any>(null);
   const [announcedOperation, setAnnouncedOperation] = useState<ChatOperationEvidence | undefined>(undefined);
   const [expandedLogGroups, setExpandedLogGroups] = useState<Set<string>>(() => new Set());
@@ -73,31 +94,50 @@ export function ChatPane({
   const timeline = groupChatTimeline(buildChatTimeline(transcript, operationEvidence));
   const displayTitle = chatSessionTitle(session);
   const profileName = profileDisplayName(profile);
-  const waitingForCardQuestion = Boolean(session.sourceCardId)
-    && session.sourceCardSeeded !== true
-    && (session.messages?.length ?? 0) === 0;
+  const waitingForCardQuestion = sessionNeedsCardSeed(session);
   const composerPlaceholder = session.pendingInteraction ? t("chat.answerAbove")
     : !isConnected ? t("chat.connectingPlaceholder")
       : runActive ? t("chat.steerPlaceholder")
         : waitingForCardQuestion ? t("kanban.askSeed.placeholder")
           : t("chat.instruct", { name: profileName });
+  const slashCatalogGeneration = slashCatalogVersion();
+  const slashSuggestions = useMemo(() => {
+    if (session.remoteKind === "demo" || slashDismissed) return [];
+    return slashSuggestionsFor(draft);
+  }, [draft, session.remoteKind, slashDismissed, slashCatalogGeneration]);
+  useEffect(() => {
+    // A new prefix reopens the menu after Esc and resets the highlight.
+    setSlashDismissed(false);
+    setSlashIndex(-1);
+  }, [draft]);
+  useEffect(() => {
+    const prefill = session.composerPrefill;
+    if (!prefill) return;
+    setDraft(prefill.text);
+    consumeChatComposerPrefill(session.id, prefill.id);
+  }, [session.composerPrefill?.id, session.id]);
   const statusText = useMemo(() => {
     if (session.connectionState === "error") return t("chat.status.error");
+    if (session.connectionState === "queued") return t("chat.status.queued");
     if (session.connectionState === "connecting") return t("chat.status.connecting");
     if (session.connectionState === "disconnected" && isLiveChat) return t("chat.status.reconnecting");
     if (session.historyState === "loading") return t("chat.status.loading");
     if (session.interruptPending) return t("chat.status.stopping");
+    if (session.slashPending) return t("chat.status.running");
     if (session.pendingInteraction?.kind === "approval") return t("chat.status.approval");
     if (session.pendingInteraction?.kind === "clarify") return t("chat.status.clarify");
     if (session.status === "waiting") return t("chat.status.waiting");
     if (runActive) return t("chat.status.running");
     return t("chat.status.ready");
-  }, [isLiveChat, locale.value, runActive, session.connectionState, session.historyState, session.interruptPending, session.pendingInteraction?.kind, session.status]);
+  }, [isLiveChat, locale.value, runActive, session.connectionState, session.historyState, session.interruptPending, session.pendingInteraction?.kind, session.slashPending, session.status]);
   const suggestions = session.followUpSuggestions ?? [];
   const hasSendable = Boolean(draft.trim() || attachments.length > 0);
   const submitDisabled = (runActive ? !canSteer : !canSend) || !hasSendable;
-  const activePreset = activeChatModelPreset();
-  const presetReadout = activePreset?.name;
+  const presetReadout = matchingChatModelPresetName(chatModelPresets.value, {
+    provider: session.provider ?? "",
+    model: session.model ?? "",
+    reasoningEffort: session.reasoningEffort ?? "",
+  });
 
   useEffect(() => {
     const list = messageListRef.current;
@@ -157,7 +197,9 @@ export function ChatPane({
 
   async function submit(event: Event): Promise<void> {
     event.preventDefault();
-    const prompt = buildPromptWithAttachments(draft, attachments);
+    const submittedComposer = composer.value;
+    const submittedAttachError = attachError;
+    const prompt = buildPromptWithAttachments(submittedComposer.draft, submittedComposer.attachments);
     if (typeof prompt !== "string") {
       setAttachError(t("chat.attachError.payload-too-large"));
       return;
@@ -165,25 +207,30 @@ export function ChatPane({
     if (!prompt.trim()) return;
     if (runActive) {
       if (await steerSession(session.id, prompt)) {
-        setDraft("");
-        setAttachments([]);
-        setAttachError(undefined);
+        if (clearAcknowledgedChatComposer(session.id, submittedComposer)) {
+          setAttachError((current) => current === submittedAttachError ? undefined : current);
+        }
       }
       return;
     }
     if (!canSend) return;
     // For "Ask assignee", attach card context once to the user's first typed prompt.
-    const cardContext = consumeCardSeed(session.id);
-    const outbound = cardContext
-      ? `${cardContext}
-
---- ${t("kanban.askSeed.userQuestion")} ---
-${prompt}`
-      : prompt;
-    sendMessage(session.id, outbound);
-    setDraft("");
-    setAttachments([]);
-    setAttachError(undefined);
+    const cardContext = pendingCardSeedForPrompt(session.id);
+    // Slash commands are control-plane operations, not the first card question.
+    // Route the untouched command through sendMessage so it reaches slash.exec,
+    // and retain the one-shot card context for the first real user prompt.
+    const seededCardContext = cardContext && !isStudioSlashCommand(prompt) ? cardContext : undefined;
+    const outbound = seededCardContext ? buildCardSeededUserPrompt(seededCardContext, prompt) : prompt;
+    if (typeof outbound !== "string") {
+      setAttachError(t("chat.attachError.payload-too-large"));
+      return;
+    }
+    const sent = await sendMessage(session.id, outbound);
+    if (!sent) return;
+    if (seededCardContext) consumeCardSeed(session.id, seededCardContext);
+    if (clearAcknowledgedChatComposer(session.id, submittedComposer)) {
+      setAttachError((current) => current === submittedAttachError ? undefined : current);
+    }
     clearFollowUpSuggestions(session.id);
   }
 
@@ -268,7 +315,7 @@ ${prompt}`
       class={`chat-pane ${isActive ? "is-active" : ""} ${hideHeader ? "is-headerless" : ""}`}
       style={{ "--session-color": profile.color }}
       onPointerDown={() => {
-        if (activeSessionId.value !== session.id) openSession(session.id);
+        if (activateWorkspaceOnPointerDown && activeSessionId.value !== session.id) openSession(session.id);
       }}
     >
       {!hideHeader && (
@@ -345,45 +392,47 @@ ${prompt}`
           shouldStickToBottom.current = list.scrollHeight - list.scrollTop - list.clientHeight < 32;
         }}
       >
-        {session.errorMessage ? (
-          <div class="chat-connection-note is-error" role="alert">
-            <span>{localizeRuntimeMessage(session.errorMessage)}</span>
-            {isLiveChat && (session.connectionState === "error" || session.historyState === "error") && <button type="button" onClick={() => reconnectChatSession(session.id)}>{session.historyState === "error" ? t("chat.reload") : t("chat.reconnect")}</button>}
-          </div>
-        ) : session.connectionState === "disconnected" && isLiveChat && session.messages.length === 0 ? (
-          <div class="chat-connection-note"><span>{t("chat.recovering")}</span></div>
-        ) : null}
-        {session.historyPartial && <div class="chat-connection-note"><span>{session.historyNotice ? localizeRuntimeMessage(session.historyNotice) : t("chat.historyPartial")}</span></div>}
-        {timeline.length === 0 ? (
-          <div class="empty-chat">
-            <span>{session.historyState === "loading" ? t("chat.loadingHistory") : isLiveChat ? t("chat.hermesSession") : t("chat.newThread")}</span>
-            <p>{session.historyState === "loading" ? t("chat.loadingSaved") : !isConnected ? t("chat.connectingLive") : runActive ? t("chat.runningPlaceholder") : t("chat.firstInstruction", { name: profileName })}</p>
-          </div>
-        ) : timeline.map((item) => item.kind === "operation" ? (
-          <ChatOperationEntry key={`operation:${item.operation.id}`} operation={item.operation} />
-        ) : item.kind === "log-group" ? (
-          <ChatLogGroup
-            key={`log-group:${item.id}`}
-            group={item}
-            expanded={expandedLogGroups.has(item.id)}
-            onToggle={() => setExpandedLogGroups((current) => {
-              const next = new Set(current);
-              if (next.has(item.id)) next.delete(item.id); else next.add(item.id);
-              return next;
-            })}
-            profile={profile}
-            profileName={profileName}
-          />
-        ) : (
-          <ChatMessageEntry key={`message:${item.message.id}`} message={item.message} profile={profile} profileName={profileName} />
-        ))}
-        {session.pendingInteraction && (
-          <ChatInteraction
-            sessionId={session.id}
-            interaction={session.pendingInteraction}
-            connected={session.connectionState === "ready"}
-          />
-        )}
+        <div class="message-list-content">
+          {session.errorMessage ? (
+            <div class="chat-connection-note is-error" role="alert">
+              <span>{localizeRuntimeMessage(session.errorMessage)}</span>
+              {isLiveChat && (session.connectionState === "error" || session.historyState === "error") && <button type="button" onClick={() => reconnectChatSession(session.id)}>{session.historyState === "error" ? t("chat.reload") : t("chat.reconnect")}</button>}
+            </div>
+          ) : session.connectionState === "disconnected" && isLiveChat && session.messages.length === 0 ? (
+            <div class="chat-connection-note"><span>{t("chat.recovering")}</span></div>
+          ) : null}
+          {session.historyPartial && <div class="chat-connection-note"><span>{session.historyNotice ? localizeRuntimeMessage(session.historyNotice) : t("chat.historyPartial")}</span></div>}
+          {timeline.length === 0 ? (
+            <div class="empty-chat">
+              <span>{session.historyState === "loading" ? t("chat.loadingHistory") : isLiveChat ? t("chat.hermesSession") : t("chat.newThread")}</span>
+              <p>{session.historyState === "loading" ? t("chat.loadingSaved") : !isConnected ? t("chat.connectingLive") : runActive ? t("chat.runningPlaceholder") : t("chat.firstInstruction", { name: profileName })}</p>
+            </div>
+          ) : timeline.map((item) => item.kind === "operation" ? (
+            <ChatOperationEntry key={`operation:${item.operation.id}`} operation={item.operation} />
+          ) : item.kind === "log-group" ? (
+            <ChatLogGroup
+              key={`log-group:${item.id}`}
+              group={item}
+              expanded={expandedLogGroups.has(item.id)}
+              onToggle={() => setExpandedLogGroups((current) => {
+                const next = new Set(current);
+                if (next.has(item.id)) next.delete(item.id); else next.add(item.id);
+                return next;
+              })}
+              profile={profile}
+              profileName={profileName}
+            />
+          ) : (
+            <ChatMessageEntry key={`message:${item.message.id}`} message={item.message} profile={profile} profileName={profileName} />
+          ))}
+          {session.pendingInteraction && (
+            <ChatInteraction
+              sessionId={session.id}
+              interaction={session.pendingInteraction}
+              connected={session.connectionState === "ready"}
+            />
+          )}
+        </div>
       </div>
       <span
         class="visually-hidden"
@@ -468,15 +517,29 @@ ${prompt}`
             sessionId={session.id}
             sessionProvider={session.provider}
             sessionModel={session.model}
+            sessionReasoningEffort={session.reasoningEffort}
             canSend={canSend}
             onQueued={() => setModelNote(t("chat.model.queued"))}
-            onOpenAdvanced={() => {
+            onOpenAdvanced={(providerHint) => {
               setComposerMenuOpen(false);
+              setModelProviderHint(providerHint);
               setModelOpen(true);
               setModelNote(undefined);
             }}
             onInteract={() => setComposerMenuOpen(false)}
           />
+          {session.pendingModelChange && (
+            <small class="composer-model-pending" role="status">
+              <span>{t("chat.model.pendingSwitch", { model: session.pendingModelChange.model })}</span>
+              <button
+                type="button"
+                aria-label={t("chat.model.pendingCancel")}
+                title={t("chat.model.pendingCancel")}
+                disabled={session.pendingModelChange.applying === true}
+                onClick={() => cancelSessionModelChange(session.id)}
+              >×</button>
+            </small>
+          )}
           {presetReadout && (
             <small class="composer-model-readout" title={t("chat.model.hint")}>
               <span class="composer-model-preset-name">{t("chat.modelPreset.readout", { name: presetReadout })}</span>
@@ -487,18 +550,69 @@ ${prompt}`
           <ChatModelPanel
             profileId={profile.id}
             sessionId={session.id}
+            sessionProvider={session.provider}
+            sessionModel={session.model}
+            sessionReasoningEffort={session.reasoningEffort}
+            initialProvider={modelProviderHint}
             canSend={canSend}
-            onClose={() => { setModelOpen(false); setModelNote(undefined); }}
+            onClose={() => { setModelOpen(false); setModelProviderHint(undefined); setModelNote(undefined); }}
             onQueued={() => setModelNote(t("chat.model.queued"))}
           />
         )}
         <div class="composer-main">
+          {slashSuggestions.length > 0 && (
+            <div class="composer-slash-menu" role="listbox" aria-label={t("chat.slash.suggestions")}>
+              {slashSuggestions.map((item, index) => (
+                <button
+                  key={item.text}
+                  type="button"
+                  role="option"
+                  aria-selected={index === slashIndex}
+                  class={index === slashIndex ? "is-active" : undefined}
+                  onClick={() => {
+                    setDraft(`${item.text} `);
+                    (messageListRef.current?.closest(".chat-pane")?.querySelector("textarea") as HTMLTextAreaElement | null)?.focus();
+                  }}
+                >
+                  <b>{item.text}</b>
+                  {item.meta && <small>{item.meta}</small>}
+                </button>
+              ))}
+            </div>
+          )}
           <textarea
             value={draft}
             disabled={!canCompose}
-            aria-busy={session.steerPending === true}
+            aria-busy={session.steerPending === true || session.slashPending === true}
             onInput={(event) => setDraft(event.currentTarget.value)}
             onKeyDown={(event) => {
+              if (slashSuggestions.length > 0) {
+                if (event.key === "ArrowDown") {
+                  event.preventDefault();
+                  setSlashIndex((current) => (current + 1) % slashSuggestions.length);
+                  return;
+                }
+                if (event.key === "ArrowUp") {
+                  event.preventDefault();
+                  setSlashIndex((current) => (current <= 0 ? slashSuggestions.length - 1 : current - 1));
+                  return;
+                }
+                if (event.key === "Escape") {
+                  event.preventDefault();
+                  setSlashDismissed(true);
+                  setSlashIndex(-1);
+                  return;
+                }
+                if (event.key === "Tab" || (event.key === "Enter" && slashIndex >= 0)) {
+                  const chosen = slashSuggestions[slashIndex >= 0 ? slashIndex : 0];
+                  if (chosen) {
+                    event.preventDefault();
+                    setDraft(`${chosen.text} `);
+                    setSlashIndex(-1);
+                    return;
+                  }
+                }
+              }
               if (shouldSubmitComposerKey(event)) {
                 event.preventDefault();
                 event.currentTarget.form?.requestSubmit();
@@ -573,15 +687,6 @@ export function formatChatMessageTime(
   }).format(date);
 }
 
-function PromptOperationMark({ operation }: { operation: Pick<ChatOperationEvidence, "state" | "message"> }) {
-  return (
-    <span class={`message-prompt-state is-${operation.state}`}>
-      <span>{t(operationStateTranslation(operation.state))}</span>
-      {operation.message && <small>{localizeRuntimeMessage(officeRuntimeMessage(operation.message))}</small>}
-    </span>
-  );
-}
-
 function operationStateTranslation(state: ChatOperationEvidence["state"]): TranslationKey {
   return ({
     pending: "chat.prompt.pending",
@@ -595,11 +700,19 @@ export function presentedOperationEvidence(session: Pick<ChatSession, "messages"
   const legacy = session.messages.flatMap<ChatOperationEvidence>((message): ChatOperationEvidence[] => {
     if (message.promptOperation) return [{
       id: message.promptOperation.id, kind: "prompt" as const, body: message.body, at: message.at,
+      timelineSequence: message.timelineSequence,
       state: message.promptOperation.state,
       ...(message.promptOperation.message ? { message: message.promptOperation.message } : {}),
     }];
     return message.kind === "steer"
-      ? [{ id: message.id, kind: "steer" as const, body: message.body, at: message.at, state: "accepted" as const }]
+      ? [{
+          id: message.id,
+          timelineSequence: message.timelineSequence,
+          kind: "steer" as const,
+          body: message.body,
+          at: message.at,
+          state: "accepted" as const,
+        }]
       : [];
   });
   return [...(session.operationEvidence ?? []), ...legacy];
@@ -623,14 +736,135 @@ export function buildChatTimeline(messages: readonly ChatMessage[], evidence: re
     ...messages.map((message, sequence) => ({ kind: "message" as const, message, sequence })),
     ...evidence.map((operation, index) => ({ kind: "operation" as const, operation, sequence: messages.length + index })),
   ];
+  const sequenced = timeline.filter((item) => timelineSequence(item) !== undefined);
+  if (sequenced.length === timeline.length) return timeline.sort(compareTimelineSequence);
+  if (sequenced.length > 0) return mergePartiallySequencedTimeline(timeline, sequenced);
   const times = timeline.map((item) => comparableTimelineTime(item.kind === "message" ? item.message.at : item.operation.at));
   if (times.some((time) => time === undefined) || new Set(times.map((time) => time?.kind)).size !== 1) return timeline;
+  // A date-less clock cannot prove a day boundary. Legacy rows without the
+  // shared sequence retain their source order instead of inventing chronology.
+  if (times[0]?.kind === "clock") return timeline;
   return timeline.sort((left, right) => {
     const leftTime = comparableTimelineTime(left.kind === "message" ? left.message.at : left.operation.at);
     const rightTime = comparableTimelineTime(right.kind === "message" ? right.message.at : right.operation.at);
-    if (leftTime && rightTime && leftTime.value !== rightTime.value) return leftTime.value - rightTime.value;
+    if (leftTime && rightTime && leftTime.value !== rightTime.value) {
+      return leftTime.value - rightTime.value;
+    }
     return left.sequence - right.sequence;
   });
+}
+
+function timelineSequence(item: ChatTimelineItem): number | undefined {
+  const value = item.kind === "message" ? item.message.timelineSequence : item.operation.timelineSequence;
+  return typeof value === "number" && Number.isSafeInteger(value) ? value : undefined;
+}
+
+function compareTimelineSequence(left: ChatTimelineItem, right: ChatTimelineItem): number {
+  const leftSequence = timelineSequence(left)!;
+  const rightSequence = timelineSequence(right)!;
+  if (leftSequence !== rightSequence) return leftSequence - rightSequence;
+  const timeOrder = compareComparableTimelineTimes(left, right);
+  return timeOrder === 0 ? left.sequence - right.sequence : timeOrder;
+}
+
+function mergePartiallySequencedTimeline(
+  timeline: readonly ChatTimelineItem[],
+  sequenced: readonly ChatTimelineItem[],
+): ChatTimelineItem[] {
+  const anchors = [...sequenced].sort(compareTimelineSequence);
+  const missing = timeline.filter((item) => timelineSequence(item) === undefined);
+  const timedAnchors = anchors.map((item, index) => ({
+    index,
+    time: comparableTimelineTime(item.kind === "message" ? item.message.at : item.operation.at),
+  }));
+  const positioned = [
+    ...anchors.map((item, index) => ({ item, position: index, anchor: true })),
+    ...missing.map((item) => {
+      const time = comparableTimelineTime(item.kind === "message" ? item.message.at : item.operation.at);
+      const matchingAnchors = time === undefined
+        ? []
+        : timedAnchors.flatMap((entry) => entry.time?.kind === time.kind
+          ? [{ index: entry.index, time: entry.time }]
+          : []);
+      if (time === undefined || matchingAnchors.length === 0) {
+        // With no comparable anchor the historical position is unknowable.
+        // Put it before the trusted sequence so later appends cannot move it.
+        return { item, position: -1, anchor: false };
+      }
+      const axes = timelineAxis(matchingAnchors.map(({ time: anchorTime }) => anchorTime), time.kind);
+      const target = nearestTimelineAxis(time.value, axes[0]!, axes[axes.length - 1]!, time.kind);
+      let position = matchingAnchors[0]!.index - 0.5;
+      for (let index = 0; index < matchingAnchors.length; index += 1) {
+        const current = matchingAnchors[index]!;
+        const currentAxis = axes[index]!;
+        if (target < currentAxis) break;
+        const next = matchingAnchors[index + 1];
+        const nextAxis = axes[index + 1];
+        if (next === undefined || nextAxis === undefined) {
+          position = current.index + 0.5;
+          break;
+        }
+        if (target <= nextAxis) {
+          const ratio = nextAxis === currentAxis ? 0.5 : (target - currentAxis) / (nextAxis - currentAxis);
+          position = current.index + ratio * (next.index - current.index);
+          break;
+        }
+      }
+      return { item, position, anchor: false };
+    }),
+  ];
+  return positioned.sort((left, right) => {
+    if (left.position !== right.position) return left.position - right.position;
+    if (left.anchor && right.anchor) return compareTimelineSequence(left.item, right.item);
+    return left.item.sequence - right.item.sequence;
+  }).map(({ item }) => item);
+}
+
+function timelineAxis(
+  times: readonly NonNullable<ReturnType<typeof comparableTimelineTime>>[],
+  kind: "absolute" | "clock",
+): number[] {
+  if (kind === "absolute") {
+    let previous = Number.NEGATIVE_INFINITY;
+    return times.map((time) => {
+      previous = Math.max(previous, time.value);
+      return previous;
+    });
+  }
+  const day = 24 * 60 * 60;
+  let previous = Number.NEGATIVE_INFINITY;
+  return times.map((time) => {
+    let value = time.value;
+    while (value < previous) value += day;
+    previous = value;
+    return value;
+  });
+}
+
+function nearestTimelineAxis(value: number, first: number, last: number, kind: "absolute" | "clock"): number {
+  if (kind === "absolute") return value;
+  const day = 24 * 60 * 60;
+  const firstDay = Math.floor(first / day);
+  const lastDay = Math.floor(last / day);
+  let best = value;
+  let bestDistance = Number.POSITIVE_INFINITY;
+  for (let dayOffset = firstDay - 1; dayOffset <= lastDay + 1; dayOffset += 1) {
+    const candidate = value + dayOffset * day;
+    const distance = candidate < first ? first - candidate : candidate > last ? candidate - last : 0;
+    if (distance < bestDistance) {
+      best = candidate;
+      bestDistance = distance;
+    }
+  }
+  return best;
+}
+
+function compareComparableTimelineTimes(left: ChatTimelineItem, right: ChatTimelineItem): number {
+  const leftTime = comparableTimelineTime(left.kind === "message" ? left.message.at : left.operation.at);
+  const rightTime = comparableTimelineTime(right.kind === "message" ? right.message.at : right.operation.at);
+  // Absolute timestamps can safely break a legacy sequence collision. A
+  // date-less clock cannot establish which side of midnight came first.
+  return leftTime?.kind === "absolute" && rightTime?.kind === "absolute" ? leftTime.value - rightTime.value : 0;
 }
 
 export function groupChatTimeline(timeline: readonly ChatTimelineItem[]): PresentedChatTimelineItem[] {
@@ -684,7 +918,9 @@ function ChatLogGroup({
   profileName: string;
 }) {
   const latest = group.messages.at(-1);
-  const preview = latest && latest.body.trim() !== "[Tool output hidden]" ? chatMessageBody(latest) : t("chat.tool");
+  const preview = latest && latest.body.trim() !== "[Tool output hidden]"
+    ? displayProfileReferences(chatMessageBody(latest), profileList.value)
+    : t("chat.tool");
   return (
     <section class={`chat-log-group ${expanded ? "is-expanded" : ""}`}>
       <button type="button" class="chat-log-group-toggle" aria-expanded={expanded} onClick={onToggle}>
@@ -703,16 +939,26 @@ function ChatLogGroup({
 }
 
 function ChatMessageEntry({ message, profile, profileName }: { message: ChatMessage; profile: Profile; profileName: string }) {
+  const body = chatMessageBody(message);
+  const displayReferences = (value: string) => displayProfileReferences(value, profileList.value);
+  const displayedToolBody = message.from === "tool" ? displayReferences(body) : body;
+  if (message.from === "user") {
+    return <UserInstructionEntry body={body} at={message.at} status={message.status ?? "complete"} />;
+  }
   return (
     <div
       class={`message message-${message.from} message-${message.status ?? "complete"}`}
       style={message.from === "agent" ? { "--agent-color": profile.color } : undefined}
     >
-      <span class="visually-hidden">{message.from === "user" ? t("chat.you") : message.from === "tool" ? t("chat.tool") : profileName}</span>
+      <span class="visually-hidden">{message.from === "tool" ? t("chat.tool") : profileName}</span>
       {message.from === "tool" && <span class="message-tool-mark" aria-hidden="true">⚙</span>}
       {message.from === "tool"
-        ? <p>{chatMessageBody(message) || (message.status === "streaming" ? "…" : "")}</p>
-        : <MarkdownBody text={chatMessageBody(message)} streaming={message.status === "streaming"} />}
+        ? <p>{displayedToolBody || (message.status === "streaming" ? "…" : "")}</p>
+        : <MarkdownBody
+            text={body}
+            streaming={message.status === "streaming"}
+            {...(message.from === "agent" ? { transformText: displayReferences } : {})}
+          />}
       <time>{formatChatMessageTime(message.at)}</time>
     </div>
   );
@@ -740,18 +986,84 @@ function isUrgentOperation(operation: ChatOperationEvidence): boolean {
 }
 
 function ChatOperationEntry({ operation }: { operation: ChatOperationEvidence }) {
-  const attention = operation.state === "pending" || operation.state === "rejected" || operation.state === "unconfirmed";
+  return <UserInstructionEntry body={operation.body} at={operation.at} status={operation.state} operation />;
+}
+
+function UserInstructionEntry({
+  body,
+  at,
+  status,
+  operation = false,
+}: {
+  body: string;
+  at: string;
+  status: ChatMessage["status"] | ChatOperationEvidence["state"];
+  operation?: boolean;
+}) {
+  const bodyRef = useRef<HTMLDivElement>(null);
+  const copiedTimer = useRef<number | undefined>(undefined);
+  const [expanded, setExpanded] = useState(false);
+  const [canExpand, setCanExpand] = useState(false);
+  const [copied, setCopied] = useState(false);
+
+  useEffect(() => {
+    const element = bodyRef.current;
+    if (!element || expanded) return;
+    const measure = () => setCanExpand(element.scrollHeight > element.clientHeight + 1);
+    measure();
+    if (typeof ResizeObserver === "undefined") return;
+    const observer = new ResizeObserver(measure);
+    observer.observe(element);
+    return () => observer.disconnect();
+  }, [body, expanded]);
+
+  useEffect(() => () => {
+    if (copiedTimer.current !== undefined) window.clearTimeout(copiedTimer.current);
+  }, []);
+
+  const copyInstruction = async () => {
+    try {
+      await navigator.clipboard.writeText(body);
+      setCopied(true);
+      if (copiedTimer.current !== undefined) window.clearTimeout(copiedTimer.current);
+      copiedTimer.current = window.setTimeout(() => setCopied(false), 1600);
+    } catch {
+      // Clipboard permission can be denied by the host; keep the message intact.
+    }
+  };
+
   return (
-    <details class={`chat-operation-ledger chat-operation is-${operation.state}`} open={attention || undefined} aria-live="off">
-      <summary>
-        <span><b>{operation.kind === "steer" ? t("chat.operation.steer") : t("chat.operation.prompt")}</b><PromptOperationMark operation={operation} /></span>
-        <span class="chat-operation-body">{operation.body}</span>
-        <time>{formatChatMessageTime(operation.at)}</time>
-      </summary>
-      <div class="chat-operation-meta">
-        <code>{operation.id}</code>
+    <div
+      class={`message message-user message-${status ?? "complete"} user-instruction${operation ? ` chat-operation is-${status}` : ""}`}
+      aria-live="off"
+    >
+      <span class="visually-hidden">{t("chat.you")}</span>
+      <div ref={bodyRef} class={`user-instruction-body ${expanded ? "is-expanded" : "is-collapsed"}`}>
+        <MarkdownBody text={body} />
       </div>
-    </details>
+      <div class="user-instruction-utilities">
+        <time dateTime={at}>{formatChatMessageTime(at)}</time>
+        <button
+          type="button"
+          class={`user-instruction-copy${copied ? " is-copied" : ""}`}
+          title={copied ? t("chat.message.copied") : t("chat.message.copy")}
+          aria-label={copied ? t("chat.message.copied") : t("chat.message.copy")}
+          onClick={() => void copyInstruction()}
+        >
+          <CopyIcon width={14} height={14} />
+        </button>
+      </div>
+      {canExpand && (
+        <button
+          type="button"
+          class="user-instruction-expand"
+          aria-expanded={expanded}
+          onClick={() => setExpanded((current) => !current)}
+        >
+          {expanded ? t("chat.message.showLess") : t("chat.message.showMore")}
+        </button>
+      )}
+    </div>
   );
 }
 
@@ -761,6 +1073,7 @@ function comparableTimelineTime(value: string): { kind: "absolute" | "clock"; va
   const absolute = Date.parse(value);
   return Number.isNaN(absolute) ? undefined : { kind: "absolute", value: absolute };
 }
+
 
 export function chatComposerState(session: ChatSession): { canCompose: boolean; canSteer: boolean; runActive: boolean; showStop: boolean } {
   const runActive = isChatRunActive(session);

@@ -17,7 +17,10 @@ const MAX_SESSION_PAGES = 20;
 const MAX_SESSION_ROWS = UPSTREAM_PAGE_SIZE * MAX_SESSION_PAGES;
 const MAX_PROFILE_ROWS = 2_000;
 const MAX_INVENTORY_BYTES = 8 * 1024 * 1024;
-const INVENTORY_TIMEOUT_MS = 7_000;
+// Cold profile discovery can consume most of the original seven-second shared
+// budget before session paging begins. Keep the full snapshot below the
+// server's outer request bound while leaving enough time to collect all pages.
+const INVENTORY_TIMEOUT_MS = 12_000;
 const INVENTORY_GENERATION_TTL_MS = 5 * 60_000;
 const MAX_INVENTORY_GENERATIONS = 8;
 const MAX_EPOCH_SECONDS = 8_640_000_000_000;
@@ -372,7 +375,21 @@ function mapSessions(rows: Record<string, unknown>[]): MappingResult<ChatSession
       const createdAt = startedAt ?? UNKNOWN_INVENTORY_TIMESTAMP;
       const updatedAt = lastActive ?? endedAt ?? UNKNOWN_INVENTORY_TIMESTAMP;
       const title = safeInventoryText(readString(row, "title"), 240) || "Untitled session";
-      items.push({ id, profileId: profile, title, activity: row.is_active === true ? "thinking" : "idle", createdAt, updatedAt, ...(preview === undefined ? {} : { lastMessagePreview: preview }) });
+      const conversationKind = readString(row, "conversation_kind") === "delegated" ? "delegated" as const : undefined;
+      const delegationTaskId = safeIdentifier(readString(row, "delegation_task_id"), SESSION_ID_PATTERN);
+      const delegatedByProfileId = safeIdentifier(readString(row, "delegated_by_profile"), PROFILE_PATTERN);
+      items.push({
+        id,
+        profileId: profile,
+        title,
+        activity: row.is_active === true ? "thinking" : "idle",
+        createdAt,
+        updatedAt,
+        ...(preview === undefined ? {} : { lastMessagePreview: preview }),
+        ...(conversationKind === undefined ? {} : { conversationKind }),
+        ...(delegationTaskId === undefined ? {} : { delegationTaskId }),
+        ...(delegatedByProfileId === undefined ? {} : { delegatedByProfileId }),
+      });
     } catch { failures += 1; }
   }
   return { items, failures };
@@ -390,7 +407,10 @@ function safeIdentifier(value: string | undefined, pattern: RegExp): string | un
 function activity(gateway: boolean, active: number): AgentActivity { return active > 0 ? "thinking" : gateway ? "idle" : "offline"; }
 function optionalEpochToIso(row: Record<string, unknown>, key: string): string | undefined {
   const value = row[key];
-  if (value === undefined) return undefined;
+  // Hermes serializes an unfinished session's optional timestamps as JSON
+  // null. Treat null the same as an omitted optional field instead of dropping
+  // the otherwise valid session from inventory.
+  if (value === undefined || value === null) return undefined;
   if (typeof value !== "number" || !Number.isFinite(value) || value < 0 || value > MAX_EPOCH_SECONDS) {
     throw new Error(`Hermes inventory ${key} timestamp is invalid.`);
   }

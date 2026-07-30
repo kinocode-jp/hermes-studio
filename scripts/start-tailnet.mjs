@@ -1,6 +1,8 @@
 import { spawn, execFile } from "node:child_process";
 import { constants } from "node:fs";
 import { access } from "node:fs/promises";
+import { createServer } from "node:net";
+import { dirname, isAbsolute, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 
@@ -11,11 +13,16 @@ const LOOPBACK_TARGET = `http://127.0.0.1:${OFFICE_PORT}`;
 const MIN_TOKEN_LENGTH = 32;
 const MAX_TOKEN_LENGTH = 4_096;
 const SERVE_HTTPS_PORT = "443";
+const DESKTOP_ARGUMENT = "--desktop";
+const FORGET_DESKTOP_ARGUMENT = "--forget-desktop";
+const DEFAULT_MACOS_DESKTOP_EXECUTABLE = "/Applications/Hermes Studio.app/Contents/MacOS/hermes-studio";
+const DESKTOP_KEYCHAIN_SERVICE = "app.hermesoffice.desktop.remote-config";
+const DESKTOP_KEYCHAIN_ACCOUNT = "tailnet-owner";
 /** Allow time for interactive Tailscale HTTPS/Serve consent prompts. */
 const SERVE_CONFIGURE_TIMEOUT_MS = 5 * 60 * 1000;
 
 /**
- * Suffixes this launcher reads (and forwards to the production child).
+ * Suffixes this launcher reads (and forwards to the selected Office owner).
  * Canonical prefix is HERMES_STUDIO_*; deprecated HERMES_OFFICE_* is copied
  * only when the studio key is unset so existing host envs keep working.
  * Never log values — REMOTE_TOKEN and similar are secrets.
@@ -33,6 +40,14 @@ const LEGACY_ENV_SUFFIXES = [
 const officeLauncher = fileURLToPath(new URL("./start-studio.mjs", import.meta.url));
 const webIndex = fileURLToPath(new URL("../apps/web/dist/index.html", import.meta.url));
 const serverEntry = fileURLToPath(new URL("../apps/server/dist/index.js", import.meta.url));
+
+function launchTarget() {
+  const args = process.argv.slice(2);
+  if (args.length === 0) return "office";
+  if (args.length === 1 && args[0] === DESKTOP_ARGUMENT) return "desktop";
+  if (args.length === 1 && args[0] === FORGET_DESKTOP_ARGUMENT) return "forget-desktop";
+  fail(`unsupported arguments. Use no arguments for Office Server, ${DESKTOP_ARGUMENT} for the installed desktop app, or ${FORGET_DESKTOP_ARGUMENT} to remove its saved remote configuration.`);
+}
 
 function fail(message) {
   process.stderr.write(`Hermes Studio tailnet launcher: ${message}\n`);
@@ -317,6 +332,95 @@ async function assertProductionAssets() {
   }
 }
 
+function configuredDesktopExecutable() {
+  const configured = process.env.HERMES_STUDIO_DESKTOP_EXECUTABLE;
+  const executable = configured === undefined || configured.trim() === ""
+    ? DEFAULT_MACOS_DESKTOP_EXECUTABLE
+    : configured.trim();
+  if (process.platform !== "darwin") {
+    fail(`${DESKTOP_ARGUMENT} currently supports the packaged macOS desktop app only.`);
+  }
+  if (!isAbsolute(executable) || executable.includes("\0")) {
+    fail("HERMES_STUDIO_DESKTOP_EXECUTABLE must be an absolute path to the packaged desktop executable.");
+  }
+  return executable;
+}
+
+/**
+ * Desktop asset preflight. Must run before creating persistent Serve config so
+ * a missing or incomplete app bundle cannot leave a new proxy behind.
+ */
+async function assertDesktopApplication(executable) {
+  const contentsDirectory = dirname(dirname(executable));
+  const bundledServer = join(contentsDirectory, "Resources/resources/server/hermes-studio-server.mjs");
+  const bundledWebIndex = join(contentsDirectory, "Resources/resources/web/index.html");
+  try {
+    await Promise.all([
+      access(executable, constants.R_OK | constants.X_OK),
+      access(bundledServer, constants.R_OK),
+      access(bundledWebIndex, constants.R_OK),
+    ]);
+  } catch {
+    fail(
+      `the packaged desktop app is missing or incomplete at ${executable}. Install Hermes Studio.app or set HERMES_STUDIO_DESKTOP_EXECUTABLE to its Contents/MacOS/hermes-studio executable.`,
+    );
+  }
+}
+
+/**
+ * A running desktop app would attach to its existing local-only child instead
+ * of starting a new remote-enabled child. Require a free Office port before
+ * launching the desktop target so that failure mode is explicit.
+ */
+async function assertDesktopOfficePortAvailable() {
+  await new Promise((resolve) => {
+    const probe = createServer();
+    probe.unref();
+    probe.once("error", (error) => {
+      if (error && typeof error === "object" && "code" in error && error.code === "EADDRINUSE") {
+        fail(
+          `port ${OFFICE_PORT} is already in use. Quit Hermes Studio completely (closing its window is not enough on macOS), confirm ${LOOPBACK_TARGET} is no longer serving, and retry.`,
+        );
+      }
+      const message = error instanceof Error ? error.message : String(error);
+      fail(`could not verify that port ${OFFICE_PORT} is available before desktop launch: ${message}`);
+    });
+    probe.listen({ host: "127.0.0.1", port: OFFICE_PORT, exclusive: true }, () => {
+      probe.close((error) => {
+        if (error) {
+          fail(`could not release the port ${OFFICE_PORT} preflight listener: ${error.message}`);
+        }
+        resolve();
+      });
+    });
+  });
+}
+
+async function forgetDesktopRemoteConfiguration() {
+  if (process.platform !== "darwin") {
+    fail(`${FORGET_DESKTOP_ARGUMENT} currently supports macOS Keychain only.`);
+  }
+  try {
+    await execFileAsync(
+      "/usr/bin/security",
+      ["delete-generic-password", "-a", DESKTOP_KEYCHAIN_ACCOUNT, "-s", DESKTOP_KEYCHAIN_SERVICE],
+      { encoding: "utf8", maxBuffer: 64 * 1024, timeout: 15_000 },
+    );
+  } catch (error) {
+    const stderr = error && typeof error === "object" && "stderr" in error ? String(error.stderr ?? "") : "";
+    const code = error && typeof error === "object" && "code" in error ? error.code : undefined;
+    if (code === 44 || stderr.includes("could not be found in the keychain")) {
+      process.stdout.write("Hermes Studio has no saved desktop remote configuration.\n");
+      return;
+    }
+    const message = stderr.trim() || (error instanceof Error ? error.message : String(error));
+    fail(`could not remove the saved desktop remote configuration from macOS Keychain: ${message}`);
+  }
+  process.stdout.write(
+    "Hermes Studio desktop remote configuration removed from macOS Keychain. Quit and reopen the app to return to local-only mode. Tailscale Serve remains unchanged.\n",
+  );
+}
+
 function isEmptyServeConfig(config) {
   if (config === null || config === undefined) return true;
   if (!isPlainObject(config)) return false;
@@ -478,7 +582,7 @@ function createPersistentPrivateServe() {
   });
 }
 
-function printOperatorGuidance(canonicalOrigin, trustedProxyHops, allowedOrigins, serveWasPreconfigured) {
+function printOperatorGuidance(canonicalOrigin, trustedProxyHops, allowedOrigins, serveWasPreconfigured, target) {
   const serveLine = serveWasPreconfigured
     ? `Tailscale Serve        : already configured (idempotent) private HTTPS :${SERVE_HTTPS_PORT} → ${LOOPBACK_TARGET} (persistent --bg)`
     : `Tailscale Serve        : private HTTPS :${SERVE_HTTPS_PORT} → ${LOOPBACK_TARGET} (persistent --bg; interactive consent if Tailscale prompted)`;
@@ -511,15 +615,21 @@ function printOperatorGuidance(canonicalOrigin, trustedProxyHops, allowedOrigins
     "  CSRF, WebSockets, and the PWA all use that single origin through Serve.",
     "• Funnel and any public-internet exposure remain unsupported.",
     "• The launcher never overwrites a different existing Serve configuration.",
+    ...(target === "desktop" ? [
+      "• The desktop app saves this validated remote configuration in macOS",
+      "  Keychain. Later Finder or Dock launches restore it automatically.",
+    ] : []),
     "",
-    "Starting production Office launcher…",
+    target === "desktop"
+      ? "Starting Hermes Studio desktop app with the remote configuration…"
+      : "Starting production Office launcher…",
     "",
   ];
   process.stdout.write(`${lines.join("\n")}\n`);
 }
 
-function startOffice() {
-  const child = spawn(process.execPath, [officeLauncher], {
+function startChild(executable, args, description) {
+  const child = spawn(executable, args, {
     stdio: "inherit",
     env: process.env,
   });
@@ -534,7 +644,7 @@ function startOffice() {
   process.once("SIGTERM", () => forward("SIGTERM"));
 
   child.on("error", (error) => {
-    process.stderr.write(`Hermes Studio tailnet launcher: failed to start production launcher: ${error.message}\n`);
+    process.stderr.write(`Hermes Studio tailnet launcher: failed to start ${description}: ${error.message}\n`);
     process.exitCode = 1;
   });
 
@@ -548,46 +658,80 @@ function startOffice() {
   });
 }
 
-// --- main ---
-
-// Accept deprecated HERMES_OFFICE_* host env when HERMES_STUDIO_* is unset.
-// Prefer studio keys; never log secret values (e.g. REMOTE_TOKEN).
-applyLegacyEnvFallbacks();
-
-validateToken();
-validateHostBinding();
-const trustedProxyHops = configureTrustedProxyHops();
-const canonicalOrigin = await discoverCanonicalOrigin();
-const canonicalHost = new URL(canonicalOrigin).hostname;
-const allowedOrigins = validateAndBuildAllowedOrigins(canonicalOrigin);
-process.env.HERMES_STUDIO_ALLOWED_ORIGINS = allowedOrigins.join(",");
-// Keep the default listener explicit for the child without writing any secrets.
-process.env.HERMES_STUDIO_HOST ||= "127.0.0.1";
-process.env.HERMES_STUDIO_PORT ||= String(OFFICE_PORT);
-// Tailscale-only path: intentionally enable remote owner privileged settings
-// and one-shot secret deposit over authenticated HTTPS. Default is off for all
-// other launchers. Tailscale is the network boundary; Office owner auth remains mandatory.
-process.env.HERMES_STUDIO_REMOTE_PRIVILEGED = "true";
-
-// Inspect Serve first (fail closed on conflict) without changing it.
-const serveStateBefore = await assertServeConfigurationSafe(canonicalHost);
-
-// Production assets before creating any new persistent Serve mapping.
-await assertProductionAssets();
-
-let serveState = serveStateBefore;
-if (serveStateBefore === "empty") {
-  // Configure without --yes; may prompt interactively for HTTPS/Serve consent.
-  await createPersistentPrivateServe();
-
-  // Confirm the new mapping matches exactly; fail closed otherwise.
-  serveState = await assertServeConfigurationSafe(canonicalHost);
-  if (serveState !== "exact") {
-    fail(
-      "Tailscale Serve did not result in the exact private HTTPS root reverse-proxy mapping expected. Inspect with `tailscale serve status` and correct or reset before retrying.",
-    );
-  }
+function startOffice() {
+  startChild(process.execPath, [officeLauncher], "production Office launcher");
 }
 
-printOperatorGuidance(canonicalOrigin, trustedProxyHops, allowedOrigins, serveStateBefore === "exact");
-startOffice();
+function startDesktop(executable) {
+  // Invoke the bundle executable directly instead of `open` so the desktop
+  // parent inherits the validated remote environment and forwards only the
+  // Office-specific variables to its owned server child.
+  startChild(executable, [], "Hermes Studio desktop app");
+}
+
+// --- main ---
+
+async function main() {
+  const target = launchTarget();
+  if (target === "forget-desktop") {
+    await forgetDesktopRemoteConfiguration();
+    return;
+  }
+  const desktopExecutable = target === "desktop" ? configuredDesktopExecutable() : undefined;
+
+  // Accept deprecated HERMES_OFFICE_* host env when HERMES_STUDIO_* is unset.
+  // Prefer studio keys; never log secret values (e.g. REMOTE_TOKEN).
+  applyLegacyEnvFallbacks();
+
+  validateToken();
+  validateHostBinding();
+  const trustedProxyHops = configureTrustedProxyHops();
+  const canonicalOrigin = await discoverCanonicalOrigin();
+  const canonicalHost = new URL(canonicalOrigin).hostname;
+  const allowedOrigins = validateAndBuildAllowedOrigins(canonicalOrigin);
+  process.env.HERMES_STUDIO_ALLOWED_ORIGINS = allowedOrigins.join(",");
+  // Keep the default listener explicit for the child without writing any secrets.
+  process.env.HERMES_STUDIO_HOST ||= "127.0.0.1";
+  process.env.HERMES_STUDIO_PORT ||= String(OFFICE_PORT);
+  // Tailscale-only path: intentionally enable remote owner privileged settings
+  // and one-shot secret deposit over authenticated HTTPS. Default is off for all
+  // other launchers. Tailscale is the network boundary; Office owner auth remains mandatory.
+  process.env.HERMES_STUDIO_REMOTE_PRIVILEGED = "true";
+
+  // Inspect Serve first (fail closed on conflict) without changing it.
+  const serveStateBefore = await assertServeConfigurationSafe(canonicalHost);
+
+  // Target assets before creating any new persistent Serve mapping.
+  if (target === "desktop") {
+    await assertDesktopApplication(desktopExecutable);
+    await assertDesktopOfficePortAvailable();
+  } else {
+    await assertProductionAssets();
+  }
+
+  let serveState = serveStateBefore;
+  if (serveStateBefore === "empty") {
+    // Configure without --yes; may prompt interactively for HTTPS/Serve consent.
+    await createPersistentPrivateServe();
+
+    // Confirm the new mapping matches exactly; fail closed otherwise.
+    serveState = await assertServeConfigurationSafe(canonicalHost);
+    if (serveState !== "exact") {
+      fail(
+        "Tailscale Serve did not result in the exact private HTTPS root reverse-proxy mapping expected. Inspect with `tailscale serve status` and correct or reset before retrying.",
+      );
+    }
+  }
+
+  if (target === "desktop") {
+    // The native desktop saves only the already-validated Tailnet values to
+    // macOS Keychain. This flag is consumed by the desktop parent and is never
+    // forwarded to Office or Hermes children.
+    process.env.HERMES_STUDIO_PERSIST_REMOTE_CONFIG = "true";
+  }
+  printOperatorGuidance(canonicalOrigin, trustedProxyHops, allowedOrigins, serveStateBefore === "exact", target);
+  if (target === "desktop") startDesktop(desktopExecutable);
+  else startOffice();
+}
+
+await main();

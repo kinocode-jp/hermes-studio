@@ -26,6 +26,8 @@ import {
   profileList,
   selectProfile,
   selectedProfileId,
+  settingsModalOpen,
+  closeSettingsModal,
   sessions,
 } from "../src/store.ts";
 
@@ -152,7 +154,7 @@ test("mobile new chat opens its workspace only after session creation succeeds",
 test("mobile primary navigation closes both overlays before revealing its surface", () => {
   const previousSurface = activeSurface.value;
   try {
-    for (const surface of ["office", "kanban", "teams", "settings"] as const) {
+    for (const surface of ["office", "kanban", "teams"] as const) {
       resetMobileRouteStateForTests();
       openMobileWorkspace();
       openMobileInspector();
@@ -162,20 +164,32 @@ test("mobile primary navigation closes both overlays before revealing its surfac
       assert.equal(mobileWorkspaceOpen.value, false);
       assert.deepEqual(mobileRouteStack(), []);
     }
-    // Legacy library nav folds into Settings → Global.
+    // Settings is a modal and must not replace the active dashboard surface.
+    const dashboardSurface = activeSurface.value;
+    resetMobileRouteStateForTests();
+    openMobileWorkspace();
+    navigateToSurface("settings");
+    assert.equal(activeSurface.value, dashboardSurface);
+    assert.equal(settingsModalOpen.value, true);
+    assert.equal(mobileWorkspaceOpen.value, false);
+    closeSettingsModal();
+
+    // Legacy library nav folds into the same global Settings modal.
     resetMobileRouteStateForTests();
     openMobileWorkspace();
     navigateToSurface("library");
-    assert.equal(activeSurface.value, "settings");
+    assert.equal(activeSurface.value, dashboardSurface);
+    assert.equal(settingsModalOpen.value, true);
     assert.equal(mobileWorkspaceOpen.value, false);
   } finally {
+    closeSettingsModal();
     resetMobileRouteStateForTests();
     clearMobileRoutes();
     activeSurface.value = previousSurface;
   }
 });
 
-test("mobile profile selection opens exactly one focused route with and without openWorkspace", () => {
+test("mobile profile selection only opens a route when chat workspace is requested", () => {
   const previousProfiles = profileList.value;
   const previousSessions = sessions.value;
   const previousOpenIds = openSessionIds.value;
@@ -193,14 +207,14 @@ test("mobile profile selection opens exactly one focused route with and without 
     openSessionIds.value = [];
     activeSessionId.value = "";
 
-    // Inspector-only selection must close any open workspace.
-    openMobileWorkspace();
+    // Sidebar selection updates the profile without inventing a hidden route.
     selectProfile("theo", { openDetail: false });
-    assert.equal(mobileInspectorOpen.value, true);
+    assert.equal(mobileInspectorOpen.value, false);
     assert.equal(mobileWorkspaceOpen.value, false);
-    assert.deepEqual(mobileRouteStack(), ["workspace", "inspector"]);
+    assert.deepEqual(mobileRouteStack(), []);
 
-    // openWorkspace opens chat only — never the inspector — with or without an existing session.
+    // openWorkspace opens a fresh chat only — never the inspector. Existing
+    // durable conversations require an explicit conversation-row selection.
     selectProfile("theo", { openWorkspace: true });
     assert.equal(mobileInspectorOpen.value, false);
     assert.equal(mobileWorkspaceOpen.value, true);
@@ -212,7 +226,9 @@ test("mobile profile selection opens exactly one focused route with and without 
     selectProfile("theo", { openWorkspace: true });
     assert.equal(mobileInspectorOpen.value, false);
     assert.equal(mobileWorkspaceOpen.value, true);
-    assert.equal(activeSessionId.value, "existing");
+    assert.equal(sessions.value.length, 2);
+    assert.notEqual(activeSessionId.value, "existing");
+    assert.equal(sessions.value.find((item) => item.id === activeSessionId.value)?.titlePresentation, "new-chat");
     assert.deepEqual(mobileRouteStack(), ["workspace"]);
   } finally {
     resetMobileRouteStateForTests();
@@ -260,42 +276,71 @@ test("mobile route stack closes workspace then inspector and restores workspace 
 });
 
 test("mobile route and modal overlays expose consistent focus, inert, and navigation semantics", async () => {
-  const [app, rail, workspace, profile, overlay, main, routes] = await Promise.all([
+  const [app, rail, settings, profileChat, overlay, outsideClose, main, routes] = await Promise.all([
     readFile(new URL("../src/app.tsx", import.meta.url), "utf8"),
     readFile(new URL("../src/components/side-rail.tsx", import.meta.url), "utf8"),
-    readFile(new URL("../src/components/chat-workspace.tsx", import.meta.url), "utf8"),
-    readFile(new URL("../src/components/profile-panel.tsx", import.meta.url), "utf8"),
+    readFile(new URL("../src/components/settings-modal.tsx", import.meta.url), "utf8"),
+    readFile(new URL("../src/components/profile-chat-modal.tsx", import.meta.url), "utf8"),
     readFile(new URL("../src/components/use-mobile-overlay.ts", import.meta.url), "utf8"),
+    readFile(new URL("../src/components/use-modal-outside-close.ts", import.meta.url), "utf8"),
     readFile(new URL("../src/main.tsx", import.meta.url), "utf8"),
     readFile(new URL("../src/mobile-routes.ts", import.meta.url), "utf8"),
   ]);
 
-  assert.match(rail, /navigateToSurface\(item\.id\)/);
+  assert.doesNotMatch(rail, /onClick=\{\(\) => \{\s*addDashboardPanel\(item\.kind\)/);
+  assert.match(rail, /aria-keyshortcuts="Shift\+Enter"/);
+  assert.match(rail, /event\.key !== "Enter" \|\| !event\.shiftKey/);
+  assert.match(rail, /addPanelFromKeyboard\(item\.kind\)/);
+  assert.match(rail, /if \(result === "full"\)/);
+  assert.match(rail, /role="status" aria-live="polite" aria-atomic="true"/);
+  assert.match(rail, /activateOrAddPanelFromClick\(item\.kind\)/);
+  assert.match(rail, /activateMobileChatTab\(defaultProfile\.id\)/);
+  assert.match(rail, /activateDashboardContainingPanel\("chat", \{ sessionId \}\)/);
+  assert.match(rail, /addDashboardPanel\("chat", \{ sessionId \}\)/);
+  assert.match(rail, /item\.dataset\.sessionId === sessionId/);
+  assert.match(rail, /if \(event\.pointerType === "mouse"\) beginSidebarSessionPointerDrag/);
+  assert.match(rail, /if \(phoneViewport\) setMobileTabKind\("chat"\)/);
+  assert.match(rail, /if \(phoneViewport\) revealMobilePanel\("chat", sessionId\)/);
+  assert.match(rail, /if \(phoneViewport && !hasSessions\) closeMobileProfiles\(\)/);
+  assert.match(rail, /if \(iconOnly && !phoneViewport\)/);
+  assert.match(rail, /activeSessionId\.value[\s\S]*sidebar\.currentChatOpen[\s\S]*sidebar\.defaultChatStart/);
   assert.match(app, /data-mobile-route-chrome/);
   assert.match(rail, /data-mobile-route-chrome/);
-  assert.match(app, /onClick=\{openMobileInspector\}/);
-  assert.match(workspace, /kind: "route"/);
-  assert.match(workspace, /onClose: closeMobileRoute/);
-  assert.match(workspace, /onClick=\{closeMobileRoute\}/);
-  assert.match(workspace, /onClick=\{openMobileInspector\}/);
-  assert.match(workspace, /role=\{mobileOverlay\.active \? "region" : undefined\}/);
-  assert.doesNotMatch(workspace, /aria-modal=/);
-  assert.match(profile, /kind: "modal"/);
-  assert.match(profile, /onClose: closeMobileRoute/);
-  assert.match(profile, /onClick=\{closeMobileRoute\}/);
-  assert.match(profile, /viewport: COMPACT_OVERLAY_VIEWPORT/);
+  assert.match(app, /<SettingsModal \/>/);
+  assert.match(app, /<ProfileChatModal \/>/);
+  assert.match(profileChat, /if \(openPaneIds\.includes\(session\.id\)\)/);
+  assert.match(profileChat, /setProfileChatModalActivePane\(session\.id\)/);
+  assert.match(profileChat, /profileChatModalActivePaneId\.value === session\.id/);
+  assert.match(profileChat, /replaceProfileChatModalPane\(target\.sessionId, sessionId\)/);
+  assert.match(profileChat, /MODAL_SESSION_DRAG_THRESHOLD_PX/);
+  assert.match(profileChat, /window\.addEventListener\("blur", clearPointerDrag\)/);
+  assert.doesNotMatch(profileChat, /aria-keyshortcuts="Shift\+Enter"/);
+  assert.doesNotMatch(profileChat, /onAdd\(\)/);
+  assert.match(profileChat, /profile-chat-drop-note" role="status" aria-live="polite" aria-atomic="true"/);
+  assert.match(profileChat, /profile\.newChatUnavailable/);
+  assert.match(profileChat, /disabled=\{!canCreateChat\}/);
+  assert.match(profileChat, /if \(openPaneIds\.length > 0\) return;[\s\S]*createSession\(profile\.id, \{ workspace: false \}\)/);
+  assert.match(app, /activateDashboardContainingPanel\("studio"\)/);
+  assert.doesNotMatch(app, /addDashboardPanel\("studio"\)/);
+  for (const modal of [settings, profileChat]) {
+    assert.match(modal, /kind: "modal"/);
+    assert.match(modal, /viewport: "\(min-width: 0px\)"/);
+    assert.match(modal, /role="dialog"/);
+    assert.match(modal, /aria-modal="true"/);
+    assert.match(modal, /data-mobile-overlay-initial-focus/);
+    assert.match(modal, /useModalOutsideClose/);
+  }
   assert.match(overlay, /COMPACT_OVERLAY_VIEWPORT = "\(max-width: 1279px\)"/);
-  assert.match(overlay, /PHONE_OVERLAY_VIEWPORT = "\(max-width: 767px\)"/);
-  assert.match(profile, /role=\{mobileOverlay\.active \? "dialog" : undefined\}/);
-  assert.match(profile, /aria-modal=\{mobileOverlay\.active \? "true" : undefined\}/);
-  for (const source of [workspace, profile]) assert.match(source, /data-mobile-overlay-initial-focus/);
-  assert.match(overlay, /mobileOverlayBackgroundElements\(overlayRoot, appShell, kind\)/);
+  assert.match(overlay, /PHONE_OVERLAY_VIEWPORT = "\(max-width: 768px\)"/);
+  assert.match(overlay, /mobileOverlayBackgroundElements\(overlayRoot, appShell, kind, preserveMobileRouteChrome\)/);
   assert.match(overlay, /while \(overlayBranch !== appShell\)/);
-  assert.match(overlay, /parent === appShell && kind === "route"/);
+  assert.match(overlay, /parent === appShell && keepRouteChrome/);
   assert.match(overlay, /lockBackgroundElements\(background\)/);
   assert.match(overlay, /event\.key === "Escape"/);
   assert.match(overlay, /kind !== "modal" \|\| event\.key !== "Tab"/);
   assert.match(overlay, /canRestoreModalFocus\(previousFocus\)/);
+  assert.match(outsideClose, /pressStartedOnLayer\.current = event\.target === event\.currentTarget/);
+  assert.match(outsideClose, /event\.detail !== 0/);
   assert.match(main, /installMobileRouteHistory\(\)/);
   assert.match(routes, /openMobileWorkspace/);
   assert.match(routes, /openMobileInspector/);
@@ -371,6 +416,15 @@ test("operation evidence uses one deduplicated live status outside its non-live 
   assert.match(chat, /aria-live="off"/);
 });
 
+test("delegated conversations remain identified inside dashboard chat panels", async () => {
+  const dashboard = await readFile(new URL("../src/components/dashboard-view.tsx", import.meta.url), "utf8");
+  assert.match(dashboard, /conversationKind === "delegated"/);
+  assert.match(dashboard, /delegated-chat-badge/);
+  assert.match(dashboard, /profile\.delegatedChat/);
+  assert.match(dashboard, /document\.elementFromPoint\(x, y\)/);
+  assert.match(dashboard, /isVisibleDashboardPoint\(host, event\.clientX, event\.clientY\)/);
+});
+
 test("mobile tab and Kanban CSS preserve scrolling, focus, scaled text, and touch targets", async () => {
   const [workspace, styles, appearance, liveSettings, audit] = await Promise.all([
     readFile(new URL("../src/components/chat-workspace.tsx", import.meta.url), "utf8"),
@@ -385,8 +439,11 @@ test("mobile tab and Kanban CSS preserve scrolling, focus, scaled text, and touc
   assert.match(styles, /\.mobile-chat-tabs \{[^}]*overflow-x: auto/);
   assert.match(styles, /\.mobile-chat-tabs button:focus-visible \{[^}]*outline: 2px solid/);
   assert.match(styles, /\.mobile-chat-tabs button \{[^}]*clamp\(148px, 48vw, 220px\)/);
-  assert.match(styles, /\.chat-operation-ledger > summary \{[^}]*min-height: 44px/);
-  assert.match(styles, /\.chat-operation-ledger > summary:focus-visible \{[^}]*outline: 2px solid/);
+  assert.match(styles, /\.side-rail\[data-mobile-profiles-open="true"\] \.sidebar-session \{[^}]*touch-action: pan-y/);
+  assert.match(styles, /\.side-rail\[data-mobile-profiles-open="true"\] \.sidebar-session > i \{[^}]*touch-action: none/);
+  assert.match(styles, /\.user-instruction-body\.is-collapsed \{[^}]*max-height: calc\(1\.65em \* 10\)/);
+  assert.match(styles, /\.user-instruction:hover \.user-instruction-utilities,[\s\S]*opacity: 1/);
+  assert.match(styles, /@media \(hover: none\) \{[\s\S]*\.user-instruction-copy \{[^}]*var\(--target-mobile, 44px\)/);
 
   assert.match(styles, /--text-xs: calc\(12px \* var\(--font-scale, 1\)\)/);
   assert.match(styles, /--text-sm: calc\(13px \* var\(--font-scale, 1\)\)/);
@@ -402,10 +459,10 @@ test("mobile tab and Kanban CSS preserve scrolling, focus, scaled text, and touc
   assert.match(styles, /\.task-comment-list header \{[^}]*flex-wrap: wrap/);
   assert.match(styles, /\.task-comment-form \{[^}]*minmax\(var\(--target-mobile\), max-content\)/);
 
-  for (const selector of [".live-settings__tabs button", ".skill-line p", ".settings-ledger textarea", ".memory-gauge span", ".settings-field"]) {
+  for (const selector of [".live-settings__tabs button", ".skill-line p", ".settings-ledger textarea", ".memory-gauge-metrics > span", ".settings-field"]) {
     assert.match(declarationsForSelector(liveSettings, selector), /var\(--ls-text-|var\(--font-scale\)/, `${selector} must follow the selected font scale`);
   }
-  for (const selector of [".access-audit__title p", ".access-audit__current strong", ".access-audit__rail li", ".access-audit__message", ".access-audit footer"]) {
+  for (const selector of [".access-audit__title p", ".access-audit__current strong", ".access-audit__rail li", ".access-audit__message", ".access-audit__logout-copy p"]) {
     assert.match(declarationsForSelector(audit, selector), /var\(--font-scale\)|var\(--text-/, `${selector} must follow the selected font scale`);
   }
 });
@@ -452,7 +509,7 @@ test("small phones preserve scaled primary navigation, safe areas, and touch tar
 
 test("compact Profile overlays keep 44px controls through 768, 1024, and 1279px", async () => {
   const appearance = await readFile(new URL("../src/appearance.css", import.meta.url), "utf8");
-  const compactRule = appearance.match(/@media \(max-width: (1279)px\) \{([\s\S]*?)\n\}\n\n@media \(max-width: 767px\)/);
+  const compactRule = appearance.match(/@media \(max-width: (1279)px\) \{([\s\S]*?)\n\}\n\n@media \(max-width: 768px\)/);
   assert.ok(compactRule, "compact touch-target rules must precede the phone-only rules");
   const maxWidth = Number(compactRule[1]);
   for (const viewport of [768, 1024, 1279]) {

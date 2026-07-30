@@ -10,6 +10,7 @@ import { appModalSizes, createModalResizeHandlers, getAppModalSize, shouldIgnore
 import { CharacterPortrait } from "./character-portrait";
 import { LiveSettings } from "./live-settings";
 import { useMobileOverlay } from "./use-mobile-overlay";
+import { useModalOutsideClose } from "./use-modal-outside-close";
 import { CloseIcon } from "./icons";
 import {
   profileDisplayName,
@@ -32,6 +33,7 @@ export function ProfileSettingsModal() {
   const modalSize = getAppModalSize("profile-settings");
   const resize = useMemo(() => createModalResizeHandlers("profile-settings"), []);
   useEffect(() => () => resize.dispose(), [resize]);
+  const outsideClose = useModalOutsideClose(closeProfileSettingsModal);
   const [editingName, setEditingName] = useState(false);
   const [nameDraft, setNameDraft] = useState("");
 
@@ -50,7 +52,7 @@ export function ProfileSettingsModal() {
   };
 
   return (
-    <div class="profile-settings-modal-layer" data-modal-affordance="true" role="presentation" onPointerDown={(event) => { if (shouldIgnoreModalOutsideClose()) return; if (event.target === event.currentTarget) closeProfileSettingsModal(); }} onClick={(event) => { if (shouldIgnoreModalOutsideClose()) return; if (event.target === event.currentTarget) closeProfileSettingsModal(); }}>
+    <div class="profile-settings-modal-layer" data-modal-affordance="true" role="presentation" {...outsideClose}>
       <button class="profile-settings-modal-scrim" type="button" aria-label={t("common.close")} onClick={() => { if (!shouldIgnoreModalOutsideClose()) closeProfileSettingsModal(); }} />
       <section
         ref={overlay.ref}

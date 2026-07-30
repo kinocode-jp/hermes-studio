@@ -15,6 +15,12 @@ fn owned_launch_failures_map_to_safe_specific_notices() {
         StartupNoticeKind::OwnedBundledResourceUnavailable
     );
     assert_eq!(
+        StartupNoticeKind::from(OwnedServerLaunchError::RemoteConfigurationUnavailable {
+            detail: "keychain locked".into()
+        }),
+        StartupNoticeKind::OwnedRemoteConfigurationUnavailable
+    );
+    assert_eq!(
         StartupNoticeKind::from(OwnedServerLaunchError::ChildLaunchFailed {
             detail: "spawn failed".into()
         }),

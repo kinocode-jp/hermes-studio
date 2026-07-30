@@ -20,6 +20,8 @@ import { HostApps } from "./host-apps";
 import { HermesAgentUpdate } from "./hermes-agent-update";
 import { InfoTip } from "./info-tip";
 import { CloseIcon, EditIcon, PlusIcon, RefreshIcon, SaveIcon, TrashIcon } from "./icons";
+import { useMobileOverlay } from "./use-mobile-overlay";
+import { useModalOutsideClose } from "./use-modal-outside-close";
 import {
   REASONING_EFFORT_VALUES,
   fetchLiveChatModels,
@@ -111,6 +113,7 @@ export function LiveSettings({ profileId, profileLabel, scope = "all", initialTa
   const [global, setGlobal] = useState<GlobalAgentSettings | null>(null);
   const [profile, setProfile] = useState<ProfileAgentSettings | null>(null);
   const [agentBehavior, setAgentBehavior] = useState<ProfileAgentBehavior | null>(null);
+  const [sharedSubagentCandidatesRevision, setSharedSubagentCandidatesRevision] = useState(0);
   const [sharedSubagentCandidates, setSharedSubagentCandidates] = useState<SharedSubagentCandidate[]>([]);
   const [preferredCandidateIds, setPreferredCandidateIds] = useState<string[]>([]);
   const [subagentProviders, setSubagentProviders] = useState<LiveChatProviderOption[]>([]);
@@ -196,15 +199,21 @@ export function LiveSettings({ profileId, profileLabel, scope = "all", initialTa
         : ["global", "project", "skills", "soul", "memory", "config", "privileged"]);
   const allowedTabKey = allowedTabs.join("|");
   const tabLabels: Record<SettingsTab, string> = {
-    global: t("settings.global"),
+    global: t(scope === "global-host" ? "settings.scope.global" : "settings.global"),
     project: t("settings.project"),
     skills: t("settings.skills"),
     soul: t("settings.identity"),
     memory: t("settings.memory"),
     config: t("settings.config"),
     privileged: t("settings.privileged"),
-    host: t("hostAdmin.title"),
+    host: t(scope === "global-host" ? "settings.scope.host" : "hostAdmin.title"),
   };
+  const globalHostTabDetails: Partial<Record<SettingsTab, string>> = scope === "global-host"
+    ? {
+      global: t("settings.scope.globalDetail"),
+      host: t("settings.scope.hostDetail"),
+    }
+    : {};
   const settingsTitle = scope === "profile"
     ? t("profile.settings")
     : scope === "global-host"
@@ -398,6 +407,7 @@ export function LiveSettings({ profileId, profileLabel, scope = "all", initialTa
         setUsageBySkill(skillUsage);
         if (cachedCore.behavior) {
           setAgentBehavior(cachedCore.behavior.profile);
+          setSharedSubagentCandidatesRevision(cachedCore.behavior.sharedRevision);
           const shared = cachedCore.behavior.sharedCandidates.map((item) => ({ ...item }));
           setSharedSubagentCandidates(shared);
           initialSharedCandidatesRef.current = shared.map((item) => ({ ...item }));
@@ -449,6 +459,7 @@ export function LiveSettings({ profileId, profileLabel, scope = "all", initialTa
 
       if (nextBehavior) {
         setAgentBehavior(nextBehavior.profile);
+        setSharedSubagentCandidatesRevision(nextBehavior.sharedRevision);
         const shared = nextBehavior.sharedCandidates.map((item) => ({ ...item }));
         setSharedSubagentCandidates(shared);
         initialSharedCandidatesRef.current = shared.map((item) => ({ ...item }));
@@ -457,6 +468,7 @@ export function LiveSettings({ profileId, profileLabel, scope = "all", initialTa
         setPreferredSubagent(nextBehavior.profile.preferredSubagent);
       } else {
         setAgentBehavior(null);
+        setSharedSubagentCandidatesRevision(0);
         setSharedSubagentCandidates([]);
         initialSharedCandidatesRef.current = [];
         setPreferredCandidateIds([]);
@@ -704,7 +716,7 @@ export function LiveSettings({ profileId, profileLabel, scope = "all", initialTa
       .slice(0, 3);
     const derivedPreferred = selected[0]
       ? (selected[0].label.trim() || [selected[0].provider, selected[0].model].filter(Boolean).join("/") || preferredSubagent)
-      : preferredSubagent;
+      : "";
     const submitted = {
       subagentAuto,
       preferredSubagent: derivedPreferred,
@@ -714,12 +726,14 @@ export function LiveSettings({ profileId, profileLabel, scope = "all", initialTa
     void perform("agent-behavior", "agent-behavior", async () => {
       const updated = await updateAgentBehavior(profile.profile, {
         expectedRevision: agentBehavior.revision,
+        expectedSharedRevision: sharedSubagentCandidatesRevision,
         subagentMode: submitted.subagentAuto ? "auto" : "manual",
         preferredSubagent: submitted.preferredSubagent,
         preferredCandidateIds: submitted.preferredCandidateIds,
         sharedCandidates: submitted.sharedCandidates,
       });
       setAgentBehavior(updated.profile);
+      setSharedSubagentCandidatesRevision(updated.sharedRevision);
       const shared = updated.sharedCandidates.map((item) => ({ ...item }));
       setSharedSubagentCandidates(shared);
       initialSharedCandidatesRef.current = shared.map((item) => ({ ...item }));
@@ -1139,15 +1153,6 @@ export function LiveSettings({ profileId, profileLabel, scope = "all", initialTa
         </header>
       )}
 
-      {showAccessAudit && canReadAudit && <AccessAudit />}
-
-      {visibleTab !== "host" && !currentTabWritable && (
-        <div class="live-settings__notice is-read-only" role="status">
-          <span>{t("settings.readOnly")}</span>
-          <p>{mutationAccess.localOwner ? t("settings.permissionUnavailable") : t("settings.localOwnerRequired")}</p>
-        </div>
-      )}
-
       {showTabs && (
         <nav class="live-settings__tabs" aria-label={t("settings.categories")}>
           {allowedTabs.map((id) => (
@@ -1162,10 +1167,26 @@ export function LiveSettings({ profileId, profileLabel, scope = "all", initialTa
               disabled={id !== "global" && id !== "host" && !profileId}
               // Keep tabs clickable even while background refresh is running.
             >
-              {tabLabels[id]}
+              <span>{tabLabels[id]}</span>
+              {globalHostTabDetails[id] && <small>{globalHostTabDetails[id]}</small>}
             </button>
           ))}
         </nav>
+      )}
+
+      {scope === "global-host" && (
+        <header class="settings-scope-intro">
+          <span>{visibleTab === "host" ? t("settings.scope.hostEyebrow") : t("settings.scope.globalEyebrow")}</span>
+          <h1>{tabLabels[visibleTab]}</h1>
+          <p>{visibleTab === "host" ? t("settings.scope.hostLead") : t("settings.scope.globalLead")}</p>
+        </header>
+      )}
+
+      {visibleTab !== "host" && !currentTabWritable && (
+        <div class="live-settings__notice is-read-only" role="status">
+          <span>{t("settings.readOnly")}</span>
+          <p>{mutationAccess.localOwner ? t("settings.permissionUnavailable") : t("settings.localOwnerRequired")}</p>
+        </div>
       )}
 
       {error && (
@@ -1181,9 +1202,22 @@ export function LiveSettings({ profileId, profileLabel, scope = "all", initialTa
       ) : visibleTab === "host" ? (
         showDeviceAdmin && (
           <>
-            <HermesAgentUpdate permitted={mutationAccess.hermesUpdate} />
-            <HostApps permitted={mutationAccess.hostApps} vaultAccess={mutationAccess.obsidianVaults} />
-            <DeviceAdmin />
+            <section class="settings-host-group" aria-labelledby="settings-host-runtime-title">
+              <header>
+                <h2 id="settings-host-runtime-title">{t("settings.host.runtimeTitle")}</h2>
+                <p>{t("settings.host.runtimeLead")}</p>
+              </header>
+              <HermesAgentUpdate permitted={mutationAccess.hermesUpdate} />
+              <HostApps permitted={mutationAccess.hostApps} vaultAccess={mutationAccess.obsidianVaults} />
+            </section>
+            <section class="settings-host-group" aria-labelledby="settings-host-access-title">
+              <header>
+                <h2 id="settings-host-access-title">{t("settings.host.accessTitle")}</h2>
+                <p>{t("settings.host.accessLead")}</p>
+              </header>
+              <DeviceAdmin />
+              {showAccessAudit && canReadAudit && <AccessAudit />}
+            </section>
           </>
         )
       ) : visibleTab === "global" ? (
@@ -1539,7 +1573,7 @@ export function LiveSettings({ profileId, profileLabel, scope = "all", initialTa
                           value={newProjectName}
                           maxLength={200}
                           placeholder={t("settings.projects.namePlaceholder")}
-                          disabled={!mutationAccess.project}
+                          disabled={!mutationAccess.project || busy.has("projects:create")}
                           aria-label={t("settings.projects.namePlaceholder")}
                           onInput={(event) => setNewProjectName(event.currentTarget.value)}
                         />
@@ -1553,6 +1587,7 @@ export function LiveSettings({ profileId, profileLabel, scope = "all", initialTa
                           class="settings-projects__quiet"
                           aria-label={t("settings.skillEditor.close")}
                           title={t("settings.skillEditor.close")}
+                          disabled={busy.has("projects:create")}
                           onClick={() => setNewProjectFormOpen(false)}
                         ><CloseIcon /></button>
                       </form>
@@ -1560,7 +1595,7 @@ export function LiveSettings({ profileId, profileLabel, scope = "all", initialTa
                       <button
                         type="button"
                         class="settings-projects__new"
-                        disabled={!mutationAccess.project}
+                        disabled={!mutationAccess.project || busy.has("projects:create")}
                         onClick={() => setNewProjectFormOpen(true)}
                       ><PlusIcon /> {t("settings.projects.create")}</button>
                     )}
@@ -2312,6 +2347,14 @@ function SkillContentModal({
   const [content, setContent] = useState<SkillContent | null>(null);
   const [draft, setDraft] = useState("");
   const dirty = content !== null && draft !== content.content;
+  const close = () => { if (!saving) onClose(); };
+  const outsideClose = useModalOutsideClose(close);
+  const overlay = useMobileOverlay<HTMLElement>({
+    kind: "modal",
+    open: true,
+    onClose: close,
+    viewport: "(min-width: 0px)",
+  });
 
   useEffect(() => {
     let cancelled = false;
@@ -2350,36 +2393,21 @@ function SkillContentModal({
     }
   };
 
-  useEffect(() => {
-    const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === "Escape") {
-        event.preventDefault();
-        event.stopPropagation();
-        onClose();
-      }
-    };
-    window.addEventListener("keydown", onKeyDown, true);
-    return () => window.removeEventListener("keydown", onKeyDown, true);
-  }, [onClose]);
-
   const modal = (
     <div
       class="skill-editor-layer"
       role="presentation"
       data-modal-affordance="true"
-      onPointerDown={(event) => {
-        if (event.target === event.currentTarget) onClose();
-      }}
-      onClick={(event) => {
-        if (event.target === event.currentTarget) onClose();
-      }}
+      {...outsideClose}
     >
-      <button class="skill-editor-scrim" type="button" aria-label={t("common.close")} title={t("common.close")} onClick={onClose} />
+      <button class="skill-editor-scrim" type="button" disabled={saving} aria-label={t("common.close")} title={t("common.close")} onClick={close} />
       <section
+        ref={overlay.ref}
         class="skill-editor-modal"
         role="dialog"
         aria-modal="true"
         aria-labelledby="skill-editor-title"
+        tabIndex={-1}
         onPointerDown={(event) => event.stopPropagation()}
         onClick={(event) => event.stopPropagation()}
       >
@@ -2394,7 +2422,7 @@ function SkillContentModal({
               </small>
             )}
           </div>
-          <button type="button" class="skill-editor-close" onClick={onClose} aria-label={t("common.close")} title={t("common.close")}><CloseIcon /></button>
+          <button type="button" class="skill-editor-close" disabled={saving} onClick={close} aria-label={t("common.close")} title={t("common.close")}><CloseIcon /></button>
         </header>
         <div class="skill-editor-body">
           <div class="skill-editor-meta">
@@ -2435,7 +2463,7 @@ function SkillContentModal({
           )}
         </div>
         <footer class="skill-editor-actions">
-          <button type="button" class="quiet-button" onClick={onClose} aria-label={t("settings.skillEditor.close")} title={t("settings.skillEditor.close")}><CloseIcon /></button>
+          <button type="button" class="quiet-button" disabled={saving} onClick={close} aria-label={t("settings.skillEditor.close")} title={t("settings.skillEditor.close")}><CloseIcon /></button>
           <button
             type="button"
             class="primary-button"
@@ -2470,14 +2498,36 @@ function SectionHead({ title, note, info }: { title: string; note?: string; info
 /** Modal directory browser backed by the read-only host fs listing API. */
 function DirectoryPicker({ onPick, onClose }: { onPick(path: string): void; onClose(): void }) {
   const [listing, setListing] = useState<HostDirListing | null>(null);
+  const [loading, setLoading] = useState(false);
   const [error, setError] = useState(false);
+  const requestGeneration = useRef(0);
+  const overlay = useMobileOverlay<HTMLDivElement>({
+    kind: "modal",
+    open: true,
+    onClose,
+    viewport: "(min-width: 0px)",
+  });
   const load = useCallback((path?: string) => {
+    const generation = ++requestGeneration.current;
     setError(false);
-    listHostDirs(path).then(setListing).catch(() => setError(true));
+    setLoading(true);
+    void listHostDirs(path)
+      .then((next) => {
+        if (requestGeneration.current === generation) setListing(next);
+      })
+      .catch(() => {
+        if (requestGeneration.current === generation) setError(true);
+      })
+      .finally(() => {
+        if (requestGeneration.current === generation) setLoading(false);
+      });
   }, []);
-  useEffect(() => { load(); }, [load]);
+  useEffect(() => {
+    load();
+    return () => { requestGeneration.current += 1; };
+  }, [load]);
   return (
-    <div class="dir-picker-layer" role="dialog" aria-modal="true" aria-label={t("settings.projects.chooseFolder")}>
+    <div ref={overlay.ref} class="dir-picker-layer" role="dialog" aria-modal="true" aria-label={t("settings.projects.chooseFolder")} tabIndex={-1}>
       <div class="dir-picker-scrim" onClick={onClose} />
       <div class="dir-picker">
         <header>
@@ -2485,20 +2535,20 @@ function DirectoryPicker({ onPick, onClose }: { onPick(path: string): void; onCl
           <button type="button" class="dir-picker__close" aria-label={t("settings.skillEditor.close")} title={t("settings.skillEditor.close")} onClick={onClose}><CloseIcon /></button>
         </header>
         <div class="dir-picker__path"><code>{listing?.path ?? "…"}</code></div>
-        <div class="dir-picker__list">
+        <div class="dir-picker__list" aria-busy={loading}>
           {error && <p class="dir-picker__error">{t("settings.loadFailed")}</p>}
           {listing && (
             <>
               {listing.parent !== null && (
-                <button type="button" class="dir-picker__row is-up" onClick={() => load(listing.parent!)}>
+                <button type="button" class="dir-picker__row is-up" disabled={loading} onClick={() => load(listing.parent!)}>
                   <span aria-hidden="true">↑</span> ..
                 </button>
               )}
-              <button type="button" class="dir-picker__row is-home" onClick={() => load(listing.home)}>
+              <button type="button" class="dir-picker__row is-home" disabled={loading} onClick={() => load(listing.home)}>
                 <span aria-hidden="true">⌂</span> {t("settings.projects.home")}
               </button>
               {listing.dirs.map((dir) => (
-                <button type="button" key={dir.path} class="dir-picker__row" onClick={() => load(dir.path)}>
+                <button type="button" key={dir.path} class="dir-picker__row" disabled={loading} onClick={() => load(dir.path)}>
                   <span aria-hidden="true">▸</span> {dir.name}
                 </button>
               ))}
@@ -2508,7 +2558,9 @@ function DirectoryPicker({ onPick, onClose }: { onPick(path: string): void; onCl
         </div>
         <footer>
           <button type="button" class="dir-picker__cancel" onClick={onClose}>{t("settings.skillEditor.close")}</button>
-          <button type="button" class="dir-picker__pick" disabled={!listing} onClick={() => listing && onPick(listing.path)}>
+          <button type="button" class="dir-picker__pick" disabled={!listing || loading} onClick={() => {
+            if (listing && !loading) onPick(listing.path);
+          }}>
             {t("settings.projects.useThisFolder")}
           </button>
         </footer>

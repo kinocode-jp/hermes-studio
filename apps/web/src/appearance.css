@@ -103,7 +103,6 @@ html, body { height: 100%; }
 :root:not([data-theme="midnight"]) .mobile-chat-tabs { background: color-mix(in srgb, var(--surface-raised) 94%, transparent); }
 :root:not([data-theme="midnight"]) .topbar { box-shadow: var(--shadow-sm); }
 :root:not([data-theme="midnight"]) .side-rail-nav > button:hover { background: var(--surface); }
-:root:not([data-theme="midnight"]) .brand-mark,
 :root:not([data-theme="midnight"]) .user-button,
 :root:not([data-theme="midnight"]) .side-rail-nav > button.is-active,
 :root:not([data-theme="midnight"]) .mobile-chat-tabs button.is-active { color: var(--accent); background: var(--accent-soft); }

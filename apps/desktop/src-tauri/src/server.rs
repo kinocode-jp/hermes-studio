@@ -9,14 +9,22 @@ use std::{
 
 use tauri::Manager;
 
-use crate::capability::{DesktopCapability, OfficeServerProcess};
-use crate::constants::{OFFICE_HOST, OFFICE_PORT, START_TIMEOUT, STOP_TIMEOUT};
+use crate::capability::{
+    persist_desktop_capability, read_persisted_desktop_capability, AttachedServerCapability,
+    DesktopCapability, OfficeServerProcess,
+};
+use crate::constants::{
+    HEALTH_RESPONSE_TIMEOUT, OFFICE_HOST, OFFICE_PORT, START_TIMEOUT, STOP_TIMEOUT,
+};
 use crate::diagnostics::{
     child_stdio_paths, diagnostic_log_path, ensure_diagnostic_log, log_event,
 };
 use crate::health::{health_check, probe_existing_health, ProbeOutcome};
 use crate::hex_util::generate_desktop_capability;
-use crate::proof::desktop_readiness_proof_check;
+use crate::proof::{
+    desktop_readiness_proof_check, desktop_readiness_proof_outcome, DesktopProofOutcome,
+};
+use crate::remote_config::prepare_desktop_remote_environment;
 use crate::runtime::{
     inherit_office_remote_environment, inherit_safe_environment, resolve_managed_runtime,
 };
@@ -29,7 +37,7 @@ use crate::web_ui::{probe_existing_web_ui, WebUiProbeOutcome};
 #[cfg(debug_assertions)]
 use crate::runtime::{resolve_repo_root, resolve_tsx_cli};
 
-pub(crate) fn setup_office(app: &tauri::App) -> Result<OfficeLaunch, StartupFailure> {
+pub(crate) fn setup_office(app: &tauri::AppHandle) -> Result<OfficeLaunch, StartupFailure> {
     let _ = ensure_diagnostic_log();
     log_event("Desktop launcher starting Office setup.");
     let address = SocketAddr::from((Ipv4Addr::LOCALHOST, OFFICE_PORT));
@@ -73,17 +81,42 @@ pub(crate) fn setup_office(app: &tauri::App) -> Result<OfficeLaunch, StartupFail
                         .with_optional_log());
                 }
             };
+            if let Err(detail) = persist_desktop_capability(app, &desktop_capability) {
+                stop_office_server(&mut child);
+                return Err(StartupFailure::from_kind(StartupNoticeKind::InternalStateUnavailable)
+                    .with_detail(detail)
+                    .with_optional_log());
+            }
             *process = Some(child);
             *capability = Some(desktop_capability);
             log_event("Owned Office Server is ready; Web UI may open.");
             Ok(OfficeLaunch::OwnedReady)
         }
         OfficeStartup::CompatibleCandidate => {
-            // Same Web UI as a browser session: open the loopback Office origin.
-            // Do not claim process ownership, generate a desktop capability, or
-            // stop the listener when the shell exits.
+            // Public response shape is not identity. A second desktop instance
+            // may attach only when the existing listener proves knowledge of the
+            // first instance's user-private capability.
+            let capability = read_persisted_desktop_capability(app).ok_or_else(|| {
+                StartupFailure::from_kind(StartupNoticeKind::ExistingServerCandidate)
+                    .with_optional_log()
+            })?;
+            let deadline = Instant::now() + HEALTH_RESPONSE_TIMEOUT;
+            if desktop_readiness_proof_outcome(address, &capability, deadline)
+                != DesktopProofOutcome::Valid
+            {
+                return Err(StartupFailure::from_kind(
+                    StartupNoticeKind::ExistingServerCandidate,
+                )
+                .with_optional_log());
+            }
+            let attached_state = app.state::<AttachedServerCapability>();
+            let mut attached = attached_state.0.lock().map_err(|_| {
+                StartupFailure::from_kind(StartupNoticeKind::InternalStateUnavailable)
+                    .with_optional_log()
+            })?;
+            *attached = Some(capability);
             log_event(
-                "Compatible Office health and Web UI shape on the Office port; opening existing loopback Web UI.",
+                "Existing Office listener passed the private desktop ownership proof; opening its loopback Web UI without taking process ownership.",
             );
             Ok(OfficeLaunch::ExistingOpen)
         }
@@ -106,7 +139,7 @@ impl WithOptionalLog for StartupFailure {
 }
 
 pub(crate) fn start_office_server(
-    app: &tauri::App,
+    app: &tauri::AppHandle,
     desktop_capability: &str,
 ) -> Result<Child, OwnedServerLaunchError> {
     let resource_dir = app
@@ -135,13 +168,20 @@ pub(crate) fn start_office_server(
         hermes.display()
     ));
 
+    let remote_environment = prepare_desktop_remote_environment().map_err(|detail| {
+        log_event(&format!("Desktop remote configuration preparation failed: {detail}"));
+        OwnedServerLaunchError::RemoteConfigurationUnavailable { detail }
+    })?;
+
     let mut command = Command::new(&node);
     command.env_clear();
     inherit_safe_environment(&mut command);
-    // Office remote-device configuration is owned by the host environment, not
-    // hardcoded or stored in the browser. Pass it through to the server child
-    // only; do not forward it to the managed Hermes runtime.
-    inherit_office_remote_environment(&mut command, |key| env::var_os(key));
+    // Office remote-device configuration comes from the explicit host
+    // environment or the desktop owner's validated Keychain entry. Pass it to
+    // the server child only; do not forward it to managed Hermes runtimes.
+    inherit_office_remote_environment(&mut command, |key| {
+        env::var_os(key).or_else(|| remote_environment.lookup(key))
+    });
     command
         .arg(&script)
         .env("HERMES_STUDIO_HOST", OFFICE_HOST)
@@ -149,7 +189,11 @@ pub(crate) fn start_office_server(
         .env("HERMES_STUDIO_HERMES_MODE", "managed")
         .env("HERMES_STUDIO_HERMES_EXECUTABLE", &hermes)
         .env("HERMES_STUDIO_DESKTOP_CAPABILITY", desktop_capability)
-        .stdin(Stdio::null());
+        // Keep a private pipe open for the lifetime of the desktop parent. The
+        // server watches EOF and shuts itself down if the native shell crashes
+        // or is force-quit before Tauri can run its normal exit handler.
+        .env("HERMES_STUDIO_DESKTOP_PARENT_PIPE", "true")
+        .stdin(Stdio::piped());
 
     // Prefer serving the packaged web dist from the same origin when present so
     // a manual browser open of http://127.0.0.1:4317/ also works.
@@ -182,7 +226,7 @@ pub(crate) fn start_office_server(
 
 #[cfg(debug_assertions)]
 pub(crate) fn start_office_dev_server(
-    _app: &tauri::App,
+    _app: &tauri::AppHandle,
     desktop_capability: &str,
 ) -> Result<Child, OwnedServerLaunchError> {
     let repo_root = resolve_repo_root().map_err(|error| {
@@ -207,10 +251,17 @@ pub(crate) fn start_office_dev_server(
         repo_root.display()
     ));
 
+    let remote_environment = prepare_desktop_remote_environment().map_err(|detail| {
+        log_event(&format!("Desktop remote configuration preparation failed: {detail}"));
+        OwnedServerLaunchError::RemoteConfigurationUnavailable { detail }
+    })?;
+
     let mut command = Command::new(&node);
     command.env_clear();
     inherit_safe_environment(&mut command);
-    inherit_office_remote_environment(&mut command, |key| env::var_os(key));
+    inherit_office_remote_environment(&mut command, |key| {
+        env::var_os(key).or_else(|| remote_environment.lookup(key))
+    });
     command
         .current_dir(&repo_root)
         .arg(&tsx)
@@ -222,7 +273,8 @@ pub(crate) fn start_office_dev_server(
         .env("HERMES_STUDIO_HERMES_EXECUTABLE", &hermes)
         .env("HERMES_STUDIO_DESKTOP_CAPABILITY", desktop_capability)
         .env("HERMES_STUDIO_DESKTOP_ORIGINS", "http://localhost:4173")
-        .stdin(Stdio::null());
+        .env("HERMES_STUDIO_DESKTOP_PARENT_PIPE", "true")
+        .stdin(Stdio::piped());
     // Dev keeps console inheritance for interactive diagnosis; also mirror to log files.
     apply_child_stdio_dev(&mut command);
     command.spawn().map_err(|error| {

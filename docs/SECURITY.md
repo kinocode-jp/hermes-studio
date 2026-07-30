@@ -93,6 +93,13 @@ invalid-digest registry fails closed and does not reopen enrollment.
 
 - Browsers receive normalized Office DTOs rather than the Hermes token, Hermes
   backend URL, Profile filesystem paths, or raw provider-secret objects.
+- Local model discovery probes only fixed loopback OpenCodex/Ollama/LM Studio/
+  vLLM model-list URLs with short deadlines and bounded responses. It reads
+  provider/model identifiers only and writes only Studio-owned
+  `local-cli-*`/`local-runtime-*` custom endpoints with fixed loopback base URLs;
+  it never imports CLI credentials or client-supplied endpoint addresses. The
+  remote-safe `local-model-providers.sync` operation is therefore a bounded
+  rescan of host-local public metadata, not arbitrary profile configuration.
 - Schema-driven Hermes config is filtered fail-closed by field-id policy (not
   Hermes category merges alone): only ordinary non-secret, non-execution-
   adjacent leaves cross the Office boundary on the Advanced surface. Whole
@@ -227,6 +234,19 @@ browser or PWA—there is no native Hermes Studio app. Tailscale selects direct
 peer-to-peer or DERP relay transport; Office remains same-origin. Operator
 detail: [`TAILSCALE.md`](TAILSCALE.md).
 
+The installed macOS desktop app can own that same remote-enabled Office process
+through `npm run start:tailnet:desktop`. This uses the same discovery, exact
+origin, proxy-hop, Serve-conflict, Funnel, and token checks, then directly
+launches the packaged executable so the validated environment reaches its owned
+Office child. It refuses to start while port `4317` is occupied, avoiding an
+accidental attachment to an already-running local-only desktop server. The
+native app stores that already-validated configuration as one encrypted macOS
+Keychain generic-password item. Normal icon launches use it only when no remote
+configuration environment value is explicitly present; an explicit environment
+deployment takes precedence as a whole. Malformed, unsupported, locked, or denied Keychain data fails closed
+with a desktop startup notice. `npm run forget:tailnet:desktop` removes the saved
+item but does not alter persistent Tailscale Serve configuration.
+
 ## Desktop host administration panel
 
 The owner-only **Desktop Host Administration** panel is rendered only for
@@ -307,11 +327,13 @@ combined development or built web assets only when the Web UI is unavailable.
 Owned-server runtime, resource, child-launch, readiness, and internal-state
 failures also have separate fixed instructions.
 
-Changing remote access requires updating the host environment
+Changing server-only remote access requires updating the host environment
 (`HERMES_STUDIO_REMOTE_TOKEN`, and when not using `start:tailnet` also
 `HERMES_STUDIO_ALLOWED_ORIGINS` / `HERMES_STUDIO_TRUSTED_PROXY_HOPS`) and
-restarting Office. The optional `npm run start:tailnet` host launcher may set
-the single discovered HTTPS origin, default trusted proxy hops to `1`, and
+restarting Office. Desktop persistence is updated by rerunning
+`npm run start:tailnet:desktop` with the intended token and removed with
+`npm run forget:tailnet:desktop`. The optional `npm run start:tailnet` host
+launcher may set the single discovered HTTPS origin, default trusted proxy hops to `1`, and
 create private Tailscale Serve only when empty or already exact (never
 overwriting a different Serve config); no in-browser toggle, scheduler, or
 remote UI can modify those values. Serve configuration is owned by the host

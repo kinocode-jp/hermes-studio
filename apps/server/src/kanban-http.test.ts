@@ -3,6 +3,7 @@ import test from "node:test";
 import type { HermesRuntimeSource } from "./hermes-backend.js";
 import {
   HermesKanbanAdapter,
+  HermesKanbanCommitUnconfirmedError,
   type HermesKanbanRequest,
 } from "./hermes-kanban.js";
 import { createDemoRuntimeStatus, createDemoSnapshot } from "./demo-state.js";
@@ -232,6 +233,33 @@ test("Kanban HTTP boundary rejects unknown fields, unsafe transitions, and overs
     });
     assert.equal(oversized.status, 413);
     assert.equal(fixture.requests.length, 0);
+  } finally {
+    await server.close();
+  }
+});
+
+test("Kanban POST ambiguity returns a non-retryable commit-unconfirmed contract", async () => {
+  const fixture = makeFixture();
+  const adapter = new HermesKanbanAdapter({
+    listAllowedProfiles: () => ["mina"],
+    request: async () => { throw new HermesKanbanCommitUnconfirmedError(); },
+  });
+  const runtime = { ...fixture.runtime, kanban: () => adapter };
+  const server = createOfficeServer({ port: 0, runtimeSource: runtime, allowedOrigins: [ORIGIN] });
+  const address = await server.listen();
+  try {
+    const session = await bootstrap(`http://127.0.0.1:${address.port}`);
+    const response = await fetch(`http://127.0.0.1:${address.port}/api/v1/kanban/cards`, {
+      method: "POST",
+      headers: { ...headers({ ...session, csrf: session.csrf }), "Content-Type": "application/json" },
+      body: JSON.stringify({ title: "Maybe created" }),
+    });
+    assert.equal(response.status, 409);
+    assert.deepEqual(await response.json(), {
+      code: "commit_unconfirmed",
+      message: "Hermes may have committed this Kanban change; refresh before retrying.",
+      retryable: false,
+    });
   } finally {
     await server.close();
   }

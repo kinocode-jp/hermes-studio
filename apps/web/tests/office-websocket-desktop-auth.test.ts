@@ -117,9 +117,9 @@ test("desktop WebSocket send fails closed when the fresh IPC proof loses ownersh
   });
 });
 
-test("unowned desktop WebView falls through to local cookie auth (attached Office)", async () => {
-  // Existing compatible Office: shell opens http://127.0.0.1:4317/ with Tauri
-  // IPC still present, but desktop_owned is false — same auth path as a browser.
+test("a browser-like 127.0.0.1 page ignores an injected desktop bridge", async () => {
+  // A normal loopback page remains on cookie auth even if a test/browser host
+  // happens to expose an object with the same shape as the Tauri bridge.
   await withBrowserEnvironment({
     protocol: "http:",
     hostname: "127.0.0.1",
@@ -150,7 +150,7 @@ test("unowned desktop WebView falls through to local cookie auth (attached Offic
   });
 });
 
-test("null ownership on packaged Tauri assets also falls through to local auth", async () => {
+test("null ownership on packaged Tauri assets fails closed without local auth", async () => {
   await withBrowserEnvironment({
     protocol: "tauri:",
     hostname: "tauri.localhost",
@@ -163,17 +163,16 @@ test("null ownership on packaged Tauri assets also falls through to local auth",
       fetches += 1;
       const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
       assert.match(url, /\/api\/v1\/auth\/local$/);
-      return jsonResponse({
-        principal: { id: "local-browser", tier: "owner", local: true, deviceName: "Local browser" },
-        csrfToken: "c".repeat(32),
-        expiresAt: "2099-01-01T00:00:00.000Z",
-      });
+      return jsonResponse({ ok: true });
     }) as typeof fetch;
     try {
       const serverUrl = "http://127.0.0.1:4317/attached-assets";
-      await openOfficeWebSocket("ws://127.0.0.1:4317/api/v1/events", serverUrl);
-      assert.equal(fetches, 1);
-      assert.equal(BareWebSocket.byPath("/api/v1/events").length, 1);
+      await assert.rejects(
+        openOfficeWebSocket("ws://127.0.0.1:4317/api/v1/events", serverUrl),
+        /does not own an authenticated desktop server/,
+      );
+      assert.equal(fetches, 0);
+      assert.equal(BareWebSocket.byPath("/api/v1/events").length, 0);
     } finally {
       globalThis.fetch = originalFetch;
     }

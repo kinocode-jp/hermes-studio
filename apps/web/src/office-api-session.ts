@@ -55,11 +55,15 @@ export function setAuthRequiredObserver(observer: ((serverUrl: string) => void) 
 export function officeServerUrl(): string {
   const configured = import.meta.env.VITE_OFFICE_SERVER_URL?.trim();
   if (configured) return configured.replace(/\/$/, "");
+  // Dev-only port override so the dev API (e.g. 4318) can run alongside the
+  // desktop app's fixed 4317 server. Production/desktop builds leave it unset.
+  const configuredPort = (import.meta.env.VITE_OFFICE_API_PORT as string | undefined)?.trim();
+  const apiPort = configuredPort && /^\d{2,5}$/.test(configuredPort) ? configuredPort : "4317";
   if (location.protocol === "tauri:" || location.hostname === "tauri.localhost") {
-    return "http://127.0.0.1:4317";
+    return `http://127.0.0.1:${apiPort}`;
   }
   if (location.hostname === "localhost" || location.hostname === "127.0.0.1") {
-    return `${location.protocol}//${location.hostname}:4317`;
+    return `${location.protocol}//${location.hostname}:${apiPort}`;
   }
   return location.origin;
 }
@@ -220,10 +224,21 @@ async function requestOfficeJson<T>(url: URL, options: OfficeApiRequestOptions, 
       const replacement = await recoverOfficeSession(serverUrl, session.authRevision);
       return await requestOfficeJson<T>(url, options, replacement, serverUrl, false);
     }
-    if (!response.ok) throw new OfficeHttpError(response.status);
+    if (!response.ok) throw new OfficeHttpError(response.status, await officeErrorCode(response));
     return await response.json() as T;
   } finally {
     window.clearTimeout(timeout);
+  }
+}
+
+async function officeErrorCode(response: Response): Promise<string | undefined> {
+  try {
+    const value = await response.json() as unknown;
+    if (!value || typeof value !== "object") return undefined;
+    const code = (value as { code?: unknown }).code;
+    return typeof code === "string" && code.length <= 64 ? code : undefined;
+  } catch {
+    return undefined;
   }
 }
 
