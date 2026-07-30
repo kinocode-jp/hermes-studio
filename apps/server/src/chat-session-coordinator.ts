@@ -1,7 +1,7 @@
 const DEFAULT_PROFILE = "default";
-// The UI exposes at most four foreground chats, while dispatcher workflows can
-// keep delegated or closing runs alive off-screen. These are bounded defaults,
-// not protocol constants; operators can tune them for the host.
+// Visible panes are not capped by these values. They bound simultaneous live
+// Hermes leases while dispatcher workflows may also keep delegated or closing
+// runs alive off-screen. Operators can tune these host defaults.
 export const MAX_CHAT_SESSION_LEASES_PER_OWNER = 16;
 export const MAX_CHAT_SESSION_LEASES_PER_PROFILE = 8;
 export const MAX_CHAT_SESSION_LEASES_TOTAL = 256;

@@ -7,7 +7,15 @@ import { isScheduledSessionHidden } from "./scheduled-sessions";
 import { mergeServerSessionStatus } from "./session-runtime";
 import { reconcileDefaultAvatarProfiles, registerDefaultAvatarProfiles } from "./avatar-preferences";
 import { ensurePokemonDisplayNames } from "./profile-names";
-import { activeSessionId, dismissSessions, openSessionIds, profileList, selectedProfileId, sessions } from "./store";
+import {
+  activeSessionId,
+  dismissSessions,
+  openSessionIds,
+  profileList,
+  selectedProfileId,
+  sessions,
+  setProfileChatModalSessionInventoryAuthoritative,
+} from "./store";
 
 type InventoryKind = "profiles" | "sessions";
 type InventoryPage = {
@@ -61,6 +69,7 @@ export function initializeInventory(snapshot: OfficeSnapshot, source: string | O
     && isTerminal(snapshot.inventory.sessions);
   // Publish identity last so consumers never pair a new identity with stale pagination.
   inventorySnapshotIdentity.value = snapshotIdentity;
+  setProfileChatModalSessionInventoryAuthoritative(sessionInventoryComplete.value);
 }
 
 export function registerInventorySnapshotRefresh(action: SnapshotRefresh | undefined): void {
@@ -181,6 +190,7 @@ function invalidateInventoryAuthentication(serverUrl: string): void {
   inventoryIdentity = undefined;
   inventorySnapshotIdentity.value = undefined;
   sessionInventoryComplete.value = false;
+  setProfileChatModalSessionInventoryAuthoritative(false);
   profileInventoryState.value = invalidatedState(profileInventoryState.value);
   sessionInventoryState.value = invalidatedState(sessionInventoryState.value);
 }
@@ -208,6 +218,7 @@ function commitInventoryPage(page: InventoryPage, identity: InventoryIdentity): 
     mergeSessions(page.sessions, identity.seenSessions);
     sessionInventoryComplete.value = identity.sessionsReliable && isTerminal(page.pagination);
     if (sessionInventoryComplete.value) pruneSessions(identity.seenSessions);
+    setProfileChatModalSessionInventoryAuthoritative(sessionInventoryComplete.value);
   }
 }
 

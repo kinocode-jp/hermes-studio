@@ -45,12 +45,9 @@ export const profileChatModalPaneIds = signal<string[]>([]);
 export const profileChatModalActivePaneId = signal("");
 /** Chat sessions rendered inside another modal (currently Kanban task detail). */
 export const embeddedChatSessionIds = signal<string[]>([]);
-/** Chat panes share one multiplexed WebSocket, so this is a UI bound, not a socket bound. */
-// Keep this aligned with the server's per-device live-session lease limit.
-// Opening a fifth pane releases the oldest live session before starting the
-// new one; durable conversation history remains untouched.
-export const MAX_OPEN_CHAT_SESSIONS = 4;
-export const MAX_PROFILE_CHAT_MODAL_PANES = 4;
+/** Server-default live lease bounds; visible panes are not limited by these. */
+export const MAX_LIVE_CHAT_SESSIONS = 16;
+export const MAX_LIVE_CHAT_SESSIONS_PER_PROFILE = 8;
 export const chatSocketState = signal<{ state: ChatConnectionState; message: RuntimeMessage }>({
   state: "disconnected",
   message: officeMessage("runtime.chat.waiting")

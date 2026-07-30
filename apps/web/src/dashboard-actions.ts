@@ -8,9 +8,9 @@
  * match the target dashboard's chat panels. dashboard-layout.ts stays pure
  * and never imports store.ts.
  */
-import { effect } from "@preact/signals";
+import { effect, untracked } from "@preact/signals";
 import { officeInventoryReliability } from "@hermes-studio/protocol";
-import type { OfficeConnection, OfficeInventoryPagination, OfficeSnapshotRequestIdentity } from "./domain";
+import type { ChatSession, OfficeConnection, OfficeInventoryPagination, OfficeSnapshotRequestIdentity } from "./domain";
 import { inventorySnapshotIdentity, sessionInventoryComplete, sessionInventoryState } from "./inventory";
 import { latestOfficeSnapshotIdentity } from "./store-state";
 import {
@@ -20,7 +20,6 @@ import {
   dashboardContainingPanel,
   deleteDashboard,
   initialDashboardNeedsDefaultChat,
-  MAX_CHAT_PANELS,
   MAX_DASHBOARD_PANELS,
   movePanel,
   newPanelId,
@@ -29,6 +28,7 @@ import {
   replacePanelInActiveDashboard,
   replaceDashboardPanels,
   removePanel,
+  setActiveDashboardChatPanel,
   switchDashboard,
   dashboards,
   activeDashboardId,
@@ -41,6 +41,7 @@ import {
   activeSessionId,
   closeSession,
   createSession,
+  dismissSessions,
   officeConnection,
   openSession,
   openSessionIds,
@@ -133,14 +134,13 @@ export function addDashboardPanel(kind: DashboardPanelKind, options?: { sessionI
     const sessionId = options?.sessionId;
     if (!sessionId || !sessions.value.some((session) => session.id === sessionId)) return "full";
     const already = activeDashboard.value.panels.some((panel) => panel.kind === "chat" && panel.sessionId === sessionId);
-    const chatCount = activeDashboard.value.panels.filter((panel) => panel.kind === "chat").length;
-    if (!already && chatCount >= MAX_CHAT_PANELS) return "full";
     if (!already && activeDashboard.value.panels.length >= MAX_DASHBOARD_PANELS) return "full";
     // openSession handles connection + eviction; the mirror effect adds the panel.
     openSession(sessionId, { workspace: true, ...(typeof options?.index === "number" ? { index: options.index } : {}) });
     mirrorOpenSessionsIntoActiveDashboard();
+    const panel = activeDashboard.value.panels.find((item) => item.kind === "chat" && item.sessionId === sessionId);
+    if (panel) setActiveDashboardChatPanel(panel.id);
     if (typeof options?.index === "number") {
-      const panel = activeDashboard.value.panels.find((item) => item.kind === "chat" && item.sessionId === sessionId);
       if (panel) movePanel(panel.id, options.index);
     }
     return already ? "focused" : "added";
@@ -181,36 +181,112 @@ export function activateDashboardContainingPanel(
   if (!dashboard) return false;
   activateDashboard(dashboard.id);
   if (kind === "chat" && options?.sessionId) {
+    const panel = activeDashboard.value.panels.find((item) =>
+      item.kind === "chat" && item.sessionId === options.sessionId,
+    );
+    if (panel) setActiveDashboardChatPanel(panel.id);
     openSession(options.sessionId, { workspace: true });
     activeSessionId.value = options.sessionId;
   }
   return true;
 }
 
-export type DashboardChatClickResult = AddPanelResult | ReplacePanelResult | "drag-required" | "missing";
+export type DashboardChatClickResult = AddPanelResult | ReplacePanelResult | "missing";
+
+function replaceableInitialChatPanel(): { panelId: string; sessionId: string } | undefined {
+  const candidates = activeDashboard.value.panels.flatMap((panel) => {
+    if (panel.kind !== "chat" || panel.sessionId === undefined) return [];
+    const session = sessions.value.find((item) => item.id === panel.sessionId);
+    return isReplaceableInitialChatSession(session)
+      ? [{ panelId: panel.id, sessionId: panel.sessionId }]
+      : [];
+  });
+  return candidates.find((candidate) => candidate.panelId === activeDashboard.value.activeChatPanelId)
+    ?? candidates.at(-1);
+}
+
+function isReplaceableInitialChatSession(session: ChatSession | undefined): boolean {
+  return session?.titlePresentation === "new-chat"
+    && session.messages.length === 0
+    && session.status !== "streaming";
+}
 
 /**
  * Sidebar click contract for an existing conversation:
- * - an entirely empty dashboard accepts the first chat panel;
- * - a non-empty dashboard without chat asks the user to drag;
- * - otherwise the sole or last-active chat panel switches sessions.
+ * - focus the pane if any dashboard already presents the conversation;
+ * - otherwise replace the sole or last-active chat pane without adding one;
+ * - if no dashboard has a chat pane, create a dashboard for the conversation.
  */
 export function selectDashboardChatSession(sessionId: string): DashboardChatClickResult {
   if (!sessions.value.some((session) => session.id === sessionId)) return "missing";
-  const panels = activeDashboard.value.panels;
-  if (panels.length === 0) return addDashboardPanel("chat", { sessionId });
 
-  const chatPanels = panels.filter((panel) => panel.kind === "chat" && panel.sessionId !== undefined);
-  if (chatPanels.length === 0) return "drag-required";
-
-  const existing = chatPanels.find((panel) => panel.sessionId === sessionId);
-  if (existing) {
+  // An already-visible conversation always wins, even when another pane is an
+  // unused startup composer. Clicking a visible conversation must only focus
+  // it; it must never move that pane or collapse the layout as a side effect.
+  const activeExisting = activeDashboard.value.panels.find((panel) =>
+    panel.kind === "chat" && panel.sessionId === sessionId,
+  );
+  if (activeExisting) {
+    setActiveDashboardChatPanel(activeExisting.id);
     openSession(sessionId, { workspace: true });
     activeSessionId.value = sessionId;
     return "focused";
   }
 
-  const lastActive = chatPanels.find((panel) => panel.sessionId === activeSessionId.value);
+  // A blank startup composer is a placeholder, not another conversation the
+  // user chose to keep. Once the active dashboard has no matching pane, replace
+  // the placeholder before searching other dashboards so a normal sidebar
+  // click never grows the visible pane count.
+  const initial = replaceableInitialChatPanel();
+  if (initial && initial.sessionId !== sessionId) {
+    const initialSession = sessions.value.find((session) => session.id === initial.sessionId);
+    const result = replaceDashboardPanel(initial.panelId, "chat", { sessionId });
+    if (result === "replaced"
+      && initialSession?.remoteKind === "draft"
+      && initialSession.storedSessionId === undefined) {
+      dismissSessions([initial.sessionId]);
+    }
+    return result;
+  }
+
+  const existingDashboard = dashboardContainingPanel("chat", { sessionId });
+  if (existingDashboard) {
+    activateDashboard(existingDashboard.id);
+    const existing = activeDashboard.value.panels.find((panel) =>
+      panel.kind === "chat" && panel.sessionId === sessionId,
+    );
+    if (existing) setActiveDashboardChatPanel(existing.id);
+    openSession(sessionId, { workspace: true });
+    activeSessionId.value = sessionId;
+    return "focused";
+  }
+
+  const activeWithChat = activeDashboard.value.panels.some((panel) => panel.kind === "chat")
+    ? activeDashboard.value
+    : undefined;
+  const dashboardWithChat = activeWithChat
+    ?? dashboards.value.find((dashboard) => dashboard.panels.some((panel) => panel.kind === "chat"));
+
+  if (!dashboardWithChat) {
+    const dashboardId = createDashboard();
+    if (!dashboardId) return "full";
+    const panelId = newPanelId();
+    dashboards.value = dashboards.value.map((dashboard) =>
+      dashboard.id === dashboardId
+        ? replaceDashboardPanels(dashboard, [{ id: panelId, kind: "chat", sessionId }])
+        : dashboard,
+    );
+    persistDashboards();
+    activateDashboard(dashboardId);
+    setActiveDashboardChatPanel(panelId);
+    return "added";
+  }
+
+  activateDashboard(dashboardWithChat.id);
+  const chatPanels = activeDashboard.value.panels.filter((panel) =>
+    panel.kind === "chat" && panel.sessionId !== undefined,
+  );
+  const lastActive = chatPanels.find((panel) => panel.id === activeDashboard.value.activeChatPanelId);
   const target = chatPanels.length === 1 ? chatPanels[0] : lastActive ?? chatPanels.at(-1);
   if (!target) return "missing";
   return replaceDashboardPanel(target.id, "chat", { sessionId });
@@ -242,7 +318,10 @@ export function replaceDashboardPanel(
   }
   setOfficeWindowOpen(activeDashboard.value.panels.some((panel) => panel.kind === "studio"));
   mirrorOpenSessionsIntoActiveDashboard();
-  if (kind === "chat" && options?.sessionId) activeSessionId.value = options.sessionId;
+  if (kind === "chat" && options?.sessionId) {
+    setActiveDashboardChatPanel(panelId);
+    activeSessionId.value = options.sessionId;
+  }
   else if (!openSessionIds.value.includes(activeSessionId.value)) activeSessionId.value = openSessionIds.value.at(-1) ?? "";
   return result;
 }
@@ -264,6 +343,10 @@ export function closeDashboardPanel(panelId: string): void {
 
 /** Switch dashboards, rewriting the open-session list to match the target. */
 export function activateDashboard(dashboardId: string): void {
+  const currentActivePanel = activeDashboard.value.panels.find((panel) =>
+    panel.kind === "chat" && panel.sessionId === activeSessionId.value,
+  );
+  if (currentActivePanel) setActiveDashboardChatPanel(currentActivePanel.id);
   const target = dashboards.value.find((dashboard) => dashboard.id === dashboardId);
   if (!target) return;
   if (target.defaultChatSeeded !== true) pendingDefaultChatDashboardIds.add(dashboardId);
@@ -285,7 +368,10 @@ export function activateDashboard(dashboardId: string): void {
   switchDashboard(dashboardId);
   if (target.panels.some((panel) => panel.kind === "studio")) setOfficeWindowOpen(true);
   mirrorOpenSessionsIntoActiveDashboard();
-  if (!wanted.includes(activeSessionId.value)) activeSessionId.value = wanted.at(-1) ?? "";
+  const preferred = target.panels.find((panel) =>
+    panel.id === target.activeChatPanelId && panel.kind === "chat" && panel.sessionId !== undefined,
+  )?.sessionId;
+  activeSessionId.value = preferred ?? wanted.at(-1) ?? "";
   initializeDefaultDashboardChat();
 }
 
@@ -355,19 +441,32 @@ export function installDashboardWiring(): () => void {
   const disposeRestore = effect(() => {
     const list = sessions.value;
     const authoritative = currentSessionInventoryIsAuthoritative(officeConnection.value);
+    if (switching) return;
     if (list.length === 0 && !authoritative) return;
     restoredPersistedChats = true;
-    const wanted = activeDashboard.value.panels
+    const dashboard = activeDashboard.value;
+    const wanted = dashboard.panels
       .filter((panel) => panel.kind === "chat" && panel.sessionId !== undefined
         && list.some((session) => session.id === panel.sessionId))
       .map((panel) => panel.sessionId!);
-    switching = true;
-    try {
-      for (const id of wanted) openSession(id, { workspace: true });
-    } finally {
-      switching = false;
-    }
-    mirrorOpenSessionsIntoActiveDashboard();
+    const preferred = dashboard.panels.find((panel) =>
+      panel.id === dashboard.activeChatPanelId && panel.kind === "chat",
+    )?.sessionId;
+    const restoreOrder = preferred && wanted.includes(preferred)
+      ? [...wanted.filter((sessionId) => sessionId !== preferred), preferred]
+      : wanted;
+    // openSession reads and writes active-target signals. Those are restoration
+    // side effects, not dependencies of this effect; tracking them causes a
+    // multi-pane restore to reactivate every pane forever.
+    untracked(() => {
+      switching = true;
+      try {
+        for (const id of restoreOrder) openSession(id, { workspace: true });
+      } finally {
+        switching = false;
+      }
+      mirrorOpenSessionsIntoActiveDashboard();
+    });
   });
 
   // Mirror the store's open sessions into the active dashboard (new chats,

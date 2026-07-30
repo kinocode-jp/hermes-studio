@@ -5,10 +5,10 @@ import {
   activeDashboard,
   dashboardEffectiveSizes,
   dashboardRowLayout,
-  MAX_CHAT_PANELS,
   MAX_DASHBOARD_PANELS,
   movePanel,
   resetActiveDashboardSizes,
+  setActiveDashboardChatPanel,
   setActiveDashboardSizes,
   type DashboardPanel,
   type DashboardPanelKind,
@@ -183,7 +183,7 @@ export function DashboardView() {
     if (!sessions.value.some((session) => session.id === sessionId)) return;
     if (target.mode === "replace") {
       const result = replaceDashboardPanel(target.panelId, "chat", { sessionId });
-      if (result === "full") showNote(t("dashboard.chatPanelLimit", { count: MAX_CHAT_PANELS }));
+      if (result === "full") showNote(t("dashboard.panelLimit", { count: MAX_DASHBOARD_PANELS }));
       return;
     }
     const existing = panels.find((panel) => panel.kind === "chat" && panel.sessionId === sessionId);
@@ -193,10 +193,7 @@ export function DashboardView() {
     }
     const result = addDashboardPanel("chat", { sessionId, index: target.index });
     if (result === "full") {
-      const chatCount = panels.filter((panel) => panel.kind === "chat").length;
-      showNote(chatCount >= MAX_CHAT_PANELS
-        ? t("dashboard.chatPanelLimit", { count: MAX_CHAT_PANELS })
-        : t("dashboard.panelLimit", { count: MAX_DASHBOARD_PANELS }));
+      showNote(t("dashboard.panelLimit", { count: MAX_DASHBOARD_PANELS }));
     }
   };
 
@@ -607,7 +604,15 @@ function DashboardPanelFrame({ panel, showDropBefore, showDropAfter, showDropRep
           onClick={() => closeDashboardPanel(panel.id)}
         ><CloseIcon width={16} height={16} /></button>
       </header>
-      <div class="dashboard-panel-body">
+      <div
+        class="dashboard-panel-body"
+        onPointerDownCapture={() => {
+          if (panel.kind === "chat") setActiveDashboardChatPanel(panel.id);
+        }}
+        onFocusCapture={() => {
+          if (panel.kind === "chat") setActiveDashboardChatPanel(panel.id);
+        }}
+      >
         <PanelContent panel={panel} />
       </div>
       {showDropAfter && <div class="workspace-drop-line is-after" aria-hidden="true"><span>{dropInsertLabel}</span></div>}

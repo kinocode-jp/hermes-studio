@@ -1,6 +1,6 @@
 /**
  * Profile Chat Modal — master/detail layout.
- * Left: recent sessions list. Right: up to 4 conversation panes for this profile.
+ * Left: recent sessions list. Right: the profile's selected conversation panes.
  */
 import { useEffect, useMemo, useRef, useState } from "preact/hooks";
 import {
@@ -8,7 +8,6 @@ import {
   closeProfileChatModal,
   createSession,
   ensureSessionConnection,
-  MAX_PROFILE_CHAT_MODAL_PANES,
   openMobileWorkspace,
   officeConnection,
   openProfileSettingsModal,
@@ -215,7 +214,7 @@ function OpenProfileChatModal({ profileId, profile }: { profileId: string; profi
       return true;
     }
     if (!addProfileChatModalPane(sessionId, { index: target.index })) {
-      showDropNote(t("profile.modalPaneLimit"));
+      showDropNote(t("profile.modalPaneAddFailed"));
       return false;
     }
     setDropNote(null);
@@ -594,7 +593,7 @@ function OpenProfileChatModal({ profileId, profile }: { profileId: string; profi
               <aside class="profile-chat-session-pane" aria-label={t("profile.openChats")}>
                 <div class="profile-chat-session-pane-head">
                   <b>{t("profile.recentChats")}</b>
-                  <span>{openPanes.length}/{MAX_PROFILE_CHAT_MODAL_PANES}</span>
+                  <span>{openPanes.length}</span>
                 </div>
                 <div class="profile-chat-session-list">
                   {visibleSessions.map((session) => (
@@ -605,11 +604,7 @@ function OpenProfileChatModal({ profileId, profile }: { profileId: string; profi
                       active={profileChatModalActivePaneId.value === session.id}
                       onSelect={() => {
                         if (consumeModalSessionClickSuppression(session.id)) return;
-                        if (openPaneIds.includes(session.id)) {
-                          setProfileChatModalActivePane(session.id);
-                        } else {
-                          selectProfileChatModalSession(session.id);
-                        }
+                        selectProfileChatModalSession(session.id);
                         setDropNote(null);
                       }}
                       onDelete={() => setSessionDeleteRequestId(session.id)}
@@ -636,11 +631,11 @@ function OpenProfileChatModal({ profileId, profile }: { profileId: string; profi
                     {t("profile.showRecentChats")}
                   </button>
                 )}
-                {dropTarget && <p class="profile-chat-drop-hint">{t("profile.modalDropToAddPane")}</p>}
+                {dropTarget && <p class="profile-chat-drop-hint">{t("profile.modalDropToAddPaneUnlimited")}</p>}
                 {dropNote && <p class="profile-chat-drop-note" role="status" aria-live="polite" aria-atomic="true">{dropNote}</p>}
               </aside>
 
-              <div class={`profile-chat-detail-pane panes-${Math.min(Math.max(openPanes.length, 1), MAX_PROFILE_CHAT_MODAL_PANES)} ${dropTarget ? "is-drop-target" : ""}`}>
+              <div class={`profile-chat-detail-pane ${openPanes.length > 4 ? "panes-many" : `panes-${Math.max(openPanes.length, 1)}`} ${dropTarget ? "is-drop-target" : ""}`}>
                 {openPanes.length > 0 ? (
                   openPanes.map((session, index) => (
                     <div
@@ -677,7 +672,7 @@ function OpenProfileChatModal({ profileId, profile }: { profileId: string; profi
                   ))
                 ) : (
                   <div class="profile-chat-empty">
-                    <p>{t("profile.modalDropToAddPane")}</p>
+                    <p>{t("profile.modalDropToAddPaneUnlimited")}</p>
                     {(newChatError || !canCreateChat) && (
                       <p class="profile-chat-new-error" role="alert">{t("profile.newChatUnavailable")}</p>
                     )}

@@ -213,6 +213,9 @@ Memory is separated into `Shared context`, `Profile memory`, and `Identity / SOU
 
 The phone does not shrink the office. It changes navigation:
 
+The packaged desktop window may be resized down to 320px, so it enters this
+same phone navigation mode when its content width falls below 768px.
+
 ```text
 ┌──────────────────────────┐
 │ Hermes Studio    ● Remote│

@@ -2,7 +2,8 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import type { ChatSession } from "../src/domain.ts";
 import {
-  MAX_OPEN_CHAT_SESSIONS,
+  MAX_LIVE_CHAT_SESSIONS,
+  MAX_LIVE_CHAT_SESSIONS_PER_PROFILE,
   activeSessionId,
   addProfileChatModalPane,
   appendOpenSessionId,
@@ -12,6 +13,7 @@ import {
   embeddedChatSessionIds,
   getOpenChatTargets,
   officeConnection,
+  openProfileChatModal,
   openSessionIds,
   openSession,
   openEmbeddedChatSession,
@@ -22,12 +24,12 @@ import {
   registerChatRuntime,
   replaceProfileChatModalPane,
   selectProfileChatModalSession,
+  setProfileChatModalSessionInventoryAuthoritative,
   setProfileChatModalActivePane,
   setProfileChatModalPanes,
   sessions,
 } from "../src/store.ts";
 import {
-  MAX_CHAT_PANELS,
   activeDashboard,
   activeDashboardId,
   dashboardContainingPanel,
@@ -39,15 +41,18 @@ import {
   replacePanelInActiveDashboard,
   resetDashboardStateForTests,
 } from "../src/dashboard-layout.ts";
-import { addDashboardPanel, closeDashboardPanel, createDashboardWithDefaultChat, dashboardChatMirrorSuspended, dashboardSessionInventoryAuthoritative, initializeDefaultDashboardChat, selectDashboardChatSession } from "../src/dashboard-actions.ts";
+import { addDashboardPanel, closeDashboardPanel, createDashboardWithDefaultChat, dashboardChatMirrorSuspended, dashboardSessionInventoryAuthoritative, initializeDefaultDashboardChat, installDashboardWiring, selectDashboardChatSession } from "../src/dashboard-actions.ts";
 import { horizontalDropEdge, paneDropTargetAt } from "../src/dashboard-drag.ts";
+import {
+  saveProfileChatModalLayout,
+  savedProfileChatModalLayout,
+} from "../src/profile-chat-modal-prefs.ts";
 
-test("opening a fifth chat evicts the oldest pane and keeps four", () => {
+test("opening a fifth chat keeps every visible pane", () => {
   const current = ["one", "two", "three", "four"];
   const next = appendOpenSessionId(current, "five");
 
-  assert.equal(MAX_OPEN_CHAT_SESSIONS, 4);
-  assert.deepEqual(next, ["two", "three", "four", "five"]);
+  assert.deepEqual(next, ["one", "two", "three", "four", "five"]);
   assert.deepEqual(current, ["one", "two", "three", "four"]);
 });
 
@@ -55,8 +60,9 @@ test("reopening an existing chat does not reorder or duplicate it", () => {
   assert.deepEqual(appendOpenSessionId(["one", "two"], "one"), ["one", "two"]);
 });
 
-test("dashboard chat capacity stays aligned with the live-session capacity", () => {
-  assert.equal(MAX_CHAT_PANELS, MAX_OPEN_CHAT_SESSIONS);
+test("live-session safety bounds are separate from visible pane counts", () => {
+  assert.equal(MAX_LIVE_CHAT_SESSIONS, 16);
+  assert.equal(MAX_LIVE_CHAT_SESSIONS_PER_PROFILE, 8);
 });
 
 test("fresh dashboard state waits for its runtime-backed default chat", () => {
@@ -131,7 +137,7 @@ test("new dashboards open a removable full-size default-profile chat pane", () =
   }
 });
 
-test("dashboard edge-add rejects a fifth chat instead of evicting a registered pane", () => {
+test("dashboard edge-add accepts a fifth chat without evicting a registered pane", () => {
   const ids = ["one", "two", "three", "four", "five"];
   sessions.value = ids.map((id): ChatSession => ({
     id,
@@ -143,14 +149,14 @@ test("dashboard edge-add rejects a fifth chat instead of evicting a registered p
     connectionState: "ready",
     historyState: "loaded",
   }));
-  openSessionIds.value = ids.slice(0, MAX_CHAT_PANELS);
+  openSessionIds.value = ids.slice(0, 4);
   resetDashboardStateForTests({
     version: 1,
     activeDashboardId: "dashboard",
     dashboards: [{
       id: "dashboard",
       name: "",
-      panels: ids.slice(0, MAX_CHAT_PANELS).map((sessionId) => ({
+      panels: ids.slice(0, 4).map((sessionId) => ({
         id: `panel-${sessionId}`,
         kind: "chat" as const,
         sessionId,
@@ -158,11 +164,11 @@ test("dashboard edge-add rejects a fifth chat instead of evicting a registered p
     }],
   });
 
-  assert.equal(addDashboardPanel("chat", { sessionId: "five", index: 2 }), "full");
-  assert.deepEqual(openSessionIds.value, ids.slice(0, MAX_CHAT_PANELS));
+  assert.equal(addDashboardPanel("chat", { sessionId: "five", index: 2 }), "added");
+  assert.deepEqual(openSessionIds.value, ["one", "two", "five", "three", "four"]);
   assert.deepEqual(
     dashboards.value[0]?.panels.map((panel) => panel.sessionId),
-    ids.slice(0, MAX_CHAT_PANELS),
+    ["one", "two", "five", "three", "four"],
   );
 });
 
@@ -217,7 +223,7 @@ test("external pane drops select the visual row before resolving an insertion", 
   });
 });
 
-test("persisted dashboards discard chat panes beyond the live-session cap", () => {
+test("persisted dashboards retain more than four chat panes", () => {
   const normalized = normalizeDashboardsState({
     version: 1,
     activeDashboardId: "dashboard",
@@ -227,7 +233,7 @@ test("persisted dashboards discard chat panes beyond the live-session cap", () =
       panels: Array.from({ length: 6 }, (_, index) => ({ id: `panel-${index}`, kind: "chat", sessionId: `session-${index}` })),
     }],
   });
-  assert.equal(normalized?.dashboards[0]?.panels.length, MAX_CHAT_PANELS);
+  assert.equal(normalized?.dashboards[0]?.panels.length, 6);
 });
 
 test("panel membership and order changes invalidate position-based dashboard sizes", () => {
@@ -266,7 +272,7 @@ test("sidebar navigation finds a registered pane without adding it", () => {
   assert.equal(dashboards.value[0]?.panels.length, 1, "lookup never mutates dashboard membership");
 });
 
-test("sidebar chat clicks seed an empty dashboard, require drag without chat, and replace the last-active chat", () => {
+test("sidebar chat clicks search all dashboards, create only when none has chat, and replace the last-active pane", () => {
   sessions.value = ["one", "two", "three"].map((id): ChatSession => ({
     id,
     profileId: "profile",
@@ -286,6 +292,7 @@ test("sidebar chat clicks seed an empty dashboard, require drag without chat, an
     dashboards: [{ id: "empty", name: "", panels: [], defaultChatSeeded: true }],
   });
   assert.equal(selectDashboardChatSession("one"), "added");
+  assert.equal(dashboards.value.length, 2, "the first chat is placed on a newly created dashboard");
   assert.deepEqual(activeDashboard.value.panels.map((panel) => panel.sessionId), ["one"]);
 
   openSessionIds.value = [];
@@ -293,10 +300,16 @@ test("sidebar chat clicks seed an empty dashboard, require drag without chat, an
   resetDashboardStateForTests({
     version: 1,
     activeDashboardId: "studio-only",
-    dashboards: [{ id: "studio-only", name: "", panels: [{ id: "studio", kind: "studio" }] }],
+    dashboards: [
+      { id: "studio-only", name: "", panels: [{ id: "studio", kind: "studio" }] },
+      { id: "chat-dashboard", name: "", panels: [{ id: "chat-one", kind: "chat", sessionId: "one" }] },
+    ],
   });
-  assert.equal(selectDashboardChatSession("one"), "drag-required");
-  assert.deepEqual(activeDashboard.value.panels.map((panel) => panel.kind), ["studio"]);
+  assert.equal(selectDashboardChatSession("one"), "focused");
+  assert.equal(activeDashboardId.value, "chat-dashboard");
+  assert.deepEqual(activeDashboard.value.panels.map((panel) => panel.sessionId), ["one"]);
+  assert.equal(selectDashboardChatSession("two"), "replaced");
+  assert.deepEqual(activeDashboard.value.panels.map((panel) => panel.sessionId), ["two"]);
 
   openSessionIds.value = ["one", "two"];
   activeSessionId.value = "one";
@@ -306,6 +319,7 @@ test("sidebar chat clicks seed an empty dashboard, require drag without chat, an
     dashboards: [{
       id: "multi-chat",
       name: "",
+      activeChatPanelId: "chat-one",
       panels: [
         { id: "studio", kind: "studio" },
         { id: "chat-one", kind: "chat", sessionId: "one" },
@@ -322,6 +336,144 @@ test("sidebar chat clicks seed an empty dashboard, require drag without chat, an
 
   assert.equal(selectDashboardChatSession("two"), "focused");
   assert.equal(activeSessionId.value, "two");
+  assert.equal(activeDashboard.value.activeChatPanelId, "chat-two");
+});
+
+test("sidebar chat click replaces the blank initial pane before opening a registered pane elsewhere", () => {
+  const draft: ChatSession = {
+    id: "initial-draft",
+    storedSessionId: "initial-stored",
+    profileId: "profile",
+    title: "",
+    titlePresentation: "new-chat",
+    status: "ready",
+    messages: [],
+    remoteKind: "stored",
+    connectionState: "ready",
+    historyState: "loaded",
+  };
+  const existing: ChatSession = {
+    id: "existing",
+    profileId: "profile",
+    title: "Existing",
+    status: "ready",
+    messages: [],
+    remoteKind: "stored",
+    connectionState: "ready",
+    historyState: "loaded",
+  };
+  sessions.value = [draft, existing];
+  openSessionIds.value = [draft.id];
+  activeSessionId.value = draft.id;
+  resetDashboardStateForTests({
+    version: 1,
+    activeDashboardId: "current",
+    dashboards: [
+      { id: "current", name: "", activeChatPanelId: "initial-pane", panels: [{ id: "initial-pane", kind: "chat", sessionId: draft.id }] },
+      { id: "other", name: "", panels: [{ id: "existing-pane", kind: "chat", sessionId: existing.id }] },
+    ],
+  });
+
+  assert.equal(selectDashboardChatSession(existing.id), "replaced");
+  assert.equal(activeDashboardId.value, "current");
+  assert.deepEqual(activeDashboard.value.panels.map((panel) => panel.sessionId), [existing.id]);
+  assert.deepEqual(openSessionIds.value, [existing.id]);
+  assert.equal(activeSessionId.value, existing.id);
+  assert.equal(sessions.value.some((session) => session.id === draft.id), true, "a persisted empty conversation stays available in the sidebar");
+});
+
+test("sidebar chat click focuses a visible conversation before considering a blank initial pane", () => {
+  const draft: ChatSession = {
+    id: "visible-initial-draft", profileId: "profile", title: "", titlePresentation: "new-chat",
+    status: "ready", messages: [], remoteKind: "draft", connectionState: "ready", historyState: "loaded",
+  };
+  const existing: ChatSession = {
+    id: "visible-existing", storedSessionId: "stored-existing", profileId: "profile", title: "Existing",
+    status: "ready", messages: [], remoteKind: "stored", connectionState: "ready", historyState: "loaded",
+  };
+  sessions.value = [draft, existing];
+  openSessionIds.value = [draft.id, existing.id];
+  activeSessionId.value = draft.id;
+  resetDashboardStateForTests({
+    version: 1,
+    activeDashboardId: "current",
+    dashboards: [{
+      id: "current",
+      name: "",
+      activeChatPanelId: "initial-pane",
+      panels: [
+        { id: "initial-pane", kind: "chat", sessionId: draft.id },
+        { id: "existing-pane", kind: "chat", sessionId: existing.id },
+      ],
+    }],
+  });
+
+  assert.equal(selectDashboardChatSession(existing.id), "focused");
+  assert.deepEqual(activeDashboard.value.panels.map((panel) => panel.sessionId), [draft.id, existing.id]);
+  assert.equal(activeDashboard.value.activeChatPanelId, "existing-pane");
+  assert.equal(activeSessionId.value, existing.id);
+});
+
+test("restoring several persisted chat panes does not recursively reactivate them", () => {
+  const previousConnection = officeConnection.value;
+  const previousProfiles = profileList.value;
+  const previousSessions = sessions.value;
+  const previousOpenIds = openSessionIds.value;
+  const previousActiveId = activeSessionId.value;
+  const previousDashboardState = {
+    version: 1 as const,
+    activeDashboardId: activeDashboardId.value,
+    dashboards: dashboards.value,
+  };
+  let dispose = () => {};
+  try {
+    const ids = ["restore-one", "restore-two", "restore-three"];
+    officeConnection.value = { ...previousConnection, state: "demo", source: "demo" };
+    profileList.value = [{
+      id: "default", name: "Default", role: "", status: "idle", color: "#087f70",
+      sessions: 0, taskCount: 0, memoryBytes: 0, memoryNote: "", skills: [], inheritedSkills: [],
+    }];
+    sessions.value = ids.map((id): ChatSession => ({
+      id,
+      profileId: "profile",
+      title: id,
+      status: "ready",
+      messages: [],
+      remoteKind: "demo",
+      connectionState: "ready",
+      historyState: "loaded",
+    }));
+    openSessionIds.value = [];
+    activeSessionId.value = "";
+    resetDashboardStateForTests({
+      version: 1,
+      activeDashboardId: "restore",
+      dashboards: [{
+        id: "restore",
+        name: "",
+        activeChatPanelId: "pane-1",
+        panels: ids.map((sessionId, index) => ({ id: `pane-${index}`, kind: "chat" as const, sessionId })),
+      }],
+    });
+
+    assert.doesNotThrow(() => { dispose = installDashboardWiring(); });
+    assert.deepEqual(openSessionIds.value, ids);
+    assert.equal(activeSessionId.value, "restore-two", "the persisted active pane is restored last and remains active");
+
+    const newDashboardId = createDashboardWithDefaultChat();
+    assert.equal(activeDashboardId.value, newDashboardId);
+    assert.equal(activeDashboard.value.panels.length, 1, "old panes must not reopen during the dashboard handoff");
+    const initialSession = sessions.value.find((session) => session.id === activeDashboard.value.panels[0]?.sessionId);
+    assert.equal(initialSession?.titlePresentation, "new-chat");
+  } finally {
+    dispose();
+    officeConnection.value = previousConnection;
+    profileList.value = previousProfiles;
+    sessions.value = previousSessions;
+    openSessionIds.value = previousOpenIds;
+    activeSessionId.value = previousActiveId;
+    resetDashboardStateForTests(previousDashboardState);
+  }
 });
 
 test("dropping a sidebar item on a pane replaces it and removes a duplicate source pane", () => {
@@ -384,7 +536,9 @@ test("modal clicks replace the only or last-active pane without growing the layo
     historyState: "loaded",
   }));
   profileChatModalId.value = "profile";
-  setProfileChatModalPanes(["one"]);
+  setProfileChatModalPanes([]);
+  assert.equal(selectProfileChatModalSession("one"), true);
+  assert.deepEqual(profileChatModalPaneIds.value, ["one"], "an empty modal receives its first pane");
   assert.equal(profileChatModalActivePaneId.value, "one");
 
   assert.equal(selectProfileChatModalSession("two"), true);
@@ -400,6 +554,132 @@ test("modal clicks replace the only or last-active pane without growing the layo
   assert.equal(selectProfileChatModalSession("two"), true);
   assert.deepEqual(profileChatModalPaneIds.value, ["three", "two"], "an existing pane is focused without duplication");
   assert.equal(profileChatModalActivePaneId.value, "two");
+});
+
+test("modal click discards the unused local draft that its initial pane replaces", () => {
+  const draft: ChatSession = {
+    id: "modal-initial-draft", profileId: "profile", title: "", titlePresentation: "new-chat",
+    status: "ready", messages: [], remoteKind: "draft", connectionState: "ready", historyState: "loaded",
+  };
+  const existing: ChatSession = {
+    id: "modal-existing", storedSessionId: "stored-existing", profileId: "profile", title: "Existing",
+    status: "ready", messages: [], remoteKind: "stored", connectionState: "ready", historyState: "loaded",
+  };
+  sessions.value = [draft, existing];
+  profileChatModalId.value = "profile";
+  profileChatModalPaneIds.value = [draft.id];
+  profileChatModalActivePaneId.value = draft.id;
+
+  assert.equal(selectProfileChatModalSession(existing.id), true);
+  assert.deepEqual(profileChatModalPaneIds.value, [existing.id]);
+  assert.equal(sessions.value.some((session) => session.id === draft.id), false);
+});
+
+test("opening a modal before session pagination completes preserves and later restores its saved panes", () => {
+  const previousConnection = officeConnection.value;
+  const previousProfiles = profileList.value;
+  const previousSessions = sessions.value;
+  const previousModalId = profileChatModalId.value;
+  const previousPaneIds = profileChatModalPaneIds.value;
+  const previousActivePaneId = profileChatModalActivePaneId.value;
+  const profileId = "paged-profile";
+  const savedSessionId = "stored:paged-profile:later";
+  const later: ChatSession = {
+    id: savedSessionId, storedSessionId: "later", profileId, title: "Later",
+    status: "ready", messages: [], remoteKind: "stored", connectionState: "disconnected", historyState: "unloaded",
+  };
+  try {
+    officeConnection.value = { ...previousConnection, source: "server", state: "connected", runtime: "ready" };
+    profileList.value = [{
+      id: profileId, name: "Paged", role: "", status: "idle", color: "#087f70",
+      sessions: 1, taskCount: 0, memoryBytes: 0, memoryNote: "", skills: [], inheritedSkills: [],
+    }];
+    sessions.value = [];
+    setProfileChatModalSessionInventoryAuthoritative(false);
+    saveProfileChatModalLayout(profileId, [savedSessionId], savedSessionId);
+
+    openProfileChatModal(profileId);
+    const temporaryDraftId = profileChatModalPaneIds.value[0]!;
+    assert.notEqual(temporaryDraftId, savedSessionId);
+    assert.deepEqual(savedProfileChatModalLayout(profileId)?.paneSessionIds, [savedSessionId]);
+
+    sessions.value = [...sessions.value, later];
+    setProfileChatModalSessionInventoryAuthoritative(true);
+    assert.deepEqual(profileChatModalPaneIds.value, [savedSessionId]);
+    assert.equal(sessions.value.some((session) => session.id === temporaryDraftId), false);
+    assert.deepEqual(savedProfileChatModalLayout(profileId)?.paneSessionIds, [savedSessionId]);
+  } finally {
+    closeProfileChatModal();
+    saveProfileChatModalLayout(profileId, [], "");
+    officeConnection.value = previousConnection;
+    profileList.value = previousProfiles;
+    sessions.value = previousSessions;
+    profileChatModalId.value = previousModalId;
+    profileChatModalPaneIds.value = previousPaneIds;
+    profileChatModalActivePaneId.value = previousActivePaneId;
+    setProfileChatModalSessionInventoryAuthoritative(true);
+  }
+});
+
+test("profile modals restore their saved panes and create a chat when the saved layout is unavailable", () => {
+  const previousConnection = officeConnection.value;
+  const previousProfiles = profileList.value;
+  const previousSessions = sessions.value;
+  const previousOpenIds = openSessionIds.value;
+  const previousActiveId = activeSessionId.value;
+  const previousModalId = profileChatModalId.value;
+  const previousModalPaneIds = profileChatModalPaneIds.value;
+  const previousModalActivePaneId = profileChatModalActivePaneId.value;
+  const profile = (id: string) => ({
+    id, name: id, role: "", status: "idle" as const, color: "#087f70",
+    sessions: 0, taskCount: 0, memoryBytes: 0, memoryNote: "", skills: [], inheritedSkills: [],
+  });
+  const session = (id: string, profileId: string): ChatSession => ({
+    id,
+    profileId,
+    title: id,
+    status: "ready",
+    messages: [],
+    remoteKind: "demo",
+    connectionState: "ready",
+    historyState: "loaded",
+  });
+  try {
+    officeConnection.value = { ...previousConnection, state: "demo", source: "demo" };
+    profileList.value = [profile("restore-profile"), profile("fresh-profile")];
+    const restoredSessionIds = ["one", "two", "three", "four", "five", "six"];
+    sessions.value = restoredSessionIds.map((id) => session(id, "restore-profile"));
+    openSessionIds.value = [];
+    activeSessionId.value = "";
+    profileChatModalId.value = "restore-profile";
+    setProfileChatModalPanes(restoredSessionIds);
+    setProfileChatModalActivePane("one");
+    closeProfileChatModal();
+
+    openProfileChatModal("restore-profile");
+    assert.deepEqual(profileChatModalPaneIds.value, restoredSessionIds);
+    assert.equal(profileChatModalActivePaneId.value, "one");
+    closeProfileChatModal();
+
+    saveProfileChatModalLayout("fresh-profile", ["missing"], "missing");
+    openProfileChatModal("fresh-profile");
+    assert.equal(profileChatModalPaneIds.value.length, 1);
+    const freshSessionId = profileChatModalPaneIds.value[0]!;
+    assert.notEqual(freshSessionId, "missing");
+    assert.equal(sessions.value.find((item) => item.id === freshSessionId)?.profileId, "fresh-profile");
+    assert.deepEqual(savedProfileChatModalLayout("fresh-profile")?.paneSessionIds, [freshSessionId]);
+  } finally {
+    saveProfileChatModalLayout("restore-profile", [], "");
+    saveProfileChatModalLayout("fresh-profile", [], "");
+    officeConnection.value = previousConnection;
+    profileList.value = previousProfiles;
+    sessions.value = previousSessions;
+    openSessionIds.value = previousOpenIds;
+    activeSessionId.value = previousActiveId;
+    profileChatModalId.value = previousModalId;
+    profileChatModalPaneIds.value = previousModalPaneIds;
+    profileChatModalActivePaneId.value = previousModalActivePaneId;
+  }
 });
 
 test("modal drop replacement removes a duplicate source pane and keeps the target position", () => {
@@ -454,9 +734,14 @@ test("closing a streaming pane defers its live release until the run becomes ter
   assert.equal(sessions.value[0]?.connectionState, "disconnected");
 });
 
-test("a hidden running lease reserves capacity before a replacement target starts", () => {
+test("an active pane displaces an older lease while a hidden run reserves profile capacity", () => {
   const ensured: string[] = [];
   const released: string[] = [];
+  const workspaceSessions: ChatSession[] = Array.from({ length: 7 }, (_, offset) => offset + 1).map((index) => ({
+    id: `workspace-${index}`, storedSessionId: `stored-${index}`, liveSessionId: `live-${index}`,
+    profileId: "profile", title: `Workspace ${index}`, status: "ready", messages: [],
+    remoteKind: "stored", connectionState: "ready", historyState: "loaded",
+  }));
   sessions.value = [
     {
       id: "background-run", storedSessionId: "stored-run", liveSessionId: "live-run", profileId: "profile", title: "Run",
@@ -464,17 +749,14 @@ test("a hidden running lease reserves capacity before a replacement target start
         id: "reply", from: "agent", body: "working", at: "00:00", status: "streaming",
       }], remoteKind: "stored", connectionState: "ready", historyState: "loaded",
     },
-    ...[2, 3, 4].map((index): ChatSession => ({
-      id: `workspace-${index}`, storedSessionId: `stored-${index}`, liveSessionId: `live-${index}`,
-      profileId: "profile", title: `Workspace ${index}`, status: "ready", messages: [],
-      remoteKind: "stored", connectionState: "ready", historyState: "loaded",
-    })),
+    ...workspaceSessions,
     {
       id: "replacement", storedSessionId: "stored-replacement", profileId: "profile", title: "Replacement",
       status: "ready", messages: [], remoteKind: "stored", connectionState: "disconnected", historyState: "loaded",
     },
   ];
-  openSessionIds.value = ["background-run", "workspace-2", "workspace-3", "workspace-4"];
+  openSessionIds.value = ["background-run", ...workspaceSessions.map((session) => session.id)];
+  activeSessionId.value = "workspace-1";
   profileChatModalId.value = null;
   profileChatModalPaneIds.value = [];
   embeddedChatSessionIds.value = [];
@@ -487,8 +769,11 @@ test("a hidden running lease reserves capacity before a replacement target start
 
   closeSession("background-run");
   openSession("replacement");
-  assert.equal(ensured.includes("replacement"), false, "the fifth server lease must not start while the hidden run owns one");
-  assert.deepEqual(getOpenChatTargets().map((target) => target.clientSessionId), ["workspace-2", "workspace-3", "workspace-4"]);
+  assert.equal(ensured.includes("replacement"), true, "the selected pane should receive a live lease");
+  assert.deepEqual(getOpenChatTargets().map((target) => target.clientSessionId), [
+    "replacement", "workspace-1", "workspace-2", "workspace-3", "workspace-4", "workspace-5", "workspace-6",
+  ]);
+  assert.equal(released.includes("workspace-7"), true, "an older inactive lease should yield to the selected pane");
 
   sessions.value = sessions.value.map((item) => item.id === "background-run" ? {
     ...item,
@@ -497,13 +782,13 @@ test("a hidden running lease reserves capacity before a replacement target start
     messages: item.messages.map((message) => ({ ...message, status: "complete" as const })),
   } : item);
   assert.equal(released.includes("background-run"), true);
-  assert.equal(ensured.includes("replacement"), true, "the newly-free lease should start the waiting visible target");
+  assert.equal(ensured.includes("workspace-7"), true, "the freed profile lease should reconnect the remaining visible pane");
 });
 
-test("modal panes take foreground lease priority without exceeding four live targets", () => {
+test("modal panes take foreground lease priority within the per-profile live bound", () => {
   const ensured: string[] = [];
   const released: string[] = [];
-  const workspaceSessions: ChatSession[] = [1, 2, 3, 4].map((index) => ({
+  const workspaceSessions: ChatSession[] = Array.from({ length: 8 }, (_, offset) => offset + 1).map((index) => ({
       id: `workspace-${index}`, storedSessionId: `stored-workspace-${index}`, profileId: "profile", title: `Workspace ${index}`,
       status: "ready", messages: [], remoteKind: "stored", connectionState: "ready", historyState: "loaded",
     }));
@@ -513,7 +798,8 @@ test("modal panes take foreground lease priority without exceeding four live tar
       status: "ready", messages: [], remoteKind: "stored", connectionState: "disconnected", historyState: "loaded",
     },
   ];
-  openSessionIds.value = ["workspace-1", "workspace-2", "workspace-3", "workspace-4"];
+  openSessionIds.value = workspaceSessions.map((session) => session.id);
+  activeSessionId.value = "workspace-1";
   profileChatModalId.value = "profile";
   profileChatModalPaneIds.value = [];
   registerChatRuntime({
@@ -524,14 +810,16 @@ test("modal panes take foreground lease priority without exceeding four live tar
   });
 
   assert.equal(addProfileChatModalPane("modal"), true);
-  assert.deepEqual(getOpenChatTargets().map((target) => target.clientSessionId), ["modal", "workspace-1", "workspace-2", "workspace-3"]);
-  assert.deepEqual(released, ["workspace-4"]);
-  assert.deepEqual(ensured, ["workspace-1", "workspace-2", "workspace-3", "workspace-4", "modal"]);
+  assert.deepEqual(getOpenChatTargets().map((target) => target.clientSessionId), [
+    "modal", "workspace-1", "workspace-2", "workspace-3", "workspace-4", "workspace-5", "workspace-6", "workspace-7",
+  ]);
+  assert.deepEqual(released, ["workspace-8"]);
+  assert.equal(ensured.includes("modal"), true);
 
   closeProfileChatModal();
-  assert.deepEqual(getOpenChatTargets().map((target) => target.clientSessionId), ["workspace-1", "workspace-2", "workspace-3", "workspace-4"]);
-  assert.deepEqual(released, ["workspace-4", "modal"]);
-  assert.deepEqual(ensured, ["workspace-1", "workspace-2", "workspace-3", "workspace-4", "modal", "workspace-4"]);
+  assert.deepEqual(getOpenChatTargets().map((target) => target.clientSessionId), workspaceSessions.map((session) => session.id));
+  assert.deepEqual(released, ["workspace-8", "modal"]);
+  assert.equal(ensured.includes("workspace-8"), true);
 });
 
 test("embedded modal chats take a foreground lease without becoming workspace panes", () => {
@@ -560,13 +848,13 @@ test("embedded modal chats take a foreground lease without becoming workspace pa
 
   assert.equal(openEmbeddedChatSession("embedded"), true);
   assert.deepEqual(openSessionIds.value, ["workspace-1", "workspace-2", "workspace-3", "workspace-4"]);
-  assert.deepEqual(getOpenChatTargets().map((target) => target.clientSessionId), ["embedded", "workspace-1", "workspace-2", "workspace-3"]);
-  assert.deepEqual(released, ["workspace-4"]);
+  assert.deepEqual(getOpenChatTargets().map((target) => target.clientSessionId), ["embedded", "workspace-1", "workspace-2", "workspace-3", "workspace-4"]);
+  assert.deepEqual(released, []);
 
   closeEmbeddedChatSession("embedded");
   assert.deepEqual(getOpenChatTargets().map((target) => target.clientSessionId), ["workspace-1", "workspace-2", "workspace-3", "workspace-4"]);
-  assert.deepEqual(released, ["workspace-4", "embedded"]);
-  assert.deepEqual(ensured, ["workspace-1", "workspace-2", "workspace-3", "workspace-4", "embedded", "workspace-4"]);
+  assert.deepEqual(released, ["embedded"]);
+  assert.deepEqual(ensured, ["workspace-1", "workspace-2", "workspace-3", "workspace-4", "embedded"]);
 });
 
 test("dashboard mirror pauses only for cleared, unavailable server inventory", () => {

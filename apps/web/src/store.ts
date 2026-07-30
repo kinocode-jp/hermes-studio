@@ -30,8 +30,8 @@ import {
   openMobileWorkspace,
 } from "./mobile-routes";
 import {
-  MAX_OPEN_CHAT_SESSIONS,
-  MAX_PROFILE_CHAT_MODAL_PANES,
+  MAX_LIVE_CHAT_SESSIONS,
+  MAX_LIVE_CHAT_SESSIONS_PER_PROFILE,
   activeSessionId,
   activeSurface,
   chatSocketState,
@@ -64,10 +64,15 @@ import {
 import { persistUiNavPreferences } from "./ui-nav-prefs";
 import { addPanelToActiveDashboard, removePanel, activeDashboard } from "./dashboard-layout";
 import { clearAllChatComposerStates, clearChatComposerState } from "./chat-composer-state";
+import {
+  saveProfileChatModalLayout,
+  savedProfileChatModalLayout,
+  type ProfileChatModalLayout,
+} from "./profile-chat-modal-prefs";
 
 export {
-  MAX_OPEN_CHAT_SESSIONS,
-  MAX_PROFILE_CHAT_MODAL_PANES,
+  MAX_LIVE_CHAT_SESSIONS,
+  MAX_LIVE_CHAT_SESSIONS_PER_PROFILE,
   activeSessionId,
   activeSurface,
   chatSocketState,
@@ -118,7 +123,7 @@ import {
   refreshFollowUpSuggestions,
   respondToApproval,
   respondToClarification,
-  sendMessage,
+  sendMessage as sendChatMessage,
   setChatHistoryError,
   setChatHistoryLoading,
   setChatSessionConnecting,
@@ -148,7 +153,6 @@ export {
   refreshFollowUpSuggestions,
   respondToApproval,
   respondToClarification,
-  sendMessage,
   setChatHistoryError,
   setChatHistoryLoading,
   setChatSessionConnecting,
@@ -163,6 +167,19 @@ export {
   consumeCardSeed,
   consumeChatComposerPrefill,
 };
+
+export function sendMessage(sessionId: string, body: string): ReturnType<typeof sendChatMessage> {
+  const pending = pendingProfileChatModalLayout;
+  if (pending?.profileId === profileChatModalId.value
+    && profileChatModalPaneIds.value.includes(sessionId)
+    && !pending.paneSessionIds.includes(sessionId)) {
+    // Sending from the temporary composer is an explicit choice to replace the
+    // unavailable saved layout. Preserve that choice before the prompt starts.
+    pendingProfileChatModalLayout = undefined;
+    persistCurrentProfileChatModalLayout();
+  }
+  return sendChatMessage(sessionId, body);
+}
 
 registerKanbanProfileTaskUpdater((counts) => {
   profileList.value = profileList.value.map((profile) => ({ ...profile, taskCount: counts.get(profile.id) ?? 0 }));
@@ -227,27 +244,42 @@ export function registerChatRuntime(actions: {
 // leases still count against the server's per-owner cap even though they are
 // intentionally absent from the visible target list.
 const deferredChatTargetReleases = new Set<string>();
+let profileChatModalSessionInventoryAuthoritative = false;
+let pendingProfileChatModalLayout: ProfileChatModalLayout | undefined;
 
 export function getOpenChatTargets(): ChatTarget[] {
-  // The UI deliberately exposes at most four foreground chats. The server has
-  // additional bounded headroom for delegated or closing runs, while this
-  // client still reserves visible capacity for hidden active runs until their
-  // terminal event arrives.
-  const foregroundSessionIds = [
-    ...profileChatModalPaneIds.value,
+  // Pane visibility is unbounded. Live Hermes leases stay within the server's
+  // operational bounds, prioritizing the panes the user most recently chose.
+  const modalIds = profileChatModalPaneIds.value;
+  const workspaceIds = openSessionIds.value;
+  const requestedSessionIds = [...new Set([
+    ...(modalIds.includes(profileChatModalActivePaneId.value) ? [profileChatModalActivePaneId.value] : []),
+    ...modalIds,
     ...embeddedChatSessionIds.value,
-  ];
-  const requestedSessionIds = foregroundSessionIds.length > 0
-    ? [...new Set([...foregroundSessionIds, ...openSessionIds.value])]
-    : [...new Set(openSessionIds.value)];
+    ...(workspaceIds.includes(activeSessionId.value) ? [activeSessionId.value] : []),
+    ...workspaceIds,
+  ])];
   const requested = new Set(requestedSessionIds);
-  const hiddenReservedLeases = [...deferredChatTargetReleases].filter((sessionId) => {
-    if (requested.has(sessionId)) return false;
+  const hiddenReservedSessions = [...deferredChatTargetReleases].flatMap((sessionId) => {
+    if (requested.has(sessionId)) return [];
     const session = sessions.value.find((item) => item.id === sessionId);
-    return session !== undefined && isChatRunActive(session);
-  }).length;
-  const visibleCapacity = Math.max(0, MAX_OPEN_CHAT_SESSIONS - hiddenReservedLeases);
-  const activeSessionIds = requestedSessionIds.slice(0, visibleCapacity);
+    return session !== undefined && isChatRunActive(session) ? [session] : [];
+  });
+  const visibleCapacity = Math.max(0, MAX_LIVE_CHAT_SESSIONS - hiddenReservedSessions.length);
+  const profileLeaseCounts = new Map<string, number>();
+  for (const session of hiddenReservedSessions) {
+    profileLeaseCounts.set(session.profileId, (profileLeaseCounts.get(session.profileId) ?? 0) + 1);
+  }
+  const activeSessionIds: string[] = [];
+  for (const sessionId of requestedSessionIds) {
+    if (activeSessionIds.length >= visibleCapacity) break;
+    const session = sessions.value.find((item) => item.id === sessionId);
+    if (!session) continue;
+    const profileLeaseCount = profileLeaseCounts.get(session.profileId) ?? 0;
+    if (profileLeaseCount >= MAX_LIVE_CHAT_SESSIONS_PER_PROFILE) continue;
+    profileLeaseCounts.set(session.profileId, profileLeaseCount + 1);
+    activeSessionIds.push(sessionId);
+  }
   return [...new Set(activeSessionIds)].flatMap((clientSessionId) => {
     const session = sessions.value.find((item) => item.id === clientSessionId);
     const target = session === undefined ? undefined : chatTarget(session);
@@ -314,6 +346,8 @@ export function applyOfficeSnapshot(snapshot: OfficeSnapshot, source: string | O
   }
   const explicitDemo = snapshot.capabilities.features.includes("demo");
   const runtimeReady = snapshot.capabilities.runtime.state === "ready";
+  const sessionInventoryAuthoritative = officeInventoryReliability(snapshot.inventory.sessions) === "complete"
+    && !snapshot.inventory.sessions.hasMore;
   const nonReadyInventoryUnreliable = !explicitDemo
     && !runtimeReady
     && (officeInventoryReliability(snapshot.inventory.profiles) !== "complete"
@@ -339,13 +373,16 @@ export function applyOfficeSnapshot(snapshot: OfficeSnapshot, source: string | O
 
   if (explicitDemo) {
     loadExplicitDemoState();
+    setProfileChatModalSessionInventoryAuthoritative(true);
     return true;
   }
   if (!runtimeReady) {
+    setProfileChatModalSessionInventoryAuthoritative(false);
     if (!preserveLastKnownLiveState) clearRuntimeState();
     return true;
   }
   if (profileInventoryUnavailable) {
+    setProfileChatModalSessionInventoryAuthoritative(false);
     if (runtimeDataSource !== "live") clearRuntimeState();
     return true;
   }
@@ -437,6 +474,7 @@ export function applyOfficeSnapshot(snapshot: OfficeSnapshot, source: string | O
   openSessionIds.value = openSessionIds.value.filter((id) => liveSessionIds.has(id));
   if (profileChatModalId.value !== null
     && !profileList.value.some((profile) => profile.id === profileChatModalId.value)) {
+    pendingProfileChatModalLayout = undefined;
     profileChatModalId.value = null;
     profileChatModalPaneIds.value = [];
     profileChatModalActivePaneId.value = "";
@@ -446,6 +484,8 @@ export function applyOfficeSnapshot(snapshot: OfficeSnapshot, source: string | O
       profileChatModalActivePaneId.value = profileChatModalPaneIds.value.at(-1) ?? "";
     }
   }
+  setProfileChatModalSessionInventoryAuthoritative(sessionInventoryAuthoritative);
+  if (sessionInventoryAuthoritative) persistCurrentProfileChatModalLayout();
   embeddedChatSessionIds.value = embeddedChatSessionIds.value.filter((id) => liveSessionIds.has(id));
   // Reconcile both presentation surfaces after inventory removal. A vanished
   // modal-only session must not retain a hidden lease, and a newly available
@@ -550,39 +590,54 @@ export function closeProfileSettingsModal(): void {
 
 export function openProfileChatModal(profileId: string, options?: { sessionId?: string }): void {
   const reusingOpenModal = profileChatModalId.value === profileId;
+  if (!reusingOpenModal) discardTemporaryPendingProfileModalDrafts();
   selectedProfileId.value = profileId;
   prefetchSelectedProfileSettings(profileId);
   profileChatModalId.value = profileId;
+  if (!reusingOpenModal) {
+    pendingProfileChatModalLayout = undefined;
+    const saved = savedProfileChatModalLayout(profileId);
+    const restoredPaneIds = saved?.paneSessionIds.filter((sessionId) =>
+      sessions.value.some((session) => session.id === sessionId && session.profileId === profileId),
+    ) ?? [];
+    const restoredActiveSessionId = saved && restoredPaneIds.includes(saved.activeSessionId)
+      ? saved.activeSessionId
+      : restoredPaneIds.at(-1) ?? "";
+    const inventoryAuthoritative = profileChatModalSessionInventoryAuthoritative
+      || (officeConnection.value.source === "demo" && officeConnection.value.state === "demo");
+    if (saved && !inventoryAuthoritative && restoredPaneIds.length < saved.paneSessionIds.length) {
+      pendingProfileChatModalLayout = saved;
+    }
+    replaceProfileChatModalPanes(restoredPaneIds, restoredActiveSessionId, false);
+    if (restoredPaneIds.length > 0 && !pendingProfileChatModalLayout) {
+      persistCurrentProfileChatModalLayout();
+    }
+  }
   if (options?.sessionId) {
     const session = sessions.value.find((item) => item.id === options.sessionId);
-    if (session?.profileId !== profileId) {
-      replaceProfileChatModalPanes([]);
-    } else if (reusingOpenModal && profileChatModalPaneIds.value.length > 0) {
-      selectProfileChatModalSession(options.sessionId);
-    } else {
-      replaceProfileChatModalPanes([options.sessionId]);
-      profileChatModalActivePaneId.value = options.sessionId;
-    }
-  } else if (!reusingOpenModal) {
-    replaceProfileChatModalPanes([]);
+    if (session?.profileId === profileId) selectProfileChatModalSession(options.sessionId);
   }
   // A newly opened profile modal should always present a usable conversation.
-  // Repeated open requests preserve existing panes; only an empty modal gets
-  // a fresh draft.
+  // Saved panes are restored first; only a missing or entirely stale saved
+  // layout gets a fresh draft.
   if (profileChatModalPaneIds.value.length === 0) {
     const sessionId = createSession(profileId, { workspace: false });
     if (sessionId) {
-      replaceProfileChatModalPanes([sessionId]);
-      profileChatModalActivePaneId.value = sessionId;
+      replaceProfileChatModalPanes([sessionId], sessionId, pendingProfileChatModalLayout === undefined);
+    } else if (!pendingProfileChatModalLayout) {
+      persistCurrentProfileChatModalLayout();
     }
   }
   persistNavigationState();
 }
 
 export function closeProfileChatModal(): void {
-  replaceProfileChatModalPanes([]);
+  // Clearing the live modal must not erase the per-profile layout that will
+  // be restored the next time this profile is opened.
+  discardTemporaryPendingProfileModalDrafts();
+  replaceProfileChatModalPanes([], "", false);
+  pendingProfileChatModalLayout = undefined;
   profileChatModalId.value = null;
-  profileChatModalActivePaneId.value = "";
 }
 
 export function openEmbeddedChatSession(sessionId: string): boolean {
@@ -591,7 +646,7 @@ export function openEmbeddedChatSession(sessionId: string): boolean {
   embeddedChatSessionIds.value = [
     sessionId,
     ...embeddedChatSessionIds.value.filter((id) => id !== sessionId),
-  ].slice(0, MAX_OPEN_CHAT_SESSIONS);
+  ];
   reconcileActiveChatTargets(previousTargets);
   return true;
 }
@@ -610,26 +665,31 @@ export function addProfileChatModalPane(sessionId: string, options?: { index?: n
   if (!session || session.profileId !== modalProfileId) return false;
   const current = profileChatModalPaneIds.value;
   if (current.includes(sessionId)) {
-    if (typeof options?.index === "number") moveProfileChatModalPane(sessionId, options.index);
-    profileChatModalActivePaneId.value = sessionId;
-    ensureSessionConnection(sessionId);
-    return true;
+    return typeof options?.index === "number"
+      ? moveProfileChatModalPane(sessionId, options.index)
+      : setProfileChatModalActivePane(sessionId);
   }
-  if (current.length >= MAX_PROFILE_CHAT_MODAL_PANES) return false;
+  cancelPendingProfileChatModalRestore();
   const next = [...current];
   const insertAt = typeof options?.index === "number"
     ? Math.max(0, Math.min(next.length, Math.floor(options.index)))
     : next.length;
   next.splice(insertAt, 0, sessionId);
-  replaceProfileChatModalPanes(next);
-  profileChatModalActivePaneId.value = sessionId;
+  replaceProfileChatModalPanes(next, sessionId);
   return true;
 }
 
 export function setProfileChatModalActivePane(sessionId: string): boolean {
   if (!profileChatModalPaneIds.value.includes(sessionId)) return false;
+  if (pendingProfileChatModalLayout?.profileId === profileChatModalId.value
+    && pendingProfileChatModalLayout.paneSessionIds.includes(sessionId)) {
+    pendingProfileChatModalLayout = { ...pendingProfileChatModalLayout, activeSessionId: sessionId };
+  }
+  const previousTargets = new Set(getOpenChatTargets().map((target) => target.clientSessionId));
   profileChatModalActivePaneId.value = sessionId;
+  reconcileActiveChatTargets(previousTargets);
   ensureSessionConnection(sessionId);
+  persistCurrentProfileChatModalLayout();
   return true;
 }
 
@@ -644,7 +704,12 @@ export function selectProfileChatModalSession(sessionId: string): boolean {
   const target = current.includes(profileChatModalActivePaneId.value)
     ? profileChatModalActivePaneId.value
     : current.at(-1)!;
-  return replaceProfileChatModalPane(target, sessionId);
+  const replacedSession = sessions.value.find((item) => item.id === target);
+  const replaced = replaceProfileChatModalPane(target, sessionId);
+  if (replaced && isDiscardableEmptyProfileModalDraft(replacedSession)) {
+    dismissSessions([target]);
+  }
+  return replaced;
 }
 
 /** Replace one modal pane, removing a duplicate source pane when necessary. */
@@ -654,13 +719,13 @@ export function replaceProfileChatModalPane(targetSessionId: string, sessionId: 
   const current = profileChatModalPaneIds.value;
   if (!modalProfileId || session?.profileId !== modalProfileId || !current.includes(targetSessionId)) return false;
   if (targetSessionId === sessionId) return setProfileChatModalActivePane(sessionId);
+  cancelPendingProfileChatModalRestore();
   const next: string[] = [];
   for (const id of current) {
     if (id === targetSessionId) next.push(sessionId);
     else if (id !== sessionId) next.push(id);
   }
-  replaceProfileChatModalPanes(next);
-  profileChatModalActivePaneId.value = sessionId;
+  replaceProfileChatModalPanes(next, sessionId);
   ensureSessionConnection(sessionId);
   return true;
 }
@@ -669,20 +734,22 @@ export function moveProfileChatModalPane(sessionId: string, index: number): bool
   const current = profileChatModalPaneIds.value;
   const from = current.indexOf(sessionId);
   if (from < 0) return false;
+  cancelPendingProfileChatModalRestore();
   let desired = Math.max(0, Math.min(current.length, Math.floor(index)));
   if (from < desired) desired -= 1;
   const next = current.filter((id) => id !== sessionId);
   next.splice(Math.max(0, Math.min(next.length, desired)), 0, sessionId);
-  replaceProfileChatModalPanes(next);
-  profileChatModalActivePaneId.value = sessionId;
+  replaceProfileChatModalPanes(next, sessionId);
   return true;
 }
 
 export function removeProfileChatModalPane(sessionId: string): void {
+  cancelPendingProfileChatModalRestore();
   replaceProfileChatModalPanes(profileChatModalPaneIds.value.filter((id) => id !== sessionId));
 }
 
 export function setProfileChatModalPanes(sessionIds: readonly string[]): void {
+  cancelPendingProfileChatModalRestore();
   const modalProfileId = profileChatModalId.value;
   if (!modalProfileId) {
     replaceProfileChatModalPanes([]);
@@ -695,18 +762,99 @@ export function setProfileChatModalPanes(sessionIds: readonly string[]): void {
   const unique: string[] = [];
   for (const id of allowed) {
     if (!unique.includes(id)) unique.push(id);
-    if (unique.length >= MAX_PROFILE_CHAT_MODAL_PANES) break;
   }
   replaceProfileChatModalPanes(unique);
 }
 
-function replaceProfileChatModalPanes(next: string[]): void {
+function replaceProfileChatModalPanes(
+  next: string[],
+  activePaneId = profileChatModalActivePaneId.value,
+  persist = true,
+): void {
   const previousTargets = new Set(getOpenChatTargets().map((target) => target.clientSessionId));
   profileChatModalPaneIds.value = next;
-  if (!next.includes(profileChatModalActivePaneId.value)) {
-    profileChatModalActivePaneId.value = next.at(-1) ?? "";
-  }
+  profileChatModalActivePaneId.value = next.includes(activePaneId) ? activePaneId : next.at(-1) ?? "";
   reconcileActiveChatTargets(previousTargets);
+  if (persist) persistCurrentProfileChatModalLayout();
+}
+
+function cancelPendingProfileChatModalRestore(): void {
+  if (pendingProfileChatModalLayout?.profileId === profileChatModalId.value) {
+    pendingProfileChatModalLayout = undefined;
+  }
+}
+
+function discardTemporaryPendingProfileModalDrafts(): void {
+  const pending = pendingProfileChatModalLayout;
+  if (!pending || pending.profileId !== profileChatModalId.value) return;
+  const transientDraftIds = profileChatModalPaneIds.value.filter((sessionId) =>
+    !pending.paneSessionIds.includes(sessionId)
+      && isDiscardableEmptyProfileModalDraft(sessions.value.find((session) => session.id === sessionId)),
+  );
+  if (transientDraftIds.length > 0) dismissSessions(transientDraftIds);
+}
+
+function isDiscardableEmptyProfileModalDraft(session: import("./domain").ChatSession | undefined): boolean {
+  return session?.titlePresentation === "new-chat"
+    && session.messages.length === 0
+    && session.status !== "streaming"
+    && session.remoteKind === "draft"
+    && session.storedSessionId === undefined;
+}
+
+/**
+ * Inventory pages can arrive after the modal opens. Keep the saved layout
+ * intact until every referenced session is known or the inventory becomes
+ * authoritative; otherwise an early modal open would erase unloaded panes.
+ */
+function reconcilePendingProfileChatModalRestore(): void {
+  const pending = pendingProfileChatModalLayout;
+  if (!pending || profileChatModalId.value !== pending.profileId) return;
+  const restoredPaneIds = pending.paneSessionIds.filter((sessionId) =>
+    sessions.value.some((session) => session.id === sessionId && session.profileId === pending.profileId),
+  );
+  const restoredActiveSessionId = restoredPaneIds.includes(pending.activeSessionId)
+    ? pending.activeSessionId
+    : restoredPaneIds.at(-1) ?? "";
+  const transientDraftIds = profileChatModalPaneIds.value.filter((sessionId) =>
+    !pending.paneSessionIds.includes(sessionId)
+      && isDiscardableEmptyProfileModalDraft(sessions.value.find((session) => session.id === sessionId)),
+  );
+
+  if (restoredPaneIds.length > 0) {
+    replaceProfileChatModalPanes(restoredPaneIds, restoredActiveSessionId, false);
+  }
+
+  const resolved = restoredPaneIds.length === pending.paneSessionIds.length;
+  if (!resolved && !profileChatModalSessionInventoryAuthoritative) {
+    if (transientDraftIds.length > 0 && restoredPaneIds.length > 0) dismissSessions(transientDraftIds);
+    return;
+  }
+
+  pendingProfileChatModalLayout = undefined;
+  if (restoredPaneIds.length === 0 && profileChatModalPaneIds.value.length === 0) {
+    const sessionId = createSession(pending.profileId, { workspace: false });
+    if (sessionId) replaceProfileChatModalPanes([sessionId], sessionId, false);
+  }
+  if (transientDraftIds.length > 0 && restoredPaneIds.length > 0) dismissSessions(transientDraftIds);
+  persistCurrentProfileChatModalLayout();
+}
+
+/** Called by inventory pagination whenever its view of stored sessions changes. */
+export function setProfileChatModalSessionInventoryAuthoritative(authoritative: boolean): void {
+  profileChatModalSessionInventoryAuthoritative = authoritative;
+  reconcilePendingProfileChatModalRestore();
+}
+
+function persistCurrentProfileChatModalLayout(): void {
+  const profileId = profileChatModalId.value;
+  if (!profileId) return;
+  if (pendingProfileChatModalLayout?.profileId === profileId) return;
+  saveProfileChatModalLayout(
+    profileId,
+    profileChatModalPaneIds.value,
+    profileChatModalActivePaneId.value,
+  );
 }
 
 
@@ -776,10 +924,7 @@ export function appendOpenSessionId(currentIds: readonly string[], sessionId: st
     ? Math.max(0, Math.min(next.length, Math.floor(index)))
     : next.length;
   next.splice(insertAt, 0, sessionId);
-  if (next.length <= MAX_OPEN_CHAT_SESSIONS) return next;
-  // Prefer keeping the newly inserted session; drop from the far end.
-  if (insertAt >= next.length - 1) return next.slice(-MAX_OPEN_CHAT_SESSIONS);
-  return next.slice(0, MAX_OPEN_CHAT_SESSIONS);
+  return next;
 }
 
 export function moveOpenSessionId(currentIds: readonly string[], sessionId: string, index: number): string[] {
@@ -819,6 +964,7 @@ export function dismissSessions(sessionIds: readonly string[]): void {
   if (!profileChatModalPaneIds.value.includes(profileChatModalActivePaneId.value)) {
     profileChatModalActivePaneId.value = profileChatModalPaneIds.value.at(-1) ?? "";
   }
+  persistCurrentProfileChatModalLayout();
   embeddedChatSessionIds.value = embeddedChatSessionIds.value.filter((sessionId) => !ids.has(sessionId));
   reconcileActiveChatTargets(previouslyActiveTargetIds);
   if (ids.has(activeSessionId.value)) activeSessionId.value = openSessionIds.value.at(-1) ?? "";
@@ -994,7 +1140,7 @@ function loadExplicitDemoState(): void {
     readOnly: false
   }));
   selectedProfileId.value = profileList.value[0]?.id ?? "";
-  openSessionIds.value = sessions.value.slice(0, MAX_OPEN_CHAT_SESSIONS).map((session) => session.id);
+  openSessionIds.value = sessions.value.map((session) => session.id);
   activeSessionId.value = openSessionIds.value[0] ?? "";
   setRuntimeDataSource("demo");
 }
@@ -1012,6 +1158,8 @@ function clearRuntimeState(): void {
   profileChatModalId.value = null;
   profileChatModalPaneIds.value = [];
   profileChatModalActivePaneId.value = "";
+  pendingProfileChatModalLayout = undefined;
+  profileChatModalSessionInventoryAuthoritative = false;
   embeddedChatSessionIds.value = [];
   clearMobileRoutes();
   chatSocketState.value = { state: "disconnected", message: officeMessage("runtime.chat.waiting") };

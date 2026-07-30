@@ -1,8 +1,11 @@
 use crate::constants::OFFICE_URL;
+use crate::diagnostics::log_event;
 use crate::startup::StartupFailure;
 #[cfg(test)]
 use crate::startup::StartupNoticeKind;
 use tauri::Manager;
+
+pub(crate) const STARTUP_WINDOW_LABEL: &str = "startup";
 
 const BUNDLED_APP_BOOTSTRAP_RECOVERY: &str = r#"
 if (window.location.protocol !== 'data:') {
@@ -19,16 +22,36 @@ pub(crate) enum StartupView {
     /// Fixed local document shown while runtime discovery and readiness run off
     /// the main thread. It never connects to or renders loopback content.
     Loading,
-    /// Packaged frontend after an owned server passed readiness.
+    /// Packaged frontend on Tauri's asset origin after an owned server passed
+    /// readiness. This preserves desktop capability auth and local app storage.
     BundledApp,
-    /// Existing listener passed health + Web UI shape; open loopback Office URL.
+    /// A verified attached listener serving the packaged Web UI.
     ExistingOffice,
     /// Recoverable failure with a fixed self-contained notice page.
     Notice(StartupFailure),
 }
 
-pub(crate) fn build_main_window(
-    app: &tauri::App,
+pub(crate) fn build_startup_window(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
+    let main_config = app
+        .config()
+        .app
+        .windows
+        .iter()
+        .find(|config| config.label == "main")
+        .ok_or("Hermes Studio main window configuration is unavailable")?;
+    let mut window_config = main_config.clone();
+    window_config.label = STARTUP_WINDOW_LABEL.to_owned();
+    window_config.url = startup_window_url(&main_config.url, &StartupView::Loading)?;
+    tauri::WebviewWindowBuilder::from_config(app, &window_config)?.build()?;
+    Ok(())
+}
+
+/// Replace the unprivileged startup WebView with the classified application
+/// view. The main WebView is created at its final URL so Tauri's document-start
+/// IPC initialization and local capability association are established for the
+/// same document that boots the packaged frontend.
+pub(crate) fn replace_startup_window(
+    app: &tauri::AppHandle,
     view: StartupView,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let main_config = app
@@ -40,6 +63,8 @@ pub(crate) fn build_main_window(
         .ok_or("Hermes Studio main window configuration is unavailable")?;
     let mut window_config = main_config.clone();
     window_config.url = startup_window_url(&main_config.url, &view)?;
+    // Keep the fixed startup view visible until the final WebView exists.
+    window_config.visible = false;
     let window = tauri::WebviewWindowBuilder::from_config(app, &window_config)?.build()?;
     if matches!(view, StartupView::BundledApp) {
         // WKWebView can occasionally leave the first bundled-app navigation at
@@ -48,7 +73,22 @@ pub(crate) fn build_main_window(
         // external/error views are untouched.
         window.eval(BUNDLED_APP_BOOTSTRAP_RECOVERY)?;
     }
+    let should_show = replacement_window_should_show(
+        app.get_webview_window(STARTUP_WINDOW_LABEL)
+            .and_then(|startup| startup.is_visible().ok()),
+    );
+    if let Some(startup) = app.get_webview_window(STARTUP_WINDOW_LABEL) {
+        startup.close()?;
+    }
+    if should_show {
+        window.show()?;
+        window.set_focus()?;
+    }
     Ok(())
+}
+
+pub(crate) fn replacement_window_should_show(startup_visible: Option<bool>) -> bool {
+    startup_visible.unwrap_or(true)
 }
 
 pub(crate) fn startup_window_url(
@@ -69,81 +109,19 @@ pub(crate) fn startup_window_url(
     }
 }
 
-/// Replace the fixed loading document after background startup completes.
-pub(crate) fn navigate_main_window(
+/// Show a fixed recovery notice without granting the unprivileged startup
+/// WebView access to the main window's Tauri capability.
+pub(crate) fn show_startup_notice(
     app: &tauri::AppHandle,
-    view: StartupView,
+    notice: StartupFailure,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let window = app
-        .get_webview_window("main")
-        .ok_or("Hermes Studio main window is unavailable")?;
-    let main_config = app
-        .config()
-        .app
-        .windows
-        .iter()
-        .find(|config| config.label == "main")
-        .ok_or("Hermes Studio main window configuration is unavailable")?;
-    let target = resolve_navigation_url(
-        app,
-        main_config.use_https_scheme,
-        startup_window_url(&main_config.url, &view)?,
-    )?;
+        .get_webview_window(STARTUP_WINDOW_LABEL)
+        .ok_or("Hermes Studio startup window is unavailable")?;
+    let target = tauri::Url::parse(&startup_notice_data_url(&notice))?;
+    log_event("Showing startup recovery notice in the unprivileged startup window.");
     window.navigate(target)?;
-    if matches!(view, StartupView::BundledApp) {
-        // This is only a best-effort WKWebView recovery. A transient eval race
-        // with the native navigation must not tear down an otherwise-ready
-        // owned server or replace the app with a startup failure notice.
-        let _ = window.eval(BUNDLED_APP_BOOTSTRAP_RECOVERY);
-    }
     Ok(())
-}
-
-fn resolve_navigation_url(
-    app: &tauri::AppHandle,
-    use_https_scheme: bool,
-    value: tauri::WebviewUrl,
-) -> Result<tauri::Url, Box<dyn std::error::Error>> {
-    match value {
-        tauri::WebviewUrl::External(url) | tauri::WebviewUrl::CustomProtocol(url) => Ok(url),
-        tauri::WebviewUrl::App(path) => {
-            #[cfg(debug_assertions)]
-            let base = app
-                .config()
-                .build
-                .dev_url
-                .clone()
-                .unwrap_or(bundled_app_base_url(use_https_scheme)?);
-            #[cfg(not(debug_assertions))]
-            let base = {
-                let _ = app;
-                bundled_app_base_url(use_https_scheme)?
-            };
-            if path.to_str() == Some("index.html") {
-                Ok(base)
-            } else {
-                Ok(base.join(&path.to_string_lossy())?)
-            }
-        }
-        _ => Err("Hermes Studio startup URL is unsupported".into()),
-    }
-}
-
-fn bundled_app_base_url(
-    use_https_scheme: bool,
-) -> Result<tauri::Url, Box<dyn std::error::Error>> {
-    #[cfg(any(target_os = "windows", target_os = "android"))]
-    let value = if use_https_scheme {
-        "https://tauri.localhost"
-    } else {
-        "http://tauri.localhost"
-    };
-    #[cfg(not(any(target_os = "windows", target_os = "android")))]
-    let value = {
-        let _ = use_https_scheme;
-        "tauri://localhost"
-    };
-    Ok(tauri::Url::parse(value)?)
 }
 
 #[cfg(test)]

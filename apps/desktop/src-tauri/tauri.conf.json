@@ -17,7 +17,7 @@
         "title": "Hermes Studio",
         "width": 1440,
         "height": 920,
-        "minWidth": 980,
+        "minWidth": 320,
         "minHeight": 680,
         "resizable": true,
         "fullscreen": false

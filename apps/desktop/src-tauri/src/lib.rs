@@ -31,7 +31,10 @@ use capability::{
 use secret_transfer::deposit_secret_transfer;
 use server::{setup_office, stop_office_server};
 use startup::{OfficeLaunch, StartupFailure, StartupNoticeKind};
-use window::{build_main_window, navigate_main_window, StartupView};
+use window::{
+    build_startup_window, replace_startup_window, show_startup_notice, StartupView,
+    STARTUP_WINDOW_LABEL,
+};
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -48,9 +51,13 @@ pub fn run() {
         .setup(|app| {
             // `main` has `create: false` in tauri.conf.json. Do not create a
             // privileged WebView until the loopback listener has been classified.
-            // A fixed data: loading document is safe to show immediately while
-            // runtime discovery and readiness run away from the main thread.
-            // - Free port: start an owned child, prove readiness, navigate to bundled UI.
+            // A fixed data: loading document is safe to show immediately in a
+            // separate unprivileged WebView while runtime discovery and readiness
+            // run away from the main thread.
+            // - Free port: start an owned child, prove readiness, then create a
+            //   fresh privileged WebView directly on the packaged app origin.
+            //   Creating it at its final URL avoids the document-start IPC race
+            //   without giving up desktop capability auth or origin-scoped data.
             // - Compatible existing server: require its private ownership proof,
             //   then open http://127.0.0.1:4317/ without taking process ownership.
             // - Other failures: fixed self-contained notice page.
@@ -58,7 +65,7 @@ pub fn run() {
             // Never return Err from this hook: with release `panic = "abort"`,
             // Tauri turns setup errors into SIGABRT (macOS crash report). Exit
             // through the normal lifecycle when no recovery window can exist.
-            if let Err(error) = build_main_window(app, StartupView::Loading) {
+            if let Err(error) = build_startup_window(app) {
                 eprintln!("Hermes Studio could not create its startup window: {error}");
                 app.handle().exit(1);
                 return Ok(());
@@ -84,12 +91,15 @@ pub fn run() {
                 label,
                 event: WindowEvent::CloseRequested { api, .. },
                 ..
-            } if label == "main" => {
+            } if is_managed_desktop_window(label) => {
                 // Match normal macOS document-window behavior: keep the owned
                 // server and WebView alive while the user closes the visible
                 // window, then restore it from the Dock without re-running setup.
                 api.prevent_close();
-                if let Some(window) = handle.get_webview_window("main") {
+                if let Some(window) = handle
+                    .get_webview_window("main")
+                    .or_else(|| handle.get_webview_window(STARTUP_WINDOW_LABEL))
+                {
                     let _ = window.hide();
                 }
             }
@@ -97,7 +107,10 @@ pub fn run() {
                 has_visible_windows: false,
                 ..
             } => {
-                if let Some(window) = handle.get_webview_window("main") {
+                if let Some(window) = handle
+                    .get_webview_window("main")
+                    .or_else(|| handle.get_webview_window(STARTUP_WINDOW_LABEL))
+                {
                     let _ = window.show();
                     let _ = window.set_focus();
                 }
@@ -112,14 +125,15 @@ pub fn run() {
 
 fn finish_office_setup(app: tauri::AppHandle) {
     let (view, launch) = match setup_office(&app) {
-        Ok(launch @ OfficeLaunch::OwnedReady) => (StartupView::BundledApp, Some(launch)),
-        Ok(launch @ OfficeLaunch::ExistingOpen) => (StartupView::ExistingOffice, Some(launch)),
+        Ok(launch) => (startup_view_for_launch(launch), Some(launch)),
         Err(failure) => (StartupView::Notice(failure), None),
     };
     let transition_app = app.clone();
     let scheduled = app.run_on_main_thread(move || {
-        match navigate_main_window(&transition_app, view) {
+        diagnostics::log_event("Creating the classified main application window.");
+        match replace_startup_window(&transition_app, view) {
             Ok(()) => {
+                diagnostics::log_event("Main application window is ready.");
                 match launch {
                     Some(OfficeLaunch::OwnedReady) => {
                         start_owned_server_monitor(transition_app.clone());
@@ -132,11 +146,12 @@ fn finish_office_setup(app: tauri::AppHandle) {
             }
             Err(error) => {
                 stop_owned_office(&transition_app);
+                diagnostics::log_event(&format!(
+                    "Main application window creation failed: {error}"
+                ));
                 let notice = StartupFailure::from_kind(StartupNoticeKind::InternalStateUnavailable)
                     .with_detail(format!("Startup window transition failed: {error}"));
-                if let Err(notice_error) =
-                    navigate_main_window(&transition_app, StartupView::Notice(notice))
-                {
+                if let Err(notice_error) = show_startup_notice(&transition_app, notice) {
                     eprintln!(
                         "Hermes Studio could not finish its startup window ({error}) or show its recovery notice ({notice_error})."
                     );
@@ -152,6 +167,17 @@ fn finish_office_setup(app: tauri::AppHandle) {
         );
         app.exit(1);
     }
+}
+
+pub(crate) fn startup_view_for_launch(launch: OfficeLaunch) -> StartupView {
+    match launch {
+        OfficeLaunch::OwnedReady => StartupView::BundledApp,
+        OfficeLaunch::ExistingOpen => StartupView::ExistingOffice,
+    }
+}
+
+pub(crate) fn is_managed_desktop_window(label: &str) -> bool {
+    label == "main" || label == STARTUP_WINDOW_LABEL
 }
 
 fn stop_owned_office(app: &tauri::AppHandle) {

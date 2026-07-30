@@ -20,8 +20,6 @@ export type DashboardPanelKind = (typeof dashboardPanelKinds)[number];
 /** Only chat panels may appear more than once per dashboard. */
 export const SINGLETON_PANEL_KINDS: readonly DashboardPanelKind[] = ["kanban", "studio", "teams", "scheduled", "profiles"];
 export const MAX_DASHBOARD_PANELS = 12;
-/** Matches MAX_OPEN_CHAT_SESSIONS in store-state (kept literal to avoid an import cycle). */
-export const MAX_CHAT_PANELS = 4;
 export const MAX_DASHBOARDS = 12;
 
 export type DashboardPanel = {
@@ -49,6 +47,8 @@ export type Dashboard = {
   id: string;
   name: string;
   panels: DashboardPanel[];
+  /** Stable identity of the most recently interacted-with chat pane. */
+  activeChatPanelId?: string | undefined;
   /** Once true, removing every panel must leave the dashboard empty. */
   defaultChatSeeded?: boolean | undefined;
   /** Optional; absent for dashboards saved before resizing existed. */
@@ -114,7 +114,6 @@ export function normalizeDashboardsState(value: unknown): DashboardsState | unde
           : undefined;
         if (kind === "chat" && sessionId === undefined) continue;
         if (kind === "chat" && panels.some((existing) => existing.kind === "chat" && existing.sessionId === sessionId)) continue;
-        if (kind === "chat" && panels.filter((existing) => existing.kind === "chat").length >= MAX_CHAT_PANELS) continue;
         if (panels.length >= MAX_DASHBOARD_PANELS) break;
         panels.push({ id: panel.id.slice(0, 64), kind, ...(kind === "chat" ? { sessionId } : {}) });
       }
@@ -125,10 +124,18 @@ export function normalizeDashboardsState(value: unknown): DashboardsState | unde
     const defaultChatSeeded = typeof item.defaultChatSeeded === "boolean"
       ? item.defaultChatSeeded
       : panels.length > 0;
+    const storedActiveChatPanelId = typeof item.activeChatPanelId === "string"
+      ? item.activeChatPanelId.slice(0, 64)
+      : undefined;
+    const activeChatPanelId = storedActiveChatPanelId
+      && panels.some((panel) => panel.id === storedActiveChatPanelId && panel.kind === "chat")
+      ? storedActiveChatPanelId
+      : undefined;
     dashboards.push({
       id: item.id.slice(0, 64),
       name: item.name.slice(0, 80),
       panels,
+      ...(activeChatPanelId ? { activeChatPanelId } : {}),
       defaultChatSeeded,
       ...(sizes ? { sizes } : {}),
     });
@@ -263,6 +270,17 @@ export function activeDashboardHasKind(kind: DashboardPanelKind): boolean {
   return activeDashboard.value.panels.some((panel) => panel.kind === kind);
 }
 
+/** Remember which chat pane should receive the next sidebar-click replacement. */
+export function setActiveDashboardChatPanel(panelId: string): boolean {
+  const dashboard = activeDashboard.value;
+  if (!dashboard.panels.some((panel) => panel.id === panelId && panel.kind === "chat")) return false;
+  if (dashboard.activeChatPanelId === panelId) return true;
+  commit(dashboards.value.map((item) =>
+    item.id === dashboard.id ? { ...item, activeChatPanelId: panelId } : item,
+  ));
+  return true;
+}
+
 export type AddPanelResult = "added" | "focused" | "full" | "duplicate-session";
 
 /**
@@ -281,7 +299,6 @@ export function addPanelToActiveDashboard(kind: DashboardPanelKind, options?: { 
     if (dashboard.panels.some((panel) => panel.kind === "chat" && panel.sessionId === sessionId)) {
       return "duplicate-session";
     }
-    if (dashboard.panels.filter((panel) => panel.kind === "chat").length >= MAX_CHAT_PANELS) return "full";
   }
   if (dashboard.panels.length >= MAX_DASHBOARD_PANELS) return "full";
   const panel: DashboardPanel = {
@@ -321,9 +338,6 @@ export function replacePanelInActiveDashboard(
     && panel.kind === kind
     && (kind !== "chat" || panel.sessionId === sessionId));
   const retained = dashboard.panels.filter((panel) => panel.id !== duplicate?.id);
-  const existingChatCount = retained.filter((panel) => panel.kind === "chat" && panel.id !== panelId).length;
-  if (kind === "chat" && existingChatCount >= MAX_CHAT_PANELS) return "full";
-
   const replacement: DashboardPanel = {
     id: target.id,
     kind,
@@ -397,11 +411,23 @@ export function reconcileChatPanels(liveSessionIds: ReadonlySet<string>): void {
  */
 export function replaceDashboardPanels(dashboard: Dashboard, panels: DashboardPanel[]): Dashboard {
   const defaultChatSeeded = dashboard.defaultChatSeeded === true || panels.length > 0;
+  const activeChatPanelId = panels.some((panel) =>
+    panel.id === dashboard.activeChatPanelId && panel.kind === "chat",
+  )
+    ? dashboard.activeChatPanelId
+    : panels.filter((panel) => panel.kind === "chat").at(-1)?.id;
   const unchanged = dashboard.panels.length === panels.length
     && dashboard.panels.every((panel, index) => panel.id === panels[index]?.id);
-  if (unchanged) return { ...dashboard, panels, defaultChatSeeded };
-  const { sizes: _staleSizes, ...rest } = dashboard;
-  return { ...rest, panels, defaultChatSeeded };
+  const { activeChatPanelId: _staleActiveChatPanelId, ...withoutActiveChatPanel } = dashboard;
+  const next = {
+    ...withoutActiveChatPanel,
+    panels,
+    ...(activeChatPanelId ? { activeChatPanelId } : {}),
+    defaultChatSeeded,
+  };
+  if (unchanged) return next;
+  const { sizes: _staleSizes, ...withoutSizes } = next;
+  return withoutSizes;
 }
 
 /** Chat session ids currently placed on the active dashboard, in panel order. */

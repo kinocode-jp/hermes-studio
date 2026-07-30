@@ -1952,6 +1952,10 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 .chat-workspace.is-dropping {
   background: color-mix(in srgb, var(--aqua) 3%, transparent);
 }
+.chat-workspace.has-many-panes {
+  grid-auto-rows: minmax(320px, 1fr);
+  overflow: auto;
+}
 .chat-workspace-slot {
   position: relative;
   min-width: 0;
@@ -2010,10 +2014,6 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 }
 .mobile-workspace-bar { display: none; }
 .mobile-chat-tabs { display: none; }
-.chat-workspace.panes-1 { --pane-count: 1; }
-.chat-workspace.panes-2 { --pane-count: 2; }
-.chat-workspace.panes-3 { --pane-count: 3; }
-.chat-workspace.panes-4 { --pane-count: 4; }
 .chat-pane { display: grid; grid-template-rows: 43px minmax(0, 1fr) auto; min-width: 280px; min-height: 0; overflow: hidden; border-right: 1px solid var(--line); border-top: 1px solid var(--session-color, var(--line)); background: var(--surface); }
 /* Headerless panes (dashboard panels, task-detail): no 43px header row, so the
    transcript takes the flexible row and the composer keeps its content height. */
@@ -4511,6 +4511,12 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 .profile-chat-detail-pane.panes-2 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 .profile-chat-detail-pane.panes-3 { grid-template-columns: repeat(3, minmax(0, 1fr)); }
 .profile-chat-detail-pane.panes-4 { grid-template-columns: repeat(2, minmax(0, 1fr)); grid-template-rows: repeat(2, minmax(0, 1fr)); }
+.profile-chat-detail-pane.panes-many {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  grid-auto-rows: minmax(360px, 1fr);
+  align-content: start;
+  overflow: auto;
+}
 .profile-chat-modal-pane {
   position: relative;
   min-width: 0;
@@ -4651,6 +4657,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 /* Mobile */
 @media (max-width: 768px) {
   .profile-chat-modal-layer { padding: 0; }
+  .profile-chat-detail-pane.panes-many { grid-template-columns: minmax(0, 1fr); }
   .profile-chat-modal-body.is-split {
     grid-template-columns: 1fr;
     grid-template-rows: minmax(160px, 34%) minmax(0, 1fr);

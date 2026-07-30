@@ -5,7 +5,6 @@ import {
   activeSessionId,
   clearWorkspaceSessionDropPreview,
   closeMobileRoute,
-  MAX_OPEN_CHAT_SESSIONS,
   mobileWorkspaceOpen,
   openMobileWorkspace,
   openProfileSettingsModal,
@@ -82,10 +81,6 @@ export function ChatWorkspace() {
     if (count === 0) {
       return { index: 0, label: t("workspace.dropHere") };
     }
-    if (count >= MAX_OPEN_CHAT_SESSIONS) {
-      // Still allow reordering/focus of an already-open session via drop index.
-      // New sessions are rejected later.
-    }
     const panes = [...host.querySelectorAll<HTMLElement>(".chat-pane")];
     if (panes.length === 0) {
       return { index: count, label: t("workspace.dropAtEnd") };
@@ -147,12 +142,6 @@ export function ChatWorkspace() {
       window.setTimeout(() => setDropNote(null), 2200);
       return;
     }
-    const alreadyOpen = openSessionIds.value.includes(sessionId);
-    if (!alreadyOpen && openSessionIds.value.length >= MAX_OPEN_CHAT_SESSIONS) {
-      setDropNote(t("workspace.paneLimit"));
-      window.setTimeout(() => setDropNote(null), 2200);
-      return;
-    }
     openSession(sessionId, {
       workspace: true,
       ...(target ? { index: target.index } : {}),
@@ -184,7 +173,7 @@ export function ChatWorkspace() {
             </small>
           </div>
         ) : (
-          <p class="workspace-drop-hint">{t("workspace.dropToAddPane")}</p>
+          <p class="workspace-drop-hint">{t("workspace.dropToAddPaneUnlimited")}</p>
         )}
         {dropNote && <p class="workspace-drop-note">{dropNote}</p>}
       </section>
@@ -251,7 +240,8 @@ export function ChatWorkspace() {
       )}
       {dropNote && <p class="workspace-drop-note">{dropNote}</p>}
       <div
-        class={`chat-workspace panes-${Math.min(openSessions.length, MAX_OPEN_CHAT_SESSIONS)} ${dropTarget ? "is-dropping" : ""}`}
+        class={`chat-workspace ${openSessions.length > 4 ? "has-many-panes" : ""} ${dropTarget ? "is-dropping" : ""}`}
+        style={{ "--pane-count": openSessions.length }}
         aria-label={t("workspace.openChats")}
       >
         {openSessions.map((session, index) => {

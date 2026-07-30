@@ -121,14 +121,12 @@ export function SideRail() {
   const [dragProfileId, setDragProfileId] = useState<string | null>(null);
   const [dropTargetId, setDropTargetId] = useState<string | null>(null);
   const [panelActionNote, setPanelActionNote] = useState("");
-  const [sessionClickTooltip, setSessionClickTooltip] = useState<{ sessionId: string; left: number; top: number; width: number } | null>(null);
   const [sessionDeleteRequestId, setSessionDeleteRequestId] = useState<string | null>(null);
   const [dashboardDeleteRequest, setDashboardDeleteRequest] = useState<{ id: string; name: string } | null>(null);
   const [taskDeleteRequest, setTaskDeleteRequest] = useState<WorkTask | null>(null);
   const [taskDeleteBusy, setTaskDeleteBusy] = useState(false);
   const [taskDeleteFailed, setTaskDeleteFailed] = useState(false);
   const panelActionNoteTimer = useRef<number | undefined>(undefined);
-  const sessionClickTooltipTimer = useRef<number | undefined>(undefined);
   const dashboardDeleteOverlay = useMobileOverlay<HTMLElement>({
     kind: "modal",
     open: dashboardDeleteRequest !== null,
@@ -168,29 +166,6 @@ export function SideRail() {
       setPanelActionNote("");
       panelActionNoteTimer.current = undefined;
     }, 2200);
-  };
-
-  const showSessionClickTooltip = (event: MouseEvent, sessionId: string) => {
-    if (!(event.currentTarget instanceof HTMLElement)) return;
-    if (sessionClickTooltipTimer.current !== undefined) window.clearTimeout(sessionClickTooltipTimer.current);
-    const rect = event.currentTarget.getBoundingClientRect();
-    const width = Math.min(320, Math.max(220, window.innerWidth - 16));
-    const left = Math.min(
-      Math.max(8, rect.right + 8),
-      Math.max(8, window.innerWidth - width - 8),
-    );
-    const top = Math.min(Math.max(44, rect.top + rect.height / 2), window.innerHeight - 44);
-    setSessionClickTooltip({ sessionId, left, top, width });
-    sessionClickTooltipTimer.current = window.setTimeout(() => {
-      setSessionClickTooltip(null);
-      sessionClickTooltipTimer.current = undefined;
-    }, 3200);
-  };
-
-  const clearSessionClickTooltip = () => {
-    if (sessionClickTooltipTimer.current !== undefined) window.clearTimeout(sessionClickTooltipTimer.current);
-    sessionClickTooltipTimer.current = undefined;
-    setSessionClickTooltip(null);
   };
 
   const activateOrAddPanelFromClick = (kind: DashboardPanelKind): boolean => {
@@ -266,7 +241,6 @@ export function SideRail() {
 
   useEffect(() => () => {
     if (panelActionNoteTimer.current !== undefined) window.clearTimeout(panelActionNoteTimer.current);
-    if (sessionClickTooltipTimer.current !== undefined) window.clearTimeout(sessionClickTooltipTimer.current);
   }, []);
 
   useEffect(() => {
@@ -408,16 +382,11 @@ export function SideRail() {
       return;
     }
     const result = selectDashboardChatSession(sessionId);
-    if (result === "drag-required") {
-      showSessionClickTooltip(event, sessionId);
-      return;
-    }
     if (result === "full") {
       showPanelActionNote(t("dashboard.panelLimit", { count: MAX_DASHBOARD_PANELS }));
       return;
     }
     if (result === "missing") return;
-    clearSessionClickTooltip();
     if (phoneViewport) setMobileTabKind("chat");
     openMobileWorkspace();
     if (phoneViewport) revealMobilePanel("chat", sessionId);
@@ -514,7 +483,6 @@ export function SideRail() {
                     style={isOpen ? { "--session-color": profile.color } : undefined}
                     aria-current={activeSessionId.value === session.id ? "true" : undefined}
                     aria-keyshortcuts="Shift+Enter"
-                    aria-describedby={sessionClickTooltip?.sessionId === session.id ? "sidebar-session-click-tooltip" : undefined}
                     aria-label={`${displayName} — ${chatSessionTitle(session)}${session.conversationKind === "delegated" ? ` — ${t("profile.delegatedChat")}` : ""}`}
                     onClick={(event) => onSessionClick(event, session.id, profile.id)}
                     onKeyDown={(event) => onSessionKeyDown(event, session.id)}
@@ -952,21 +920,6 @@ export function SideRail() {
       <p class="sidebar-panel-action-note" role="status" aria-live="polite" aria-atomic="true">
         {panelActionNote}
       </p>
-
-      {sessionClickTooltip && (
-        <div
-          id="sidebar-session-click-tooltip"
-          class="sidebar-session-click-tooltip"
-          role="tooltip"
-          style={{
-            left: `${sessionClickTooltip.left}px`,
-            top: `${sessionClickTooltip.top}px`,
-            width: `${sessionClickTooltip.width}px`,
-          }}
-        >
-          {t("dashboard.chatClickDragHint")}
-        </div>
-      )}
 
       {sessionDeleteRequestId && (() => {
         const session = sessions.value.find((item) => item.id === sessionDeleteRequestId);
