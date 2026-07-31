@@ -5789,9 +5789,10 @@ textarea::placeholder { color: var(--ink-muted); }
   display: flex;
   flex: 0 0 auto;
   min-height: 0;
+  height: min(var(--sidebar-profile-region-max-height, 300px), calc(100vh - 160px));
   max-height: min(var(--sidebar-profile-region-max-height, 300px), calc(100vh - 160px));
   overflow: hidden;
-  transition: max-height 180ms ease;
+  transition: height 180ms ease, max-height 180ms ease;
 }
 .sidebar-profile-tools {
   justify-content: flex-end;
@@ -5858,6 +5859,7 @@ textarea::placeholder { color: var(--ink-muted); }
   }
   .sidebar-profiles--nested {
     max-width: none;
+    height: auto;
     max-height: none;
     margin: 0;
     border-left: 0;
