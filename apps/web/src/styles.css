@@ -5789,8 +5789,9 @@ textarea::placeholder { color: var(--ink-muted); }
   display: flex;
   flex: 0 0 auto;
   min-height: 0;
-  max-height: min(36vh, 360px);
+  max-height: min(var(--sidebar-profile-region-max-height, 300px), calc(100vh - 160px));
   overflow: hidden;
+  transition: max-height 180ms ease;
 }
 .sidebar-profile-tools {
   justify-content: flex-end;

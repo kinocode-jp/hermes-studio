@@ -296,6 +296,8 @@ export function SideRail() {
 
   const profilesRemaining = Math.max(0, orderedProfiles.length - visibleProfiles.length);
   const hasMoreProfiles = profilesRemaining > 0 || inventory.hasMore;
+  const profilePageCount = Math.max(1, Math.ceil(visibleProfileCount / SIDEBAR_PROFILE_PAGE_SIZE));
+  const profileRegionMaxHeight = 300 + ((profilePageCount - 1) * 300);
 
   const showMoreProfiles = async () => {
     const nextCount = visibleProfileCount + SIDEBAR_PROFILE_PAGE_SIZE;
@@ -805,6 +807,7 @@ export function SideRail() {
       id="sidebar-profiles-sheet"
       class={`sidebar-profiles sidebar-profiles--nested${sidebarProfilesOpen.value ? "" : " is-collapsed"}`}
       aria-labelledby="sidebar-profiles-title"
+      style={{ "--sidebar-profile-region-max-height": `${profileRegionMaxHeight}px` }}
     >
       {sidebarProfilesOpen.value && (
         <>
