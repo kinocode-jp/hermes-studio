@@ -40,6 +40,7 @@ import {
   isSidebarProfileOpen,
   isSidebarProjectOpen,
   setSidebarProfilesOpen,
+  setSidebarProjectsOpen,
   setSidebarMode,
   setSidebarTasksOpen,
   setSidebarTeamsOpen,
@@ -47,6 +48,7 @@ import {
   previewSidebarWidth,
   sidebarMode,
   sidebarProfilesOpen,
+  sidebarProjectsOpen,
   sidebarTasksOpen,
   sidebarTeamsOpen,
   sidebarWidth,
@@ -267,9 +269,7 @@ export function SideRail() {
 
   void profileDisplayNameMap();
   const hasTeams = teams.value.length > 0;
-  const groupMode = sidebarGroupMode.value === "projects"
-    ? "projects"
-    : hasTeams && sidebarGroupMode.value === "teams" ? "teams" : "profiles";
+  const groupMode = hasTeams && sidebarGroupMode.value === "teams" ? "teams" : "profiles";
   const orderedProfiles = sortProfilesBySidebarOrder(profileList.value);
   const defaultProfile = profileList.value.find((profile) => profile.id === "default");
   const grouping = groupMode === "teams"
@@ -745,7 +745,7 @@ export function SideRail() {
     >
       {sidebarProfilesOpen.value && (
         <>
-          <header class="sidebar-section-head sidebar-profile-tools">
+          {hasTeams && <header class="sidebar-section-head sidebar-profile-tools">
               <div class="sidebar-section-head-tools">
                 <div class="profile-group-toggle" role="group" aria-label={t("sidebar.group.aria")}>
                   <button
@@ -756,55 +756,66 @@ export function SideRail() {
                     aria-label={t("sidebar.group.profiles")}
                     onClick={() => setSidebarGroupMode("profiles")}
                   ><ListIcon /></button>
-                  {hasTeams && (
-                    <button
-                      type="button"
-                      class={groupMode === "teams" ? "is-active" : ""}
-                      aria-pressed={groupMode === "teams"}
-                      title={t("sidebar.group.teams")}
-                      aria-label={t("sidebar.group.teams")}
-                      onClick={() => setSidebarGroupMode("teams")}
-                    ><GroupIcon /></button>
-                  )}
                   <button
                     type="button"
-                    class={groupMode === "projects" ? "is-active" : ""}
-                    aria-pressed={groupMode === "projects"}
-                    title={t("sidebar.group.projects")}
-                    aria-label={t("sidebar.group.projects")}
-                    onClick={() => setSidebarGroupMode("projects")}
-                  ><FolderIcon /></button>
+                    class={groupMode === "teams" ? "is-active" : ""}
+                    aria-pressed={groupMode === "teams"}
+                    title={t("sidebar.group.teams")}
+                    aria-label={t("sidebar.group.teams")}
+                    onClick={() => setSidebarGroupMode("teams")}
+                  ><GroupIcon /></button>
                 </div>
               </div>
-            </header>
+            </header>}
           <div class="sidebar-profile-list">
-            {groupMode === "projects"
-              ? projectGroups.map(renderProjectGroup)
-              : grouping.mode === "flat"
+            {grouping.mode === "flat"
               ? grouping.profiles.map((profile) => renderProfileEntry(profile, profile.id))
               : grouping.groups.map((group) => renderGroup(group))}
-            {(groupMode === "projects" ? projectGroups.length === 0 : profileList.value.length === 0)
-              && <p class="sidebar-profile-empty">-</p>}
+            {profileList.value.length === 0 && <p class="sidebar-profile-empty">-</p>}
           </div>
-          {(groupMode === "projects" ? sessionInventory.hasMore : inventory.hasMore) && !iconOnly && (
+          {inventory.hasMore && !iconOnly && (
             <button
               class="sidebar-more"
               type="button"
-              disabled={groupMode === "projects" ? sessionInventory.loading : inventory.loading}
-              onClick={() => void (groupMode === "projects" ? loadMoreSessions() : loadMoreProfiles())}
+              disabled={inventory.loading}
+              onClick={() => void loadMoreProfiles()}
             >
-              {(groupMode === "projects" ? sessionInventory.loading : inventory.loading) ? t("inventory.loading") : t("inventory.showMore")}
+              {inventory.loading ? t("inventory.loading") : t("inventory.showMore")}
             </button>
           )}
-          {(groupMode === "projects" ? sessionInventory.error : inventory.error) && !iconOnly && (
+          {inventory.error && !iconOnly && (
             <small class="inventory-note inventory-note--error">
-              {localizeRuntimeMessage((groupMode === "projects" ? sessionInventory.error : inventory.error)!)}
+              {localizeRuntimeMessage(inventory.error)}
             </small>
           )}
         </>
       )}
     </section>
   );
+  const projectTree = !iconOnly ? (
+    <section
+      id="sidebar-projects-tree"
+      class={`sidebar-nav-tree sidebar-projects--nested${sidebarProjectsOpen.value ? "" : " is-collapsed"}`}
+      aria-labelledby="sidebar-projects-title"
+    >
+      {sidebarProjectsOpen.value && (
+        <>
+          <div class="sidebar-project-list">
+            {projectGroups.map(renderProjectGroup)}
+            {projectGroups.length === 0 && <p class="sidebar-nav-tree-empty">-</p>}
+          </div>
+          {sessionInventory.hasMore && (
+            <button class="sidebar-more" type="button" disabled={sessionInventory.loading} onClick={() => void loadMoreSessions()}>
+              {sessionInventory.loading ? t("inventory.loading") : t("inventory.showMore")}
+            </button>
+          )}
+          {sessionInventory.error && (
+            <small class="inventory-note inventory-note--error">{localizeRuntimeMessage(sessionInventory.error)}</small>
+          )}
+        </>
+      )}
+    </section>
+  ) : null;
 
   return (
     <nav
@@ -816,6 +827,7 @@ export function SideRail() {
       data-sidebar-tasks-open={sidebarTasksOpen.value ? "true" : "false"}
       data-sidebar-teams-open={sidebarTeamsOpen.value ? "true" : "false"}
       data-sidebar-profiles-open={sidebarProfilesOpen.value ? "true" : "false"}
+      data-sidebar-projects-open={sidebarProjectsOpen.value ? "true" : "false"}
       data-mobile-profiles-open={phoneViewport && sidebarProfilesOpen.value ? "true" : "false"}
       data-mobile-chat-available={phoneViewport && defaultProfile ? "true" : "false"}
       data-sidebar-group={groupMode}
@@ -1029,6 +1041,26 @@ export function SideRail() {
             </Fragment>
           );
         })}
+        <button
+          id="sidebar-projects-title"
+          type="button"
+          class="sidebar-nav-button sidebar-projects-trigger has-disclosure"
+          aria-expanded={sidebarProjectsOpen.value}
+          aria-controls="sidebar-projects-tree"
+          title={t("sidebar.projects")}
+          aria-label={t("sidebar.projects")}
+          onClick={() => setSidebarProjectsOpen(!sidebarProjectsOpen.value)}
+        >
+          <span aria-hidden="true"><FolderIcon /></span>
+          {!iconOnly && <b>{t("sidebar.projects")}</b>}
+          {!iconOnly && (
+            <>
+              <small class="sidebar-nav-count" aria-hidden="true">{projectGroups.length}</small>
+              <span class="sidebar-nav-chevron" aria-hidden="true">{sidebarProjectsOpen.value ? "▾" : "▸"}</span>
+            </>
+          )}
+        </button>
+        {projectTree}
       </div>
 
       <p class="sidebar-panel-action-note" role="status" aria-live="polite" aria-atomic="true">

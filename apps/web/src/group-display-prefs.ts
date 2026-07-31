@@ -3,10 +3,10 @@ import { signal } from "@preact/signals";
 const SIDEBAR_KEY = "hermes-studio:sidebar-group-mode:v1";
 const OFFICE_KEY = "hermes-studio:office-group-mode:v1";
 
-/** Profiles, teams, or project-grouped sessions. Default is Profiles. */
-export type GroupDisplayMode = "profiles" | "teams" | "projects";
+/** Flat Profiles list vs team-grouped roster. Default is Profiles. */
+export type GroupDisplayMode = "profiles" | "teams";
 
-const VALID: readonly GroupDisplayMode[] = ["profiles", "teams", "projects"];
+const VALID: readonly GroupDisplayMode[] = ["profiles", "teams"];
 
 export const sidebarGroupMode = signal<GroupDisplayMode>(readMode(SIDEBAR_KEY));
 export const officeGroupMode = signal<GroupDisplayMode>(readMode(OFFICE_KEY));
@@ -18,14 +18,14 @@ export function setSidebarGroupMode(mode: GroupDisplayMode): void {
 }
 
 export function setOfficeGroupMode(mode: GroupDisplayMode): void {
-  if (!VALID.includes(mode) || mode === "projects") return;
+  if (!VALID.includes(mode)) return;
   officeGroupMode.value = mode;
   persistMode(OFFICE_KEY, mode);
 }
 
 /** Parse a stored preference string; unknown/legacy values fall back to Profiles. */
 export function parseGroupDisplayMode(value: unknown): GroupDisplayMode {
-  return value === "teams" || value === "projects" ? value : "profiles";
+  return value === "teams" ? "teams" : "profiles";
 }
 
 function readMode(key: string): GroupDisplayMode {

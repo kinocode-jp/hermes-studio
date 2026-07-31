@@ -5605,6 +5605,7 @@ textarea::placeholder { color: var(--ink-muted); }
   font: 700 var(--text-xs)/1 var(--font-sans);
   text-align: center;
 }
+.sidebar-projects-trigger { cursor: pointer !important; }
 .sidebar-nav-chevron {
   width: 12px;
   color: var(--ink-muted);
@@ -5722,6 +5723,16 @@ textarea::placeholder { color: var(--ink-muted); }
 .sidebar-nav-tree {
   display: grid;
   gap: 4px;
+}
+.sidebar-projects--nested {
+  max-height: min(42vh, 420px);
+  overflow-y: auto;
+  scrollbar-width: thin;
+}
+.sidebar-project-list {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
 }
 .sidebar-nav-tree.is-collapsed,
 .sidebar-profiles--nested.is-collapsed { display: none; }
@@ -5848,7 +5859,9 @@ textarea::placeholder { color: var(--ink-muted); }
   }
   .side-rail[data-mobile-profiles-open="true"] .sidebar-profiles { display: flex; }
   .sidebar-tasks--nested,
-  .sidebar-teams--nested { display: none; }
+  .sidebar-teams--nested,
+  .sidebar-projects-trigger,
+  .sidebar-projects--nested { display: none !important; }
   .sidebar-profile-nav-row > .sidebar-nav-button {
     flex: 1 1 0;
     width: 0;

@@ -16,6 +16,7 @@ type SidebarPreferences = {
   tasksOpen: boolean;
   teamsOpen: boolean;
   profilesOpen: boolean;
+  projectsOpen: boolean;
   openProfileIds: string[];
   openProjectIds: string[];
 };
@@ -27,6 +28,7 @@ export const sidebarMode = signal<SidebarMode>(initial.mode);
 export const sidebarTasksOpen = signal(initial.tasksOpen);
 export const sidebarTeamsOpen = signal(initial.teamsOpen);
 export const sidebarProfilesOpen = signal(initial.profilesOpen);
+export const sidebarProjectsOpen = signal(initial.projectsOpen);
 export const sidebarOpenProfileIds = signal<string[]>(initial.openProfileIds);
 export const sidebarOpenProjectIds = signal<string[]>(initial.openProjectIds);
 
@@ -56,6 +58,11 @@ export function setSidebarTeamsOpen(open: boolean): void {
 
 export function setSidebarProfilesOpen(open: boolean): void {
   sidebarProfilesOpen.value = open;
+  persistPreferences();
+}
+
+export function setSidebarProjectsOpen(open: boolean): void {
+  sidebarProjectsOpen.value = open;
   persistPreferences();
 }
 
@@ -109,6 +116,7 @@ function readPreferences(): SidebarPreferences {
     teamsOpen: true,
     // On phones the profile sheet overlays the whole screen, so it starts closed.
     profilesOpen: !isPhoneViewport(),
+    projectsOpen: true,
     openProfileIds: [],
     openProjectIds: [],
   };
@@ -121,6 +129,7 @@ function readPreferences(): SidebarPreferences {
       tasksOpen: typeof parsed?.tasksOpen === "boolean" ? parsed.tasksOpen : fallback.tasksOpen,
       teamsOpen: typeof parsed?.teamsOpen === "boolean" ? parsed.teamsOpen : fallback.teamsOpen,
       profilesOpen: typeof parsed?.profilesOpen === "boolean" ? parsed.profilesOpen : fallback.profilesOpen,
+      projectsOpen: typeof parsed?.projectsOpen === "boolean" ? parsed.projectsOpen : fallback.projectsOpen,
       openProfileIds: Array.isArray(parsed?.openProfileIds)
         ? parsed.openProfileIds.filter((id): id is string => typeof id === "string" && id.trim().length > 0)
         : fallback.openProfileIds,
@@ -142,6 +151,7 @@ function persistPreferences(): void {
       tasksOpen: sidebarTasksOpen.value,
       teamsOpen: sidebarTeamsOpen.value,
       profilesOpen: sidebarProfilesOpen.value,
+      projectsOpen: sidebarProjectsOpen.value,
       openProfileIds: sidebarOpenProfileIds.value,
       openProjectIds: sidebarOpenProjectIds.value,
     } satisfies SidebarPreferences));
