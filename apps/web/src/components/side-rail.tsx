@@ -74,7 +74,13 @@ import { createProfileSession } from "./profile-panel";
 import { SessionDeleteDialog } from "./session-delete-dialog";
 import { useMobileOverlay } from "./use-mobile-overlay";
 import { groupSessionsByProject, type ProjectSessionGroup } from "../project-session-groups";
+import {
+  moveSidebarProject,
+  reconcileSidebarProjectOrder,
+  sortProjectsBySidebarOrder,
+} from "../project-order";
 
+const SIDEBAR_PROFILE_PAGE_SIZE = 8;
 
 function sidebarTaskStatusLabel(status: string): string {
   switch (status) {
@@ -126,6 +132,9 @@ export function SideRail() {
   );
   const [dragProfileId, setDragProfileId] = useState<string | null>(null);
   const [dropTargetId, setDropTargetId] = useState<string | null>(null);
+  const [dragProjectId, setDragProjectId] = useState<string | null>(null);
+  const [dropProjectTargetId, setDropProjectTargetId] = useState<string | null>(null);
+  const [visibleProfileCount, setVisibleProfileCount] = useState(SIDEBAR_PROFILE_PAGE_SIZE);
   const [panelActionNote, setPanelActionNote] = useState("");
   const [sessionDeleteRequestId, setSessionDeleteRequestId] = useState<string | null>(null);
   const [dashboardDeleteRequest, setDashboardDeleteRequest] = useState<{ id: string; name: string } | null>(null);
@@ -271,13 +280,28 @@ export function SideRail() {
   const hasTeams = teams.value.length > 0;
   const groupMode = hasTeams && sidebarGroupMode.value === "teams" ? "teams" : "profiles";
   const orderedProfiles = sortProfilesBySidebarOrder(profileList.value);
+  const visibleProfiles = orderedProfiles.slice(0, visibleProfileCount);
   const defaultProfile = profileList.value.find((profile) => profile.id === "default");
   const grouping = groupMode === "teams"
-    ? groupProfilesByTeams(orderedProfiles, teams.value)
-    : { mode: "flat" as const, profiles: orderedProfiles };
-  const projectGroups = groupSessionsByProject(
+    ? groupProfilesByTeams(visibleProfiles, teams.value)
+    : { mode: "flat" as const, profiles: visibleProfiles };
+  const discoveredProjectGroups = groupSessionsByProject(
     sessions.value.filter((session) => !isScheduledSessionHidden(session)),
   );
+  const projectGroups = sortProjectsBySidebarOrder(discoveredProjectGroups);
+  const projectIdsKey = discoveredProjectGroups.map((group) => group.key).join("|");
+  useEffect(() => {
+    reconcileSidebarProjectOrder(discoveredProjectGroups.map((group) => group.key));
+  }, [projectIdsKey]);
+
+  const profilesRemaining = Math.max(0, orderedProfiles.length - visibleProfiles.length);
+  const hasMoreProfiles = profilesRemaining > 0 || inventory.hasMore;
+
+  const showMoreProfiles = async () => {
+    const nextCount = visibleProfileCount + SIDEBAR_PROFILE_PAGE_SIZE;
+    setVisibleProfileCount(nextCount);
+    if (nextCount >= orderedProfiles.length && inventory.hasMore) await loadMoreProfiles();
+  };
 
   const copy = {
     displayMode: t(sidebarMode.value === "rows" ? "sidebar.mode.cards" : "sidebar.mode.rows"),
@@ -382,6 +406,38 @@ export function SideRail() {
   const onProfileDragEnd = () => {
     setDragProfileId(null);
     setDropTargetId(null);
+  };
+
+  const onProjectDragStart = (event: DragEvent, projectId: string) => {
+    if (!(event.dataTransfer instanceof DataTransfer)) return;
+    event.dataTransfer.setData("application/x-hermes-project", projectId);
+    event.dataTransfer.setData("text/plain", projectId);
+    event.dataTransfer.effectAllowed = "move";
+    setDragProjectId(projectId);
+    setDropProjectTargetId(null);
+  };
+
+  const onProjectDragOver = (event: DragEvent, projectId: string) => {
+    if (!dragProjectId || dragProjectId === projectId) return;
+    event.preventDefault();
+    if (event.dataTransfer) event.dataTransfer.dropEffect = "move";
+    if (dropProjectTargetId !== projectId) setDropProjectTargetId(projectId);
+  };
+
+  const onProjectDrop = (event: DragEvent, projectId: string) => {
+    event.preventDefault();
+    const sourceId = event.dataTransfer?.getData("application/x-hermes-project")
+      || event.dataTransfer?.getData("text/plain")
+      || dragProjectId
+      || "";
+    if (sourceId && sourceId !== projectId) moveSidebarProject(sourceId, projectId);
+    setDragProjectId(null);
+    setDropProjectTargetId(null);
+  };
+
+  const onProjectDragEnd = () => {
+    setDragProjectId(null);
+    setDropProjectTargetId(null);
   };
 
   const onSessionClick = (event: MouseEvent, sessionId: string, profileId: string) => {
@@ -620,18 +676,25 @@ export function SideRail() {
   const renderProjectGroup = (group: ProjectSessionGroup) => {
     const label = group.kind === "project" ? group.name : t("project.group.unassigned");
     const open = isSidebarProjectOpen(group.key);
+    const dragging = dragProjectId === group.key;
+    const dropTarget = dropProjectTargetId === group.key && dragProjectId !== group.key;
     return (
       <section
         key={group.key}
-        class={`profile-group project-session-group ${group.kind === "unassigned" ? "profile-group--unassigned" : ""}`}
+        class={`profile-group project-session-group ${group.kind === "unassigned" ? "profile-group--unassigned" : ""} ${dragging ? "is-dragging" : ""} ${dropTarget ? "is-drop-target" : ""}`}
         aria-label={label}
+        onDragOver={(event) => onProjectDragOver(event, group.key)}
+        onDrop={(event) => onProjectDrop(event, group.key)}
       >
         <button
           type="button"
           class="profile-group-header project-group-header-button"
+          draggable
           aria-expanded={open}
           title={label}
           onClick={() => toggleSidebarProjectOpen(group.key)}
+          onDragStart={(event) => onProjectDragStart(event, group.key)}
+          onDragEnd={onProjectDragEnd}
         >
           <i aria-hidden="true" />
           <b>{label}</b>
@@ -773,14 +836,14 @@ export function SideRail() {
               : grouping.groups.map((group) => renderGroup(group))}
             {profileList.value.length === 0 && <p class="sidebar-profile-empty">-</p>}
           </div>
-          {inventory.hasMore && !iconOnly && (
+          {hasMoreProfiles && !iconOnly && (
             <button
               class="sidebar-more"
               type="button"
               disabled={inventory.loading}
-              onClick={() => void loadMoreProfiles()}
+              onClick={() => void showMoreProfiles()}
             >
-              {inventory.loading ? t("inventory.loading") : t("inventory.showMore")}
+              {inventory.loading ? t("inventory.loading") : t("sidebar.loadMore")}
             </button>
           )}
           {inventory.error && !iconOnly && (

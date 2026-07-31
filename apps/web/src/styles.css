@@ -5789,6 +5789,8 @@ textarea::placeholder { color: var(--ink-muted); }
   display: flex;
   flex: 0 0 auto;
   min-height: 0;
+  max-height: min(36vh, 360px);
+  overflow: hidden;
 }
 .sidebar-profile-tools {
   justify-content: flex-end;
@@ -5796,9 +5798,10 @@ textarea::placeholder { color: var(--ink-muted); }
   padding: 0 0 3px;
 }
 .sidebar-profiles--nested .sidebar-profile-list {
-  min-height: auto;
+  min-height: 0;
   padding-bottom: 2px;
-  overflow: visible;
+  overflow-y: auto;
+  scrollbar-width: thin;
 }
 /* Desktop side rail is resizable; keep nested content available outside icon-only mode. */
 .side-rail > .sidebar-resize-handle { display: grid; }
@@ -5854,8 +5857,10 @@ textarea::placeholder { color: var(--ink-muted); }
   }
   .sidebar-profiles--nested {
     max-width: none;
+    max-height: none;
     margin: 0;
     border-left: 0;
+    overflow: visible;
   }
   .side-rail[data-mobile-profiles-open="true"] .sidebar-profiles { display: flex; }
   .sidebar-tasks--nested,
