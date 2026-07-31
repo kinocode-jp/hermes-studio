@@ -279,7 +279,7 @@ export type OfficeSnapshot = {
     features: Array<"chat" | "profiles" | "skills" | "memory" | "kanban" | "teams" | "global-inheritance" | "demo">;
   };
   profiles: OfficeSnapshotProfile[];
-  sessions: Array<{ id: string; profileId: string; title: string; activity: string; createdAt?: string; updatedAt?: string; lastMessagePreview?: string; conversationKind?: "direct" | "delegated"; delegationTaskId?: string; delegatedByProfileId?: string }>;
+  sessions: Array<{ id: string; profileId: string; title: string; activity: string; createdAt?: string; updatedAt?: string; lastMessagePreview?: string; projectGroupId?: string; projectGroupName?: string; conversationKind?: "direct" | "delegated"; delegationTaskId?: string; delegatedByProfileId?: string }>;
   inventory: { profiles: OfficeInventoryPagination; sessions: OfficeInventoryPagination };
   boards: Array<{ id: string; name: string; cardCount: number }>;
 };
