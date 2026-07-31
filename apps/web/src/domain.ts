@@ -92,6 +92,10 @@ export type ChatSession = {
   createdAt?: string | undefined;
   updatedAt?: string | undefined;
   lastMessagePreview?: string | undefined;
+  /** Opaque project grouping identity supplied by Studio Server. */
+  projectGroupId?: string | undefined;
+  /** Display-only workspace basename; the absolute host path is not exposed. */
+  projectGroupName?: string | undefined;
   /** Studio-visible origin. Delegated chats are durable worker conversations. */
   conversationKind?: "direct" | "delegated" | undefined;
   /** Shared Kanban task that created a delegated profile conversation. */

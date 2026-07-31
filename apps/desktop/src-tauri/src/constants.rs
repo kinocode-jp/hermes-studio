@@ -1,9 +1,9 @@
 use std::time::Duration;
 
-pub(crate) const OFFICE_HOST: &str = "127.0.0.1";
-pub(crate) const OFFICE_PORT: u16 = 4317;
-pub(crate) const OFFICE_URL: &str = "http://127.0.0.1:4317/";
-pub(crate) const OFFICE_PROTOCOL_VERSION: i64 = 1;
+pub(crate) const STUDIO_SERVER_HOST: &str = "127.0.0.1";
+pub(crate) const STUDIO_SERVER_PORT: u16 = 4317;
+pub(crate) const STUDIO_SERVER_URL: &str = "http://127.0.0.1:4317/";
+pub(crate) const STUDIO_SERVER_PROTOCOL_VERSION: i64 = 1;
 pub(crate) const START_TIMEOUT: Duration = Duration::from_secs(50);
 pub(crate) const STOP_TIMEOUT: Duration = Duration::from_secs(5);
 pub(crate) const VERSION_TIMEOUT: Duration = Duration::from_secs(3);

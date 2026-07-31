@@ -471,6 +471,10 @@ export interface ChatSessionSummary {
   /** `UNKNOWN_INVENTORY_TIMESTAMP` means both update fields were absent. */
   updatedAt: IsoDateTime;
   lastMessagePreview?: string;
+  /** Opaque Studio-generated grouping key derived from the Hermes workspace. */
+  projectGroupId?: string;
+  /** Safe basename shown for the workspace group; never contains the host path. */
+  projectGroupName?: string;
   /** `delegated` identifies a durable specialist-profile worker conversation. */
   conversationKind?: "direct" | "delegated";
   delegationTaskId?: string;

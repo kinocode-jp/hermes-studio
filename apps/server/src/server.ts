@@ -26,7 +26,7 @@ import {
 } from "./models-http.js";
 import { StaticWebAssets } from "./static-web.js";
 import {
-  OFFICE_PROTOCOL_VERSION,
+  STUDIO_SERVER_PROTOCOL_VERSION,
   createDemoRuntimeStatus,
   createDemoSnapshot,
 } from "./demo-state.js";
@@ -81,7 +81,7 @@ export {
 } from "./server-http.js";
 export { normalizeOrigin } from "./origin.js";
 
-export interface OfficeServerOptions {
+export interface StudioServerOptions {
   host?: string;
   port?: number;
   allowedOrigins?: readonly string[];
@@ -126,7 +126,7 @@ export interface OfficeServerOptions {
   hermesAgentUpdate?: HermesAgentUpdateManager;
 }
 
-export interface OfficeServer {
+export interface StudioServer {
   readonly host: string;
   readonly port: number;
   readonly originAllowlist: ReadonlySet<string>;
@@ -135,7 +135,7 @@ export interface OfficeServer {
   broadcast<T>(topic: EventTopic, payload: T, aggregateId?: string): boolean;
 }
 
-export function createOfficeServer(options: OfficeServerOptions = {}): OfficeServer {
+export function createStudioServer(options: StudioServerOptions = {}): StudioServer {
   const host = options.host ?? "127.0.0.1";
   const port = options.port ?? 4317;
   const maxJsonBytes = boundedInteger(options.maxJsonBytes, 64 * 1024, 1_024, 1024 * 1024);
@@ -702,7 +702,7 @@ export function createOfficeServer(options: OfficeServerOptions = {}): OfficeSer
         200,
         {
           ok: true,
-          protocolVersion: OFFICE_PROTOCOL_VERSION,
+          protocolVersion: STUDIO_SERVER_PROTOCOL_VERSION,
           runtime: runtime.state,
         },
         maxResponseJsonBytes,
@@ -960,7 +960,7 @@ export function createOfficeServer(options: OfficeServerOptions = {}): OfficeSer
           httpServer.off("error", onError);
           const address = httpServer.address();
           if (address === null || typeof address === "string") {
-            reject(new Error("Office Server did not receive a TCP address."));
+            reject(new Error("Studio Server did not receive a TCP address."));
             return;
           }
           for (const origin of listenerOrigins(address)) originAllowlist.add(origin);

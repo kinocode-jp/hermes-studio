@@ -1,11 +1,11 @@
 use std::path::PathBuf;
 
-use crate::constants::OFFICE_PORT;
+use crate::constants::STUDIO_SERVER_PORT;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum OfficeStartup {
+pub(crate) enum StudioServerStartup {
     /// Loopback port is free; this desktop instance should start and own the
-    /// Office Server child.
+    /// Studio Server child.
     PortFree,
     /// A listener with the expected protocol and Web UI shape is already on
     /// the port. The launcher opens that loopback Web UI without owning or
@@ -15,7 +15,7 @@ pub(crate) enum OfficeStartup {
 
 /// Successful desktop setup outcomes (failures use [`StartupFailure`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum OfficeLaunch {
+pub(crate) enum StudioServerLaunch {
     /// Owned child is ready; open the packaged app bundle and enable capability.
     OwnedReady,
     /// Existing compatible listener; open `http://127.0.0.1:4317/` without
@@ -37,22 +37,22 @@ impl std::fmt::Display for StartupProbeError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             StartupProbeError::Incompatible => {
-                write!(formatter, "A listener on port {OFFICE_PORT} returned an Office-shaped health response with an incompatible protocol version. Verify the port owner before closing or updating it.")
+                write!(formatter, "A listener on port {STUDIO_SERVER_PORT} returned a Studio Server health response with an incompatible protocol version. Verify the port owner before closing or updating it.")
             }
             StartupProbeError::Malformed => {
-                write!(formatter, "A listener on port {OFFICE_PORT} returned a malformed health response. Verify the port owner before inspecting or closing it.")
+                write!(formatter, "A listener on port {STUDIO_SERVER_PORT} returned a malformed health response. Verify the port owner before inspecting or closing it.")
             }
             StartupProbeError::Timeout => {
-                write!(formatter, "A listener on port {OFFICE_PORT} did not complete the health probe in time. Verify the port owner before inspecting or closing it.")
+                write!(formatter, "A listener on port {STUDIO_SERVER_PORT} did not complete the health probe in time. Verify the port owner before inspecting or closing it.")
             }
             StartupProbeError::OtherService => {
-                write!(formatter, "Port {OFFICE_PORT} is already in use by a service that was not recognized as Hermes Studio. Verify the port owner before inspecting or closing it.")
+                write!(formatter, "Port {STUDIO_SERVER_PORT} is already in use by a service that was not recognized as Hermes Studio. Verify the port owner before inspecting or closing it.")
             }
             StartupProbeError::ExistingWebUiUnavailable => {
-                write!(formatter, "A listener on port {OFFICE_PORT} returned the compatible health shape but not the expected Hermes Studio Web UI shape. Verify the port owner before changing that service.")
+                write!(formatter, "A listener on port {STUDIO_SERVER_PORT} returned the compatible health shape but not the expected Hermes Studio Web UI shape. Verify the port owner before changing that service.")
             }
             StartupProbeError::ExistingWebUiTimeout => {
-                write!(formatter, "A listener on port {OFFICE_PORT} returned the compatible health shape, but its Web UI probe timed out. Verify the port owner before changing that service.")
+                write!(formatter, "A listener on port {STUDIO_SERVER_PORT} returned the compatible health shape, but its Web UI probe timed out. Verify the port owner before changing that service.")
             }
         }
     }
@@ -138,7 +138,7 @@ impl StartupNoticeKind {
                 "A listener on port 4317 has the expected Hermes Studio protocol and Web UI shape, but those public responses do not verify its identity. Nothing was opened automatically."
             }
             Self::ExistingServerIncompatible => {
-                "The listener on port 4317 returned an Office-shaped health response, but its protocol version is not compatible with this desktop launcher. This does not authenticate the listener."
+                "The listener on port 4317 returned a Studio Server health response, but its protocol version is not compatible with this desktop launcher. This does not authenticate the listener."
             }
             Self::ExistingServerMalformed => {
                 "The listener on port 4317 returned an invalid health response and has not been authenticated as Hermes Studio."
@@ -156,19 +156,19 @@ impl StartupNoticeKind {
                 "The listener on port 4317 returned the compatible health shape, but its Web UI probe did not respond in time. Its identity is not authenticated."
             }
             Self::OwnedManagedRuntimeUnavailable => {
-                "The desktop launcher could not find or validate the managed Node.js 22.x runtime and an installed Hermes Agent required to start its Office server. These are not bundled with the app."
+                "The desktop launcher could not find or validate the managed Node.js 22.x runtime and an installed Hermes Agent required to start its Studio Server. These are not bundled with the app."
             }
             Self::OwnedBundledResourceUnavailable => {
-                "The desktop launcher could not locate the bundled Office server resources required to start its own server."
+                "The desktop launcher could not locate the bundled Studio Server resources required to start its own server."
             }
             Self::OwnedRemoteConfigurationUnavailable => {
                 "The desktop launcher could not safely save or load its remote-access configuration from macOS Keychain."
             }
             Self::OwnedChildLaunchFailed => {
-                "The desktop launcher found its runtime and resources, but could not launch its Office server process."
+                "The desktop launcher found its runtime and resources, but could not launch its Studio Server process."
             }
             Self::OwnedServerReadinessFailed => {
-                "The desktop launcher started its Office server process, but the server exited early or did not become ready in time."
+                "The desktop launcher started its Studio Server process, but the server exited early or did not become ready in time."
             }
             Self::InternalStateUnavailable => {
                 "The desktop launcher could not safely update its internal ownership state."
@@ -179,7 +179,7 @@ impl StartupNoticeKind {
     pub(crate) fn recovery_steps(self) -> &'static [&'static str] {
         match self {
             Self::ExistingServerCandidate => &[
-                "First confirm that the process which owns loopback port 4317 is your Hermes Studio server.",
+                "First confirm that the process which owns loopback port 4317 is your Studio Server.",
                 "Only after confirming the owner, manually open http://127.0.0.1:4317/ in a normal browser.",
                 "If the owner is unknown, do not open the URL. Inspect or stop that process through its normal management procedure; Hermes Studio will not kill it automatically.",
                 "To let this app start its own server instead, free port 4317 by stopping the owner normally, then open Hermes Studio again.",
@@ -189,14 +189,14 @@ impl StartupNoticeKind {
                 "If that application is not needed, close it normally, then start Hermes Studio again. Do not force-kill an unknown process.",
             ],
             Self::ExistingServerIncompatible => &[
-                "First verify that the process owning loopback port 4317 is your Hermes Studio server.",
+                "First verify that the process owning loopback port 4317 is your Studio Server.",
                 "After verification, update it to a version compatible with this desktop launcher, or close it normally.",
                 "Start the desktop launcher again after the compatible server is ready or port 4317 is free.",
             ],
             Self::ExistingServerMalformed => &[
                 "First verify which process owns loopback port 4317.",
                 "Inspect the existing listener and its logs because its Hermes Studio health response is invalid.",
-                "Restart that service normally, or close it and start a compatible Hermes Studio server before retrying.",
+                "Restart that service normally, or close it and start a compatible Studio Server before retrying.",
             ],
             Self::ExistingServerTimeout => &[
                 "First verify which process owns loopback port 4317.",
@@ -204,7 +204,7 @@ impl StartupNoticeKind {
                 "Restart that service normally, then retry after it responds on port 4317.",
             ],
             Self::ExistingWebUiUnavailable => &[
-                "First verify that the process owning loopback port 4317 is your Hermes Studio server.",
+                "First verify that the process owning loopback port 4317 is your Studio Server.",
                 "For development, run the normal combined development surface so the server and Web UI start together.",
                 "For a packaged or local production setup, build the web assets and serve them from / on the same port 4317 listener.",
                 "Only after verifying the owner and making the Web UI available, manually open http://127.0.0.1:4317/ in a normal browser.",
@@ -236,7 +236,7 @@ impl StartupNoticeKind {
             ],
             Self::OwnedServerReadinessFailed => &[
                 "Close Hermes Studio normally, then start it again.",
-                "Open the diagnostic log and office-server stderr log listed below for the child process exit reason.",
+                "Open the diagnostic log and studio-server stderr log listed below for the child process exit reason.",
                 "Confirm Node 22.x and Hermes Agent work from a terminal, and that port 4317 is free before retrying.",
                 "Repair or reinstall the managed runtime or Hermes Studio application bundle if the server still does not become ready.",
             ],

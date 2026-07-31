@@ -2,7 +2,7 @@
 
 #[test]
 fn secret_transfer_id_shape_is_url_safe() {
-    // Transfer ids returned by the Office Server are base64url; the desktop
+    // Transfer ids returned by the Studio Server are base64url; the desktop
     // command rejects anything outside this alphabet/length.
     let valid = "abcdefghijklmnopqrstuv";
     assert!(valid.len() >= 22 && valid.len() <= 64);

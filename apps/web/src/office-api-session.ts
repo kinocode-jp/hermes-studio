@@ -52,12 +52,19 @@ export function setAuthRequiredObserver(observer: ((serverUrl: string) => void) 
   authRequiredObserver = observer;
 }
 
-export function officeServerUrl(): string {
-  const configured = import.meta.env.VITE_OFFICE_SERVER_URL?.trim();
+export function studioServerUrl(): string {
+  // Keep the former Office-named variables as read-only migration fallbacks.
+  const configured = (
+    import.meta.env.VITE_STUDIO_SERVER_URL
+    ?? import.meta.env.VITE_OFFICE_SERVER_URL
+  )?.trim();
   if (configured) return configured.replace(/\/$/, "");
   // Dev-only port override so the dev API (e.g. 4318) can run alongside the
   // desktop app's fixed 4317 server. Production/desktop builds leave it unset.
-  const configuredPort = (import.meta.env.VITE_OFFICE_API_PORT as string | undefined)?.trim();
+  const configuredPort = (
+    import.meta.env.VITE_STUDIO_SERVER_PORT
+    ?? import.meta.env.VITE_OFFICE_API_PORT
+  )?.trim();
   const apiPort = configuredPort && /^\d{2,5}$/.test(configuredPort) ? configuredPort : "4317";
   if (location.protocol === "tauri:" || location.hostname === "tauri.localhost") {
     return `http://127.0.0.1:${apiPort}`;
@@ -126,7 +133,7 @@ export async function recoverOfficeWebSocketAuthentication(serverUrl: string, re
   }
 }
 
-export async function officeFetchJson<T>(path: string, options: OfficeApiRequestOptions = {}, serverUrl = officeServerUrl()): Promise<T> {
+export async function officeFetchJson<T>(path: string, options: OfficeApiRequestOptions = {}, serverUrl = studioServerUrl()): Promise<T> {
   const baseUrl = new URL(serverUrl);
   const url = new URL(path, baseUrl);
   if (url.origin !== baseUrl.origin || !url.pathname.startsWith("/api/v1/")) {
@@ -145,7 +152,7 @@ export async function officeFetchJson<T>(path: string, options: OfficeApiRequest
  * Starts a one-shot device login. The credential is serialized directly into
  * the request body and is never placed in module state, signals, URLs, or logs.
  */
-export async function authenticateRemoteDevice(deviceNameInput: string, credential: string, serverUrl = officeServerUrl()): Promise<DeviceLoginResult> {
+export async function authenticateRemoteDevice(deviceNameInput: string, credential: string, serverUrl = studioServerUrl()): Promise<DeviceLoginResult> {
   const deviceName = normalizeDeviceName(deviceNameInput);
   if (!deviceName) return { ok: false, ...classifyDeviceLoginFailure(400, null) };
   try {
@@ -167,7 +174,7 @@ export async function authenticateRemoteDevice(deviceNameInput: string, credenti
   }
 }
 
-export async function fetchRemoteConfigStatus(serverUrl = officeServerUrl()): Promise<RemoteConfigStatus> {
+export async function fetchRemoteConfigStatus(serverUrl = studioServerUrl()): Promise<RemoteConfigStatus> {
   try {
     return await officeFetchJson<RemoteConfigStatus>("/api/v1/host/remote", {}, serverUrl);
   } catch (error) {
@@ -176,7 +183,7 @@ export async function fetchRemoteConfigStatus(serverUrl = officeServerUrl()): Pr
   }
 }
 
-export async function revokeRemoteDevice(deviceId: string, serverUrl = officeServerUrl()): Promise<void> {
+export async function revokeRemoteDevice(deviceId: string, serverUrl = studioServerUrl()): Promise<void> {
   try {
     await officeFetchJson<{ ok: true }>(`/api/v1/devices/${encodeURIComponent(deviceId)}/revoke`, { method: "POST" }, serverUrl);
   } catch (error) {
@@ -191,7 +198,7 @@ export async function revokeRemoteDevice(deviceId: string, serverUrl = officeSer
   }
 }
 
-export async function logoutRemoteDevice(serverUrl = officeServerUrl()): Promise<void> {
+export async function logoutRemoteDevice(serverUrl = studioServerUrl()): Promise<void> {
   notifyOfficeAuthChange(serverUrl);
   await officeFetchJson<{ ok: true }>("/api/v1/auth/logout", { method: "POST" }, serverUrl);
   officeSessions.delete(serverUrl);

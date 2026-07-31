@@ -3,13 +3,13 @@ import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { createOfficeServer } from "./server.js";
+import { createStudioServer } from "./server.js";
 
 const ORIGIN = "http://localhost:4173";
 
 test("production web assets are public, HEAD-aware, cache-safe, and use a functional strict CSP", async () => {
   const root = await webFixture();
-  const server = createOfficeServer({ port: 0, staticWebRoot: root });
+  const server = createStudioServer({ port: 0, staticWebRoot: root });
   const address = await server.listen();
   const base = `http://127.0.0.1:${address.port}`;
   try {
@@ -59,7 +59,7 @@ test("production web assets are public, HEAD-aware, cache-safe, and use a functi
 
 test("API paths retain API routing and never receive the SPA shell", async () => {
   const root = await webFixture();
-  const server = createOfficeServer({ port: 0, staticWebRoot: root, allowedOrigins: [ORIGIN] });
+  const server = createStudioServer({ port: 0, staticWebRoot: root, allowedOrigins: [ORIGIN] });
   const address = await server.listen();
   const base = `http://127.0.0.1:${address.port}`;
   try {

@@ -114,6 +114,7 @@ test("groupProfilesByTeams omits unassigned when every profile belongs to a team
 
 test("parseGroupDisplayMode defaults unknown values to profiles", () => {
   assert.equal(parseGroupDisplayMode("teams"), "teams");
+  assert.equal(parseGroupDisplayMode("projects"), "projects");
   assert.equal(parseGroupDisplayMode("profiles"), "profiles");
   assert.equal(parseGroupDisplayMode(null), "profiles");
   assert.equal(parseGroupDisplayMode("legacy"), "profiles");

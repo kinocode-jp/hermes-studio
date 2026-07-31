@@ -19,9 +19,9 @@ const LEGACY_OFFICE_KEYS = [
   "hermes-office:chat-model-prefs:v1",
 ] as const;
 const PROFILE_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
-/** Matches Studio server provider id sanitizer. */
+/** Matches Studio Server provider id sanitizer. */
 const PROVIDER_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_./:-]{0,127}$/;
-/** Matches Studio server model id sanitizer. */
+/** Matches Studio Server model id sanitizer. */
 const MODEL_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_./:+@-]{0,255}$/;
 const PRESET_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 const PRESET_NAME_MAX = 64;

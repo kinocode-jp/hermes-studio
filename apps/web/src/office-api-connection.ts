@@ -31,7 +31,7 @@ import {
   ensureOfficeSession,
   allocateOfficeConnectionGeneration,
   officeFetchJson,
-  officeServerUrl,
+  studioServerUrl,
   officeSessionRecoveryObservers,
   openOfficeWebSocket,
   recoverOfficeWebSocketAuthentication,
@@ -39,7 +39,7 @@ import {
   setAuthRequiredObserver,
 } from "./office-api-session";
 
-export function connectOfficeApi(callbacks: OfficeApiCallbacks, configuredServerUrl = officeServerUrl()): OfficeApiConnection {
+export function connectOfficeApi(callbacks: OfficeApiCallbacks, configuredServerUrl = studioServerUrl()): OfficeApiConnection {
 
   const serverUrl = configuredServerUrl.replace(/\/$/, "");
   setAuthRequiredObserver(callbacks.onAuthRequired);

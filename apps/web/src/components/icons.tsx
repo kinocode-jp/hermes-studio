@@ -100,6 +100,15 @@ export function GroupIcon(props: IconProps) {
   );
 }
 
+export function FolderIcon(props: IconProps) {
+  return (
+    <Icon {...props}>
+      <path d="M2 4.5h4l1.4 1.7H14v6.3a1 1 0 0 1-1 1H3a1 1 0 0 1-1-1z" />
+      <path d="M2 6.2h12" />
+    </Icon>
+  );
+}
+
 export function GraphIcon(props: IconProps) {
   return (
     <Icon {...props}>

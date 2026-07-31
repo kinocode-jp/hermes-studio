@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { WebSocket } from "ws";
-import { createOfficeServer } from "./server.js";
+import { createStudioServer } from "./server.js";
 
 const LOCAL_ORIGIN = "http://localhost:4173";
 const REMOTE_ORIGIN = "https://office.tailnet.example";
@@ -43,7 +43,7 @@ function responseCookies(response: Response): string {
 }
 
 test("remote origins cannot claim local bootstrap even through a loopback proxy", async () => {
-  const server = createOfficeServer({
+  const server = createStudioServer({
     port: 0,
     allowedOrigins: [LOCAL_ORIGIN, REMOTE_ORIGIN],
   });
@@ -79,7 +79,7 @@ test("remote origins cannot claim local bootstrap even through a loopback proxy"
 test("README remote configuration retains actual-loopback owner device revocation", async (t) => {
   const directory = await mkdtemp(join(tmpdir(), "hermes-studio-readme-remote-"));
   t.after(() => rm(directory, { recursive: true, force: true }));
-  const server = createOfficeServer({
+  const server = createStudioServer({
     port: 0,
     allowedOrigins: [REMOTE_ORIGIN],
     remoteToken: REMOTE_TOKEN,
@@ -125,7 +125,7 @@ test("README remote configuration retains actual-loopback owner device revocatio
 });
 
 test("one-time enrollment creates a revocable remote operator device without exposing credentials", async () => {
-  const server = createOfficeServer({
+  const server = createStudioServer({
     port: 0,
     allowedOrigins: [LOCAL_ORIGIN, REMOTE_ORIGIN],
     remoteToken: REMOTE_TOKEN,
@@ -257,7 +257,7 @@ test("one-time enrollment creates a revocable remote operator device without exp
 });
 
 test("enrollment appends session cookie before durable device cookie so last-header retention can renew", async () => {
-  const server = createOfficeServer({
+  const server = createStudioServer({
     port: 0,
     allowedOrigins: [REMOTE_ORIGIN],
     remoteToken: REMOTE_TOKEN,
@@ -306,7 +306,7 @@ test("device renewal is session-aware, IP/device limited, and a limited burst do
   const directory = await mkdtemp(join(tmpdir(), "hermes-studio-renew-limit-"));
   t.after(() => rm(directory, { recursive: true, force: true }));
   const deviceRegistryPath = join(directory, "devices.json");
-  const server = createOfficeServer({
+  const server = createStudioServer({
     port: 0,
     allowedOrigins: [REMOTE_ORIGIN],
     remoteToken: REMOTE_TOKEN,
@@ -359,7 +359,7 @@ test("a debounced last-seen update is durable across an orderly restart", async 
     trustedProxyHops: 1,
     deviceRegistryPath,
   } as const;
-  const enrolled = createOfficeServer(options);
+  const enrolled = createStudioServer(options);
   const enrolledAddress = await enrolled.listen();
   const login = await deviceLogin(`http://127.0.0.1:${enrolledAddress.port}`, REMOTE_TOKEN);
   assert.equal(login.status, 200);
@@ -370,7 +370,7 @@ test("a debounced last-seen update is durable across an orderly restart", async 
   const staleRegistry = JSON.parse(await readFile(deviceRegistryPath, "utf8")) as { devices: Array<Record<string, unknown>> };
   staleRegistry.devices[0]!.lastSeenAt = oldLastSeen;
   await writeFile(deviceRegistryPath, JSON.stringify(staleRegistry), { mode: 0o600 });
-  const renewed = createOfficeServer(options);
+  const renewed = createStudioServer(options);
   const renewedAddress = await renewed.listen();
   const renewedBase = `http://127.0.0.1:${renewedAddress.port}`;
   const renewal = await renewDevice(renewedBase, deviceCookie);
@@ -380,7 +380,7 @@ test("a debounced last-seen update is durable across an orderly restart", async 
 
   const persisted = JSON.parse(await readFile(deviceRegistryPath, "utf8")) as { devices: Array<{ lastSeenAt?: string }> };
   assert.notEqual(persisted.devices[0]!.lastSeenAt, oldLastSeen);
-  const restarted = createOfficeServer(options);
+  const restarted = createStudioServer(options);
   const restartedAddress = await restarted.listen();
   const restartedBase = `http://127.0.0.1:${restartedAddress.port}`;
   try {
@@ -394,7 +394,7 @@ test("a debounced last-seen update is durable across an orderly restart", async 
     })).status, 200);
   } finally { await restarted.close(); }
 
-  const revokedRestart = createOfficeServer(options);
+  const revokedRestart = createStudioServer(options);
   const revokedRestartAddress = await revokedRestart.listen();
   try {
     assert.equal((await renewDevice(`http://127.0.0.1:${revokedRestartAddress.port}`, deviceCookie)).status, 401);
@@ -430,7 +430,7 @@ async function expectNoTopic(websocket: WebSocket, topic: string, durationMs: nu
 }
 
 test("device authentication is disabled by default, bounded, strict, and rate limited", async () => {
-  const disabledServer = createOfficeServer({ port: 0, allowedOrigins: [REMOTE_ORIGIN] });
+  const disabledServer = createStudioServer({ port: 0, allowedOrigins: [REMOTE_ORIGIN] });
   const disabledAddress = await disabledServer.listen();
   const disabledBase = `http://127.0.0.1:${disabledAddress.port}`;
   try {
@@ -439,7 +439,7 @@ test("device authentication is disabled by default, bounded, strict, and rate li
     await disabledServer.close();
   }
 
-  const server = createOfficeServer({
+  const server = createStudioServer({
     port: 0,
     allowedOrigins: [REMOTE_ORIGIN],
     remoteToken: REMOTE_TOKEN,
@@ -487,14 +487,14 @@ test("device registry survives restart and token rotation replaces its generatio
     trustedProxyHops: 1,
     deviceRegistryPath,
   } as const;
-  const first = createOfficeServer(options);
+  const first = createStudioServer(options);
   const firstAddress = await first.listen();
   const firstLogin = await deviceLogin(`http://127.0.0.1:${firstAddress.port}`, REMOTE_TOKEN);
   assert.equal(firstLogin.status, 200);
   const firstCookies = responseCookies(firstLogin);
   await first.close();
 
-  const second = createOfficeServer(options);
+  const second = createStudioServer(options);
   const secondAddress = await second.listen();
   const secondBase = `http://127.0.0.1:${secondAddress.port}`;
   assert.equal((await deviceLogin(secondBase, REMOTE_TOKEN, "Second phone")).status, 409);
@@ -502,7 +502,7 @@ test("device registry survives restart and token rotation replaces its generatio
   await second.close();
 
   const rotatedToken = "replacement-enrollment-token-with-32-characters";
-  const rotated = createOfficeServer({ ...options, remoteToken: rotatedToken });
+  const rotated = createStudioServer({ ...options, remoteToken: rotatedToken });
   const rotatedAddress = await rotated.listen();
   const rotatedBase = `http://127.0.0.1:${rotatedAddress.port}`;
   let rotatedCookies = "";
@@ -513,7 +513,7 @@ test("device registry survives restart and token rotation replaces its generatio
     rotatedCookies = responseCookies(replacementLogin);
   } finally { await rotated.close(); }
 
-  const rotatedRestart = createOfficeServer({ ...options, remoteToken: rotatedToken });
+  const rotatedRestart = createStudioServer({ ...options, remoteToken: rotatedToken });
   const rotatedRestartAddress = await rotatedRestart.listen();
   const rotatedRestartBase = `http://127.0.0.1:${rotatedRestartAddress.port}`;
   try {
@@ -533,7 +533,7 @@ test("device registry rejects every invalid enrollment-consumed representation a
     trustedProxyHops: 1,
     deviceRegistryPath,
   } as const;
-  const enrolled = createOfficeServer(options);
+  const enrolled = createStudioServer(options);
   const enrolledAddress = await enrolled.listen();
   const enrollment = await deviceLogin(`http://127.0.0.1:${enrolledAddress.port}`, REMOTE_TOKEN);
   assert.equal(enrollment.status, 200);
@@ -553,7 +553,7 @@ test("device registry rejects every invalid enrollment-consumed representation a
 
   for (const invalid of invalidRegistries) {
     await writeFile(deviceRegistryPath, JSON.stringify(invalid), { mode: 0o600 });
-    const server = createOfficeServer(options);
+    const server = createStudioServer(options);
     const address = await server.listen();
     const base = `http://127.0.0.1:${address.port}`;
     try {
@@ -568,7 +568,7 @@ test("malformed device registry fails closed without reopening enrollment", asyn
   t.after(() => rm(directory, { recursive: true, force: true }));
   const deviceRegistryPath = join(directory, "devices.json");
   await writeFile(deviceRegistryPath, "{not-json", { mode: 0o600 });
-  const server = createOfficeServer({
+  const server = createStudioServer({
     port: 0,
     allowedOrigins: [REMOTE_ORIGIN],
     remoteToken: REMOTE_TOKEN,
@@ -585,7 +585,7 @@ test("host remote status is desktop-capability-only, secret-free, and blocks loc
   const directory = await mkdtemp(join(tmpdir(), "hermes-studio-host-remote-"));
   const deviceRegistryPath = join(directory, "devices.json");
   const desktopCapability = "d".repeat(64);
-  const server = createOfficeServer({
+  const server = createStudioServer({
     port: 0,
     allowedOrigins: [LOCAL_ORIGIN, REMOTE_ORIGIN],
     remoteToken: REMOTE_TOKEN,
@@ -642,7 +642,7 @@ test("host remote status is desktop-capability-only, secret-free, and blocks loc
 test("invalid remote origins are rejected at server construction", () => {
   let error: Error | undefined;
   try {
-    createOfficeServer({
+    createStudioServer({
       port: 0,
       allowedOrigins: [REMOTE_ORIGIN, "http://not-allowed.example", "https://allowed.tailnet.ts.net/path", "https://user:pass@allowed.tailnet.ts.net"],
       remoteToken: REMOTE_TOKEN,

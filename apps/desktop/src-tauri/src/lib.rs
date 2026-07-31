@@ -26,11 +26,11 @@ use capability::{
     clear_optional_state, desktop_capability, desktop_owned,
     remove_persisted_desktop_capability_if_matches, start_attached_server_monitor,
     start_owned_server_monitor, AttachedServerCapability, DesktopCapability, DesktopProofGate,
-    OfficeServerProcess,
+    StudioServerProcess,
 };
 use secret_transfer::deposit_secret_transfer;
-use server::{setup_office, stop_office_server};
-use startup::{OfficeLaunch, StartupFailure, StartupNoticeKind};
+use server::{setup_studio_server, stop_studio_server};
+use startup::{StudioServerLaunch, StartupFailure, StartupNoticeKind};
 use window::{
     build_startup_window, replace_startup_window, show_startup_notice, StartupView,
     STARTUP_WINDOW_LABEL,
@@ -39,7 +39,7 @@ use window::{
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let app = tauri::Builder::default()
-        .manage(OfficeServerProcess(Mutex::new(None)))
+        .manage(StudioServerProcess(Mutex::new(None)))
         .manage(DesktopCapability(Mutex::new(None)))
         .manage(AttachedServerCapability(Mutex::new(None)))
         .manage(DesktopProofGate(Mutex::new(())))
@@ -71,7 +71,7 @@ pub fn run() {
                 return Ok(());
             }
             let app_handle = app.handle().clone();
-            thread::spawn(move || finish_office_setup(app_handle));
+            thread::spawn(move || finish_studio_server_setup(app_handle));
             Ok(())
         })
         .build(tauri::generate_context!());
@@ -118,13 +118,13 @@ pub fn run() {
             _ => {}
         }
         if matches!(event, RunEvent::ExitRequested { .. } | RunEvent::Exit) {
-            stop_owned_office(handle);
+            stop_owned_studio_server(handle);
         }
     });
 }
 
-fn finish_office_setup(app: tauri::AppHandle) {
-    let (view, launch) = match setup_office(&app) {
+fn finish_studio_server_setup(app: tauri::AppHandle) {
+    let (view, launch) = match setup_studio_server(&app) {
         Ok(launch) => (startup_view_for_launch(launch), Some(launch)),
         Err(failure) => (StartupView::Notice(failure), None),
     };
@@ -135,17 +135,17 @@ fn finish_office_setup(app: tauri::AppHandle) {
             Ok(()) => {
                 diagnostics::log_event("Main application window is ready.");
                 match launch {
-                    Some(OfficeLaunch::OwnedReady) => {
+                    Some(StudioServerLaunch::OwnedReady) => {
                         start_owned_server_monitor(transition_app.clone());
                     }
-                    Some(OfficeLaunch::ExistingOpen) => {
+                    Some(StudioServerLaunch::ExistingOpen) => {
                         start_attached_server_monitor(transition_app.clone());
                     }
                     None => {}
                 }
             }
             Err(error) => {
-                stop_owned_office(&transition_app);
+                stop_owned_studio_server(&transition_app);
                 diagnostics::log_event(&format!(
                     "Main application window creation failed: {error}"
                 ));
@@ -161,7 +161,7 @@ fn finish_office_setup(app: tauri::AppHandle) {
         }
     });
     if let Err(error) = scheduled {
-        stop_owned_office(&app);
+        stop_owned_studio_server(&app);
         eprintln!(
             "Hermes Studio could not schedule its startup window transition: {error}"
         );
@@ -169,10 +169,10 @@ fn finish_office_setup(app: tauri::AppHandle) {
     }
 }
 
-pub(crate) fn startup_view_for_launch(launch: OfficeLaunch) -> StartupView {
+pub(crate) fn startup_view_for_launch(launch: StudioServerLaunch) -> StartupView {
     match launch {
-        OfficeLaunch::OwnedReady => StartupView::BundledApp,
-        OfficeLaunch::ExistingOpen => StartupView::ExistingOffice,
+        StudioServerLaunch::OwnedReady => StartupView::BundledApp,
+        StudioServerLaunch::ExistingOpen => StartupView::ExistingStudioServer,
     }
 }
 
@@ -180,7 +180,7 @@ pub(crate) fn is_managed_desktop_window(label: &str) -> bool {
     label == "main" || label == STARTUP_WINDOW_LABEL
 }
 
-fn stop_owned_office(app: &tauri::AppHandle) {
+fn stop_owned_studio_server(app: &tauri::AppHandle) {
     clear_optional_state(&app.state::<AttachedServerCapability>().0);
     let capability_state = app.state::<DesktopCapability>();
     let mut capability = capability_state
@@ -189,7 +189,7 @@ fn stop_owned_office(app: &tauri::AppHandle) {
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let owned_capability = capability.take();
     drop(capability);
-    let process_state = app.state::<OfficeServerProcess>();
+    let process_state = app.state::<StudioServerProcess>();
     let mut process = process_state
         .0
         .lock()
@@ -204,6 +204,6 @@ fn stop_owned_office(app: &tauri::AppHandle) {
         if let Some(owned_capability) = owned_capability {
             remove_persisted_desktop_capability_if_matches(app, &owned_capability);
         }
-        stop_office_server(&mut child);
+        stop_studio_server(&mut child);
     }
 }

@@ -5,7 +5,7 @@
 - Always develop against the Vite hot-reload surface, not a production static build.
 - Preferred entrypoint: `npm run dev`
 - Open the UI at `http://127.0.0.1:4173/` (or `http://localhost:4173/`).
-- The dev API server runs on `http://127.0.0.1:4318/` (`npm run dev` sets `HERMES_STUDIO_PORT=4318` and `VITE_OFFICE_API_PORT=4318`).
+- The dev API server runs on `http://127.0.0.1:4318/` (`npm run dev` sets `HERMES_STUDIO_PORT=4318` and `VITE_STUDIO_SERVER_PORT=4318`).
 - Treat `http://127.0.0.1:4317/` as the desktop app / production surface only (Hermes Studio.app health-checks and serves this port). Because dev uses 4318, the desktop app and the dev stack can run at the same time.
 - After source UI changes, do not rebuild web assets (`npm run build:web`, desktop web bundle copy, packaged app resources) just to preview them.
 - Rebuild / package only when the user explicitly asks for production, desktop packaging, or a release-like verification.

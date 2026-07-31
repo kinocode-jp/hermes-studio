@@ -8,7 +8,7 @@ for development, but a local `.app` or DMG is not an official project release.
 A Tauri production package includes:
 
 - packaged Web UI (`frontendDist`);
-- bundled Office Server module (`resources/server/hermes-studio-server.mjs`);
+- bundled Studio Server module (`resources/server/hermes-studio-server.mjs`);
 - optional static web copy (`resources/web`) produced by
   `npm run build:desktop-assets` for operators who open `http://127.0.0.1:4317/`
   in a normal browser while the desktop-owned server is running.

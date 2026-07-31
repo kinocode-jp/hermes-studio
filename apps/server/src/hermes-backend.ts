@@ -10,7 +10,7 @@ import type {
   RuntimeStatus,
 } from "@hermes-studio/protocol";
 import { brandStatePath } from "./brand-env.js";
-import { OFFICE_PROTOCOL_VERSION } from "./demo-state.js";
+import { STUDIO_SERVER_PROTOCOL_VERSION } from "./demo-state.js";
 import { createHermesChatTransport, type HermesChatTransport } from "./hermes-chat.js";
 import { createHermesChildEnvironment, discardHermesChildOutput } from "./hermes-child-environment.js";
 import { collectHermesInventory, HermesInventoryCache, type CollectedHermesInventory, type HermesJsonResult } from "./hermes-inventory.js";
@@ -779,7 +779,7 @@ function makeSnapshot(runtime: RuntimeStatus, sequence: number, profiles: Office
   return {
     generatedAt: new Date().toISOString(), sequence,
     capabilities: {
-      protocolVersion: OFFICE_PROTOCOL_VERSION, serverVersion: "0.2.0", runtime,
+      protocolVersion: STUDIO_SERVER_PROTOCOL_VERSION, serverVersion: "0.2.0", runtime,
       access: { deviceId: "local-desktop", tier: "owner", exposure: "loopback", authentication: "desktop-capability", allowedOperations: ["state.read"] },
       features: ["chat", "profiles", "skills", "memory", "kanban", "teams", "global-inheritance"],
     },

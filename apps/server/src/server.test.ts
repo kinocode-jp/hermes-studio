@@ -8,16 +8,16 @@ import { HermesCommitUnconfirmedError, HermesProfileError, type HermesRuntimeSou
 import type { HermesChatRequest } from "./hermes-chat.js";
 import { createDemoRuntimeStatus, createDemoSnapshot } from "./demo-state.js";
 import type { OfficeAuth, OfficeAuthSession } from "./office-auth.js";
-import { allowedCorsOrigin, createDesktopReadinessProof, createOfficeServer, isLoopbackHost, makeOriginAllowlist } from "./server.js";
+import { allowedCorsOrigin, createDesktopReadinessProof, createStudioServer, isLoopbackHost, makeOriginAllowlist } from "./server.js";
 
 test("direct non-loopback listeners are always refused", () => {
-  assert.throws(() => createOfficeServer({ host: "0.0.0.0" }), /direct non-loopback bind/);
+  assert.throws(() => createStudioServer({ host: "0.0.0.0" }), /direct non-loopback bind/);
   assert.throws(
-    () => createOfficeServer({ host: "0.0.0.0", allowNonLoopback: true }),
+    () => createStudioServer({ host: "0.0.0.0", allowNonLoopback: true }),
     /trusted HTTPS reverse proxy/,
   );
   assert.throws(() =>
-    createOfficeServer({
+    createStudioServer({
       host: "0.0.0.0",
       allowNonLoopback: true,
       remoteToken: "r".repeat(32),
@@ -77,7 +77,7 @@ test("allowedCorsOrigin rejects disallowed and malformed origins", () => {
 });
 
 test("CORS response header echoes the canonical allowlist entry, not the raw request origin", async () => {
-  const server = createOfficeServer({ port: 0, allowedOrigins: ["https://office.example"] });
+  const server = createStudioServer({ port: 0, allowedOrigins: ["https://office.example"] });
   const address = await server.listen();
   const base = `http://127.0.0.1:${address.port}`;
 
@@ -95,7 +95,7 @@ test("CORS response header echoes the canonical allowlist entry, not the raw req
 });
 
 test("CORS header is omitted when no Origin is sent", async () => {
-  const server = createOfficeServer({ port: 0 });
+  const server = createStudioServer({ port: 0 });
   const address = await server.listen();
   const base = `http://127.0.0.1:${address.port}`;
 
@@ -109,9 +109,9 @@ test("CORS header is omitted when no Origin is sent", async () => {
   }
 });
 
-test("createOfficeServer origin allowlist always includes remote and Tauri origins", async () => {
+test("createStudioServer origin allowlist always includes remote and Tauri origins", async () => {
   const remoteOrigin = "https://office.tailnet.example";
-  const server = createOfficeServer({ port: 0, allowedOrigins: [remoteOrigin] });
+  const server = createStudioServer({ port: 0, allowedOrigins: [remoteOrigin] });
   await server.listen();
   try {
     assert.equal(server.originAllowlist.has(remoteOrigin), true);
@@ -123,7 +123,7 @@ test("createOfficeServer origin allowlist always includes remote and Tauri origi
 
 test("usage stats rejects suffixed and fractional day values", async () => {
   const desktopCapability = "u".repeat(64);
-  const server = createOfficeServer({ port: 0, desktopCapability });
+  const server = createStudioServer({ port: 0, desktopCapability });
   const address = await server.listen();
   const base = `http://127.0.0.1:${address.port}`;
   const headers = {
@@ -142,7 +142,7 @@ test("usage stats rejects suffixed and fractional day values", async () => {
 });
 
 test("snapshot is bounded, explicit, and does not expose secret-shaped fields", async () => {
-  const server = createOfficeServer({ port: 0 });
+  const server = createStudioServer({ port: 0 });
   const address = await server.listen();
 
   try {
@@ -187,7 +187,7 @@ test("snapshot is bounded, explicit, and does not expose secret-shaped fields", 
 
 test("launch-scoped desktop capability authenticates Tauri HTTP and WebSocket requests", async () => {
   const desktopCapability = "d".repeat(64);
-  const server = createOfficeServer({ port: 0, desktopCapability });
+  const server = createStudioServer({ port: 0, desktopCapability });
   const address = await server.listen();
   const base = `http://127.0.0.1:${address.port}`;
   const origin = "tauri://localhost";
@@ -246,7 +246,7 @@ test("profiles mutations accept only the create body and reject body-bearing del
     createProfile: async (name: string) => { created.push(name); },
     deleteProfile: async (name: string) => { deleted.push(name); },
   } as unknown as HermesRuntimeSource;
-  const server = createOfficeServer({ port: 0, desktopCapability, runtimeSource: runtime });
+  const server = createStudioServer({ port: 0, desktopCapability, runtimeSource: runtime });
   const address = await server.listen();
   const base = `http://127.0.0.1:${address.port}`;
   const headers = {
@@ -297,7 +297,7 @@ test("profile creation reports an unconfirmed upstream commit without inviting a
     kanban: () => { throw new Error("unused"); },
     createProfile: async () => { throw new HermesCommitUnconfirmedError("private detail"); },
   } as unknown as HermesRuntimeSource;
-  const server = createOfficeServer({ port: 0, desktopCapability, runtimeSource: runtime });
+  const server = createStudioServer({ port: 0, desktopCapability, runtimeSource: runtime });
   const address = await server.listen();
   try {
     const response = await fetch(`http://127.0.0.1:${address.port}/api/v1/profiles`, {
@@ -333,7 +333,7 @@ test("profile mutations expose only typed, stable public errors", async () => {
     createProfile: async () => { throw new Error("invalid private path /Users/example/.hermes"); },
     deleteProfile: async () => { throw new HermesProfileError("not_found"); },
   } as unknown as HermesRuntimeSource;
-  const server = createOfficeServer({ port: 0, desktopCapability, runtimeSource: runtime });
+  const server = createStudioServer({ port: 0, desktopCapability, runtimeSource: runtime });
   const address = await server.listen();
   const headers = {
     Origin: "tauri://localhost",
@@ -365,7 +365,7 @@ test("profile mutations expose only typed, stable public errors", async () => {
 
 test("session resource rejects and drains bodies before method dispatch", async () => {
   const desktopCapability = "s".repeat(64);
-  const server = createOfficeServer({ port: 0, desktopCapability });
+  const server = createStudioServer({ port: 0, desktopCapability });
   const address = await server.listen();
   const base = `http://127.0.0.1:${address.port}`;
   const headers = {
@@ -407,7 +407,7 @@ test("session delete never reflects arbitrary runtime diagnostics", async () => 
     kanban: () => { throw new Error("unused"); },
     deleteSession: async () => { throw new Error("invalid path /Users/private/session-token"); },
   } as unknown as HermesRuntimeSource;
-  const server = createOfficeServer({ port: 0, desktopCapability, runtimeSource: runtime });
+  const server = createStudioServer({ port: 0, desktopCapability, runtimeSource: runtime });
   const address = await server.listen();
   try {
     const response = await fetch(`http://127.0.0.1:${address.port}/api/v1/sessions/stored`, {
@@ -431,7 +431,7 @@ test("desktop readiness proof is loopback-only, strict, secret-free, and unavail
   const desktopCapability = "readiness-secret-".repeat(4);
   const nonce = "ab".repeat(32);
   const query = `nonce=${nonce}&domain=hermes-office-desktop-readiness&version=1`;
-  const server = createOfficeServer({ port: 0, desktopCapability });
+  const server = createStudioServer({ port: 0, desktopCapability });
   const address = await server.listen();
   const base = `http://127.0.0.1:${address.port}`;
 
@@ -471,7 +471,7 @@ test("desktop readiness proof is loopback-only, strict, secret-free, and unavail
     await server.close();
   }
 
-  const publicServer = createOfficeServer({ port: 0 });
+  const publicServer = createStudioServer({ port: 0 });
   const publicAddress = await publicServer.listen();
   try {
     assert.equal((await fetch(`http://127.0.0.1:${publicAddress.port}/api/v1/health/desktop-proof?${query}`)).status, 404);
@@ -511,7 +511,7 @@ test("desktop capability chat socket accepts its first client frame after a dela
       }),
     }),
   } as unknown as HermesRuntimeSource;
-  const server = createOfficeServer({ port: 0, desktopCapability, runtimeSource: runtime });
+  const server = createStudioServer({ port: 0, desktopCapability, runtimeSource: runtime });
   const address = await server.listen();
   const websocket = new WebSocket(
     `ws://127.0.0.1:${address.port}/api/v1/chat`,
@@ -549,10 +549,10 @@ test("chat socket guard keeps its upgrade lease as an absolute expiry", () => {
 test("desktop development origin is explicit and cannot be widened to a remote site", async () => {
   const desktopCapability = "e".repeat(64);
   assert.throws(
-    () => createOfficeServer({ desktopCapability, desktopOrigins: ["https://office.example"] }),
+    () => createStudioServer({ desktopCapability, desktopOrigins: ["https://office.example"] }),
     /trusted local origins/,
   );
-  const server = createOfficeServer({
+  const server = createStudioServer({
     port: 0,
     desktopCapability,
     allowedOrigins: ["http://localhost:4173"],
@@ -584,7 +584,7 @@ test("desktop development origin is explicit and cannot be widened to a remote s
 
 test("remote origins augment the actual listener origin without trusting unrelated local sites", async () => {
   const remoteOrigin = "https://office.tailnet.example";
-  const server = createOfficeServer({ port: 0, allowedOrigins: [remoteOrigin] });
+  const server = createStudioServer({ port: 0, allowedOrigins: [remoteOrigin] });
   const address = await server.listen();
   const base = `http://127.0.0.1:${address.port}`;
   try {

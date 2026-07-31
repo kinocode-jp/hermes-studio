@@ -4,7 +4,7 @@ import type {
   RuntimeStatus,
 } from "@hermes-studio/protocol";
 
-export const OFFICE_PROTOCOL_VERSION: ProtocolVersion = 1;
+export const STUDIO_SERVER_PROTOCOL_VERSION: ProtocolVersion = 1;
 
 const runtime: RuntimeStatus = {
   mode: "existing-local",
@@ -24,7 +24,7 @@ export function createDemoSnapshot(now = new Date()): OfficeSnapshot {
     generatedAt: timestamp,
     sequence: 0,
     capabilities: {
-      protocolVersion: OFFICE_PROTOCOL_VERSION,
+      protocolVersion: STUDIO_SERVER_PROTOCOL_VERSION,
       serverVersion: "0.1.0",
       runtime: { ...runtime },
       access: {

@@ -2,7 +2,7 @@
 
 This guide describes the supported way to reach Hermes Studio from another device
 you control (including a phone) over a private Tailscale tailnet. It does not
-change the Office security model: one trusted operator, loopback Office listener,
+change the Office security model: one trusted operator, loopback Studio Server listener,
 exact HTTPS origin allowlist, one-time enrollment token, and no public exposure.
 
 ## What you get
@@ -11,9 +11,9 @@ exact HTTPS origin allowlist, one-time enrollment token, and no public exposure.
   (`https://<host>.<tailnet>.ts.net`).
 - Tailscale Serve as a **private** HTTPS reverse proxy to
   `http://127.0.0.1:4317`.
-- The existing production Office launcher (`npm start` / `scripts/start-studio.mjs`)
+- The existing production Studio launcher (`npm start` / `scripts/start-studio.mjs`)
   with remote enrollment enabled.
-- Same-origin browser/PWA access on every client. There is no second Office URL
+- Same-origin browser/PWA access on every client. There is no second Studio Server URL
   and no browser-side endpoint switching.
 
 ## What you do not get
@@ -69,7 +69,7 @@ npm run start:tailnet
 ```
 
 To use the installed macOS desktop app as the owner of that same remote-enabled
-Office Server, quit Hermes Studio completely first and run:
+Studio Server, quit Hermes Studio completely first and run:
 
 ```bash
 export HERMES_STUDIO_REMOTE_TOKEN='replace-with-a-random-32+-character-token'
@@ -120,7 +120,7 @@ The launcher:
    ```
 
    Then re-reads Serve status and requires the exact expected mapping.
-9. Starts the production Office launcher, or directly starts the packaged
+9. Starts the production Studio launcher, or directly starts the packaged
    desktop executable in desktop mode, forwards `SIGINT`/`SIGTERM`, and prints
    the canonical URL plus mobile steps. Direct desktop launch is required so
    the validated environment reaches the desktop-owned Office child.
@@ -214,11 +214,11 @@ Important properties:
 - **Same-origin:** cookies, CSRF, WebSockets, and the PWA all use the one HTTPS
   origin Serve publishes. Do not open a different host/port from the phone.
 - **Loopback only for Office:** remote clients never speak plain HTTP to the
-  Office port across the LAN or tailnet IP; they speak HTTPS to Serve.
+  Studio Server port across the LAN or tailnet IP; they speak HTTPS to Serve.
 - **Transport is Tailscale's job:** path selection (direct vs relay) is outside
   Office. If the phone and host can form a direct path, Tailscale uses it; if
   not, DERP relays carry the encrypted traffic. Operators do not configure a
-  second Office URL for “relay mode.”
+  second Studio Server URL for “relay mode.”
 
 ## Manual equivalent (without the launcher)
 

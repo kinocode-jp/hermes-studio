@@ -11,10 +11,10 @@ use tauri::Manager;
 
 use crate::capability::{
     persist_desktop_capability, read_persisted_desktop_capability, AttachedServerCapability,
-    DesktopCapability, OfficeServerProcess,
+    DesktopCapability, StudioServerProcess,
 };
 use crate::constants::{
-    HEALTH_RESPONSE_TIMEOUT, OFFICE_HOST, OFFICE_PORT, START_TIMEOUT, STOP_TIMEOUT,
+    HEALTH_RESPONSE_TIMEOUT, STUDIO_SERVER_HOST, STUDIO_SERVER_PORT, START_TIMEOUT, STOP_TIMEOUT,
 };
 use crate::diagnostics::{
     child_stdio_paths, diagnostic_log_path, ensure_diagnostic_log, log_event,
@@ -26,49 +26,51 @@ use crate::proof::{
 };
 use crate::remote_config::prepare_desktop_remote_environment;
 use crate::runtime::{
-    inherit_office_remote_environment, inherit_safe_environment, resolve_managed_runtime,
+    inherit_studio_server_remote_environment, inherit_safe_environment, resolve_managed_runtime,
 };
 use crate::startup::{
-    OfficeLaunch, OfficeStartup, OwnedServerLaunchError, StartupFailure, StartupNoticeKind,
-    StartupProbeError,
+    OwnedServerLaunchError, StartupFailure, StartupNoticeKind, StartupProbeError,
+    StudioServerLaunch, StudioServerStartup,
 };
 use crate::web_ui::{probe_existing_web_ui, WebUiProbeOutcome};
 
 #[cfg(debug_assertions)]
 use crate::runtime::{resolve_repo_root, resolve_tsx_cli};
 
-pub(crate) fn setup_office(app: &tauri::AppHandle) -> Result<OfficeLaunch, StartupFailure> {
+pub(crate) fn setup_studio_server(
+    app: &tauri::AppHandle,
+) -> Result<StudioServerLaunch, StartupFailure> {
     let _ = ensure_diagnostic_log();
-    log_event("Desktop launcher starting Office setup.");
-    let address = SocketAddr::from((Ipv4Addr::LOCALHOST, OFFICE_PORT));
-    match classify_office_startup(address).map_err(|error| {
-        log_event(&format!("Port {OFFICE_PORT} classification failed: {error}"));
+    log_event("Desktop launcher starting Studio Server setup.");
+    let address = SocketAddr::from((Ipv4Addr::LOCALHOST, STUDIO_SERVER_PORT));
+    match classify_studio_server_startup(address).map_err(|error| {
+        log_event(&format!("Port {STUDIO_SERVER_PORT} classification failed: {error}"));
         StartupFailure::from(error).with_optional_log()
     })? {
-        OfficeStartup::PortFree => {
-            log_event(&format!("Port {OFFICE_PORT} is free; starting owned Office Server."));
+        StudioServerStartup::PortFree => {
+            log_event(&format!("Port {STUDIO_SERVER_PORT} is free; starting owned Studio Server."));
             let desktop_capability = generate_desktop_capability();
             #[cfg(debug_assertions)]
-            let mut child = start_office_dev_server(app, &desktop_capability)
+            let mut child = start_studio_dev_server(app, &desktop_capability)
                 .map_err(|error| StartupFailure::from(error).with_optional_log())?;
             #[cfg(not(debug_assertions))]
-            let mut child = start_office_server(app, &desktop_capability)
+            let mut child = start_studio_server(app, &desktop_capability)
                 .map_err(|error| StartupFailure::from(error).with_optional_log())?;
-            if let Err(error) = wait_for_office_server(&mut child, START_TIMEOUT, &desktop_capability)
+            if let Err(error) = wait_for_studio_server(&mut child, START_TIMEOUT, &desktop_capability)
             {
                 let detail = format!("{error}");
-                log_event(&format!("Owned Office Server readiness failed: {detail}"));
-                stop_office_server(&mut child);
+                log_event(&format!("Owned Studio Server readiness failed: {detail}"));
+                stop_studio_server(&mut child);
                 return Err(StartupFailure::from_kind(StartupNoticeKind::OwnedServerReadinessFailed)
                     .with_detail(detail)
                     .with_optional_log());
             }
-            let process_state = app.state::<OfficeServerProcess>();
+            let process_state = app.state::<StudioServerProcess>();
             let capability_state = app.state::<DesktopCapability>();
             let mut capability = match capability_state.0.lock() {
                 Ok(capability) => capability,
                 Err(_) => {
-                    stop_office_server(&mut child);
+                    stop_studio_server(&mut child);
                     return Err(StartupFailure::from_kind(StartupNoticeKind::InternalStateUnavailable)
                         .with_optional_log());
                 }
@@ -76,23 +78,23 @@ pub(crate) fn setup_office(app: &tauri::AppHandle) -> Result<OfficeLaunch, Start
             let mut process = match process_state.0.lock() {
                 Ok(process) => process,
                 Err(_) => {
-                    stop_office_server(&mut child);
+                    stop_studio_server(&mut child);
                     return Err(StartupFailure::from_kind(StartupNoticeKind::InternalStateUnavailable)
                         .with_optional_log());
                 }
             };
             if let Err(detail) = persist_desktop_capability(app, &desktop_capability) {
-                stop_office_server(&mut child);
+                stop_studio_server(&mut child);
                 return Err(StartupFailure::from_kind(StartupNoticeKind::InternalStateUnavailable)
                     .with_detail(detail)
                     .with_optional_log());
             }
             *process = Some(child);
             *capability = Some(desktop_capability);
-            log_event("Owned Office Server is ready; Web UI may open.");
-            Ok(OfficeLaunch::OwnedReady)
+            log_event("Owned Studio Server is ready; Web UI may open.");
+            Ok(StudioServerLaunch::OwnedReady)
         }
-        OfficeStartup::CompatibleCandidate => {
+        StudioServerStartup::CompatibleCandidate => {
             // Public response shape is not identity. A second desktop instance
             // may attach only when the existing listener proves knowledge of the
             // first instance's user-private capability.
@@ -116,9 +118,9 @@ pub(crate) fn setup_office(app: &tauri::AppHandle) -> Result<OfficeLaunch, Start
             })?;
             *attached = Some(capability);
             log_event(
-                "Existing Office listener passed the private desktop ownership proof; opening its loopback Web UI without taking process ownership.",
+                "Existing Studio Server listener passed the private desktop ownership proof; opening its loopback Web UI without taking process ownership.",
             );
-            Ok(OfficeLaunch::ExistingOpen)
+            Ok(StudioServerLaunch::ExistingOpen)
         }
     }
 }
@@ -138,7 +140,7 @@ impl WithOptionalLog for StartupFailure {
     }
 }
 
-pub(crate) fn start_office_server(
+pub(crate) fn start_studio_server(
     app: &tauri::AppHandle,
     desktop_capability: &str,
 ) -> Result<Child, OwnedServerLaunchError> {
@@ -152,7 +154,7 @@ pub(crate) fn start_office_server(
     if !script.is_file() {
         return Err(OwnedServerLaunchError::BundledResourceUnavailable {
             detail: format!(
-                "Bundled Office Server module missing at {}.",
+                "Bundled Studio Server module missing at {}.",
                 script.display()
             ),
         });
@@ -176,16 +178,16 @@ pub(crate) fn start_office_server(
     let mut command = Command::new(&node);
     command.env_clear();
     inherit_safe_environment(&mut command);
-    // Office remote-device configuration comes from the explicit host
+    // Studio Server remote-device configuration comes from the explicit host
     // environment or the desktop owner's validated Keychain entry. Pass it to
     // the server child only; do not forward it to managed Hermes runtimes.
-    inherit_office_remote_environment(&mut command, |key| {
+    inherit_studio_server_remote_environment(&mut command, |key| {
         env::var_os(key).or_else(|| remote_environment.lookup(key))
     });
     command
         .arg(&script)
-        .env("HERMES_STUDIO_HOST", OFFICE_HOST)
-        .env("HERMES_STUDIO_PORT", OFFICE_PORT.to_string())
+        .env("HERMES_STUDIO_HOST", STUDIO_SERVER_HOST)
+        .env("HERMES_STUDIO_PORT", STUDIO_SERVER_PORT.to_string())
         .env("HERMES_STUDIO_HERMES_MODE", "managed")
         .env("HERMES_STUDIO_HERMES_EXECUTABLE", &hermes)
         .env("HERMES_STUDIO_DESKTOP_CAPABILITY", desktop_capability)
@@ -215,7 +217,7 @@ pub(crate) fn start_office_server(
     command.current_dir(current_dir);
     command.spawn().map_err(|error| {
         let detail = format!(
-            "Failed to spawn Office Server (node={}, script={}): {error}",
+            "Failed to spawn Studio Server (node={}, script={}): {error}",
             node.display(),
             script.display()
         );
@@ -225,7 +227,7 @@ pub(crate) fn start_office_server(
 }
 
 #[cfg(debug_assertions)]
-pub(crate) fn start_office_dev_server(
+pub(crate) fn start_studio_dev_server(
     _app: &tauri::AppHandle,
     desktop_capability: &str,
 ) -> Result<Child, OwnedServerLaunchError> {
@@ -259,7 +261,7 @@ pub(crate) fn start_office_dev_server(
     let mut command = Command::new(&node);
     command.env_clear();
     inherit_safe_environment(&mut command);
-    inherit_office_remote_environment(&mut command, |key| {
+    inherit_studio_server_remote_environment(&mut command, |key| {
         env::var_os(key).or_else(|| remote_environment.lookup(key))
     });
     command
@@ -267,8 +269,8 @@ pub(crate) fn start_office_dev_server(
         .arg(&tsx)
         .arg("watch")
         .arg(repo_root.join("apps/server/src/index.ts"))
-        .env("HERMES_STUDIO_HOST", OFFICE_HOST)
-        .env("HERMES_STUDIO_PORT", OFFICE_PORT.to_string())
+        .env("HERMES_STUDIO_HOST", STUDIO_SERVER_HOST)
+        .env("HERMES_STUDIO_PORT", STUDIO_SERVER_PORT.to_string())
         .env("HERMES_STUDIO_HERMES_MODE", "managed")
         .env("HERMES_STUDIO_HERMES_EXECUTABLE", &hermes)
         .env("HERMES_STUDIO_DESKTOP_CAPABILITY", desktop_capability)
@@ -278,7 +280,7 @@ pub(crate) fn start_office_dev_server(
     // Dev keeps console inheritance for interactive diagnosis; also mirror to log files.
     apply_child_stdio_dev(&mut command);
     command.spawn().map_err(|error| {
-        let detail = format!("Failed to spawn dev Office Server: {error}");
+        let detail = format!("Failed to spawn dev Studio Server: {error}");
         log_event(&detail);
         OwnedServerLaunchError::ChildLaunchFailed { detail }
     })
@@ -289,7 +291,7 @@ fn apply_child_stdio(command: &mut Command) {
         match (fs::File::create(&stdout_path), fs::File::create(&stderr_path)) {
             (Ok(stdout), Ok(stderr)) => {
                 log_event(&format!(
-                    "Office Server logs: stdout={}, stderr={}",
+                    "Studio Server logs: stdout={}, stderr={}",
                     stdout_path.display(),
                     stderr_path.display()
                 ));
@@ -297,7 +299,7 @@ fn apply_child_stdio(command: &mut Command) {
                 return;
             }
             _ => {
-                log_event("Could not open Office Server log files; discarding child stdio.");
+                log_event("Could not open Studio Server log files; discarding child stdio.");
             }
         }
     }
@@ -317,7 +319,7 @@ fn apply_child_stdio_dev(command: &mut Command) {
             .append(true)
             .open(&stderr_path);
         log_event(&format!(
-            "Dev Office Server also has log files at {} and {} (primary output inherits the terminal).",
+            "Dev Studio Server also has log files at {} and {} (primary output inherits the terminal).",
             stdout_path.display(),
             stderr_path.display()
         ));
@@ -325,17 +327,17 @@ fn apply_child_stdio_dev(command: &mut Command) {
     command.stdout(Stdio::inherit()).stderr(Stdio::inherit());
 }
 
-pub(crate) fn classify_office_startup(
+pub(crate) fn classify_studio_server_startup(
     address: SocketAddr,
-) -> Result<OfficeStartup, StartupProbeError> {
+) -> Result<StudioServerStartup, StartupProbeError> {
     if let Ok(listener) = TcpListener::bind(address) {
         drop(listener);
-        return Ok(OfficeStartup::PortFree);
+        return Ok(StudioServerStartup::PortFree);
     }
 
     match probe_existing_health(address) {
         ProbeOutcome::Compatible => match probe_existing_web_ui(address) {
-            WebUiProbeOutcome::Compatible => Ok(OfficeStartup::CompatibleCandidate),
+            WebUiProbeOutcome::Compatible => Ok(StudioServerStartup::CompatibleCandidate),
             WebUiProbeOutcome::Unavailable => {
                 Err(StartupProbeError::ExistingWebUiUnavailable)
             }
@@ -348,20 +350,20 @@ pub(crate) fn classify_office_startup(
     }
 }
 
-pub(crate) fn wait_for_office_server(
+pub(crate) fn wait_for_studio_server(
     child: &mut Child,
     timeout: Duration,
     desktop_capability: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let deadline = Instant::now() + timeout;
-    let address = SocketAddr::from((Ipv4Addr::LOCALHOST, OFFICE_PORT));
+    let address = SocketAddr::from((Ipv4Addr::LOCALHOST, STUDIO_SERVER_PORT));
     while Instant::now() < deadline {
         if let Some(status) = child.try_wait()? {
             let log_hint = child_stdio_paths()
                 .map(|(_, stderr)| format!(" See {}.", stderr.display()))
                 .unwrap_or_default();
             return Err(format!(
-                "Office Server exited during startup ({status}).{log_hint}"
+                "Studio Server exited during startup ({status}).{log_hint}"
             )
             .into());
         }
@@ -369,7 +371,7 @@ pub(crate) fn wait_for_office_server(
             && desktop_readiness_proof_check(address, desktop_capability, deadline)
         {
             if let Some(status) = child.try_wait()? {
-                return Err(format!("Office Server exited during startup ({status}).").into());
+                return Err(format!("Studio Server exited during startup ({status}).").into());
             }
             return Ok(());
         }
@@ -378,10 +380,10 @@ pub(crate) fn wait_for_office_server(
     let log_hint = child_stdio_paths()
         .map(|(_, stderr)| format!(" See {}.", stderr.display()))
         .unwrap_or_default();
-    Err(format!("Office Server did not become ready within 50 seconds.{log_hint}").into())
+    Err(format!("Studio Server did not become ready within 50 seconds.{log_hint}").into())
 }
 
-pub(crate) fn stop_office_server(child: &mut Child) {
+pub(crate) fn stop_studio_server(child: &mut Child) {
     if child.try_wait().ok().flatten().is_some() {
         return;
     }
@@ -399,7 +401,7 @@ pub(crate) fn stop_office_server(child: &mut Child) {
 
 #[cfg(unix)]
 fn send_terminate(child: &mut Child) {
-    // Office Server handles SIGTERM and closes its managed Hermes processes.
+    // Studio Server handles SIGTERM and closes its managed Hermes processes.
     unsafe {
         libc::kill(child.id() as libc::pid_t, libc::SIGTERM);
     }

@@ -291,7 +291,7 @@ export function registerOfficeRetry(action: () => void): void {
   officeRuntimeHooks.retryOfficeConnection = action;
 }
 
-export function retryOfficeServer(): void {
+export function retryStudioServer(): void {
   officeAccess.value = { ...officeAccess.value, state: "checking", message: officeMessage("runtime.office.reconnecting") };
   officeRuntimeHooks.retryOfficeConnection();
 }
@@ -447,6 +447,8 @@ export function applyOfficeSnapshot(snapshot: OfficeSnapshot, source: string | O
       ...(live.createdAt === undefined ? {} : { createdAt: live.createdAt }),
       ...(live.updatedAt === undefined ? {} : { updatedAt: live.updatedAt }),
       ...(live.lastMessagePreview === undefined ? {} : { lastMessagePreview: live.lastMessagePreview }),
+      projectGroupId: live.projectGroupId,
+      projectGroupName: live.projectGroupName,
       ...(live.conversationKind === undefined ? {} : { conversationKind: live.conversationKind }),
       ...(live.delegationTaskId === undefined ? {} : { delegationTaskId: live.delegationTaskId }),
       ...(live.delegatedByProfileId === undefined ? {} : { delegatedByProfileId: live.delegatedByProfileId }),

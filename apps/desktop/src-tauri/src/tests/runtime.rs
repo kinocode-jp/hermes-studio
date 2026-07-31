@@ -7,7 +7,7 @@ use std::{
 
 use crate::hex_util::random_desktop_capability;
 use crate::runtime::{
-    hermes_agent_is_detected, hermes_candidates, inherit_office_remote_environment,
+    hermes_agent_is_detected, hermes_candidates, inherit_studio_server_remote_environment,
     node_candidates, node_version_is_compatible, run_version_command_with_timeout,
     validated_local_executable,
 };
@@ -136,7 +136,7 @@ fn executable_validation_canonicalizes_and_rejects_writable_files() {
 }
 
 #[test]
-fn office_remote_environment_allowlist_is_exact_when_host_values_present() {
+fn studio_server_remote_environment_allowlist_is_exact_when_host_values_present() {
     let mut lookup = std::collections::HashMap::new();
     lookup.insert("HERMES_STUDIO_REMOTE_TOKEN", OsString::from("office-token"));
     lookup.insert("HERMES_STUDIO_ALLOWED_ORIGINS", OsString::from("https://office.example"));
@@ -145,7 +145,7 @@ fn office_remote_environment_allowlist_is_exact_when_host_values_present() {
     lookup.insert("HERMES_STUDIO_CHAT_SESSION_LEASES_PER_PROFILE", OsString::from("16"));
     let mut command = Command::new("/bin/sh");
     command.env_clear();
-    inherit_office_remote_environment(&mut command, |key| lookup.get(key).cloned());
+    inherit_studio_server_remote_environment(&mut command, |key| lookup.get(key).cloned());
     let envs: Vec<(String, String)> = command
         .get_envs()
         .filter_map(|(k, v)| {
@@ -157,17 +157,17 @@ fn office_remote_environment_allowlist_is_exact_when_host_values_present() {
     assert!(envs.contains(&("HERMES_STUDIO_TRUSTED_PROXY_HOPS".to_string(), "1".to_string())));
     assert!(envs.contains(&("HERMES_STUDIO_REMOTE_PRIVILEGED".to_string(), "true".to_string())));
     assert!(envs.contains(&("HERMES_STUDIO_CHAT_SESSION_LEASES_PER_PROFILE".to_string(), "16".to_string())));
-    assert_eq!(envs.len(), 4, "only the four allowed Office keys may be forwarded");
+    assert_eq!(envs.len(), 4, "only the four allowed Studio Server keys may be forwarded");
 }
 
 #[test]
-fn office_remote_environment_allowlist_ignores_empty_or_missing_values() {
+fn studio_server_remote_environment_allowlist_ignores_empty_or_missing_values() {
     let mut lookup = std::collections::HashMap::new();
     lookup.insert("HERMES_STUDIO_REMOTE_TOKEN", OsString::from(""));
     lookup.insert("HERMES_OFFICE_REMOTE_TOKEN", OsString::from("deprecated-value"));
     let mut command = Command::new("/bin/sh");
     command.env_clear();
-    inherit_office_remote_environment(&mut command, |key| lookup.get(key).cloned());
+    inherit_studio_server_remote_environment(&mut command, |key| lookup.get(key).cloned());
     let envs: Vec<(String, String)> = command
         .get_envs()
         .filter_map(|(k, v)| {

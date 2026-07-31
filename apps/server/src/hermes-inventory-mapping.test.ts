@@ -189,6 +189,21 @@ test("delegated profile conversations expose only bounded public provenance", as
   assert.equal(inventory.sessions[1]?.delegationTaskId, undefined);
 });
 
+test("session workspaces become opaque project groups without exposing host paths", async () => {
+  const root = "/Volumes/Private/Client/kinocode-hp";
+  const sameProject = [
+    { ...session("workspace-a", 2), profile: "profile-0", cwd: `${root}/apps/web`, git_repo_root: root },
+    { ...session("workspace-b", 1), profile: "profile-1", cwd: root },
+    { ...session("no-workspace", 0), profile: "profile-0" },
+  ];
+  const inventory = await collectHermesInventory(requester([profile(), profile("profile-1")], sameProject));
+
+  assert.equal(inventory.sessions[0]?.projectGroupName, "kinocode-hp");
+  assert.equal(inventory.sessions[0]?.projectGroupId, inventory.sessions[1]?.projectGroupId);
+  assert.equal(inventory.sessions[2]?.projectGroupId, undefined);
+  assert.equal(JSON.stringify(inventory.sessions).includes(root), false);
+});
+
 test("session inventory redacts Hermes secrets before bounding browser display text", async () => {
   const secret = "dashboard-example-value-123456"; // gitleaks:allow -- synthetic redaction fixture
   const standalone = "sk_" + "live_ABCDEFGHIJKLMNOPQRSTUVWXYZ";

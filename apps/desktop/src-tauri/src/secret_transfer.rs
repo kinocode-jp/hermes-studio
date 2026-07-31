@@ -2,7 +2,7 @@
 //!
 //! The packaged WebView never places secret bytes on ordinary browser fetch
 //! JSON. Instead it invokes this command; Rust POSTs the value to the owned
-//! loopback Office Server with the desktop capability header. The response
+//! loopback Studio Server with the desktop capability header. The response
 //! carries only a short-lived transfer id.
 
 use std::{
@@ -14,7 +14,7 @@ use std::{
 use crate::capability::{
     authenticated_owned_capability, close_owned_desktop_window, OwnedCapabilityOutcome,
 };
-use crate::constants::{OFFICE_HOST, OFFICE_PORT};
+use crate::constants::{STUDIO_SERVER_HOST, STUDIO_SERVER_PORT};
 use crate::http::{
     http_status_is_ok, read_bounded_response, remaining_timeout, response_deadline,
     set_write_timeout_until, BoundedReadError,
@@ -34,7 +34,7 @@ struct DepositResponse {
     expires_at: String,
 }
 
-/// Deposit a secret into the Office Server transfer store via native loopback HTTP.
+/// Deposit a secret into the Studio Server transfer store via native loopback HTTP.
 /// Returns the one-shot transfer id (never echoes the secret).
 #[tauri::command]
 pub(crate) async fn deposit_secret_transfer(
@@ -70,7 +70,7 @@ fn deposit_secret_blocking(app: &tauri::AppHandle, value: String) -> Result<Stri
         }
     };
 
-    let address = SocketAddr::from((Ipv4Addr::LOCALHOST, OFFICE_PORT));
+    let address = SocketAddr::from((Ipv4Addr::LOCALHOST, STUDIO_SERVER_PORT));
     let deadline = Instant::now() + DEPOSIT_TIMEOUT;
     let body = match serde_json::to_vec(&serde_json::json!({ "value": value })) {
         Ok(bytes) => bytes,
@@ -83,14 +83,14 @@ fn deposit_secret_blocking(app: &tauri::AppHandle, value: String) -> Result<Stri
         return Err("Secret transfer timed out.".into());
     };
     let mut stream = TcpStream::connect_timeout(&address, connect_timeout)
-        .map_err(|_| "Secret transfer could not reach the Office Server.".to_string())?;
+        .map_err(|_| "Secret transfer could not reach the Studio Server.".to_string())?;
     if set_write_timeout_until(&stream, deadline).is_err() {
         return Err("Secret transfer timed out.".into());
     }
 
     let request = format!(
         "POST /api/v1/secret-transfers HTTP/1.1\r\n\
-         Host: {OFFICE_HOST}:{OFFICE_PORT}\r\n\
+         Host: {STUDIO_SERVER_HOST}:{STUDIO_SERVER_PORT}\r\n\
          Content-Type: application/json\r\n\
          Content-Length: {}\r\n\
          X-Hermes-Office-Desktop-Capability: {capability}\r\n\
@@ -123,7 +123,7 @@ fn deposit_secret_blocking(app: &tauri::AppHandle, value: String) -> Result<Stri
     };
     if !http_status_is_ok(headers) {
         // Never include response body (may contain error detail).
-        return Err("Secret transfer was rejected by the Office Server.".into());
+        return Err("Secret transfer was rejected by the Studio Server.".into());
     }
     let parsed: DepositResponse = serde_json::from_str(body_text.trim())
         .map_err(|_| "Secret transfer response was invalid.".to_string())?;

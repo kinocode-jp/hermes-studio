@@ -19,8 +19,8 @@ independent audit, certification, or warranty.
 
 ### Listener and request boundary
 
-- Office Server binds to loopback by default.
-- Office Server requires a loopback listener; direct non-loopback binding is
+- Studio Server binds to loopback by default.
+- Studio Server requires a loopback listener; direct non-loopback binding is
   rejected. Remote browsers must arrive through the configured loopback proxy.
 - Local bootstrap checks the peer address, exact Host/Origin allowlists, and
   rejects forwarded requests rather than trusting proxy headers.
@@ -142,7 +142,7 @@ invalid-digest registry fails closed and does not reopen enrollment.
   enforce note, node, edge, and response-size bounds.
 - Managed and adopted Hermes endpoints are restricted to loopback.
 - Hermes child processes receive a constructed environment allowlist rather
-  than Office Server's complete environment; Office auth/proxy configuration
+  than Studio Server's complete environment; Office auth/proxy configuration
   and unrelated provider credentials are not inherited.
 - Profile settings that Hermes scopes to a process are routed to a
   Profile-pinned Hermes backend.
@@ -223,12 +223,12 @@ creates persistent private Serve only when empty or already an exact private
 HTTPS root reverse-proxy
 (`tailscale serve --bg --https=443 http://127.0.0.1:4317`, without `--yes` so
 Tailscale may require interactive HTTPS/Serve consent), runs production asset
-preflight before creating Serve, and starts the production Office launcher. It
+preflight before creating Serve, and starts the production Studio launcher. It
 fails closed on missing Tailscale, invalid DNS names, non-HTTPS or alternate
 remote origins, missing/short tokens, non-loopback binds, missing production
 assets, conflicting or unrecognized Serve configuration, and Funnel mapping. It
 does not enable Funnel, bind Office to a LAN or tailnet address, invent a second
-Office URL, or switch browser endpoints. Remote clients need the official
+Studio Server URL, or switch browser endpoints. Remote clients need the official
 Tailscale mobile app (same tailnet) and open the single HTTPS origin in a
 browser or PWA—there is no native Hermes Studio app. Tailscale selects direct
 peer-to-peer or DERP relay transport; Office remains same-origin. Operator
@@ -374,7 +374,7 @@ review support that statement.
 - Never return Office, Hermes, provider, tunnel, or identity-provider secrets in
   browser DTOs, logs, audit records, errors, URLs, or WebSocket events.
 - Construct child-process environments from an explicit minimum allowlist; do
-  not inherit the entire Office Server environment.
+  not inherit the entire Studio Server environment.
 - Keep Hermes endpoints on loopback and reject redirects or alternate addresses
   that escape that boundary.
 - Apply authorization on the server for every request and socket operation;

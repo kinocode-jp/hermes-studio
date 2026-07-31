@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
-use crate::constants::OFFICE_URL;
-use crate::startup::{OfficeLaunch, StartupFailure, StartupNoticeKind};
+use crate::constants::STUDIO_SERVER_URL;
+use crate::startup::{StudioServerLaunch, StartupFailure, StartupNoticeKind};
 use crate::window::{
     html_escape, percent_encode_data, startup_loading_data_url, startup_loading_html,
     replacement_window_should_show, startup_notice_data_url, startup_notice_data_url_kind,
@@ -49,12 +49,12 @@ fn startup_window_uses_app_assets_only_after_owned_server_readiness() {
 #[test]
 fn owned_and_attached_servers_keep_distinct_application_origins() {
     assert_eq!(
-        startup_view_for_launch(OfficeLaunch::OwnedReady),
+        startup_view_for_launch(StudioServerLaunch::OwnedReady),
         StartupView::BundledApp
     );
     assert_eq!(
-        startup_view_for_launch(OfficeLaunch::ExistingOpen),
-        StartupView::ExistingOffice
+        startup_view_for_launch(StudioServerLaunch::ExistingOpen),
+        StartupView::ExistingStudioServer
     );
 }
 
@@ -85,27 +85,27 @@ fn startup_window_uses_a_fixed_local_loading_document_before_readiness() {
 }
 
 #[test]
-fn startup_window_opens_existing_compatible_office_on_loopback() {
+fn startup_window_opens_existing_compatible_studio_server_on_loopback() {
     let app_url = tauri::WebviewUrl::App(PathBuf::from("index.html"));
-    let url = startup_window_url(&app_url, &StartupView::ExistingOffice)
-        .expect("existing office URL should parse");
+    let url = startup_window_url(&app_url, &StartupView::ExistingStudioServer)
+        .expect("existing Studio Server URL should parse");
 
     let tauri::WebviewUrl::External(url) = url else {
-        panic!("existing office must load as External loopback URL");
+        panic!("existing Studio Server must load as External loopback URL");
     };
-    assert_eq!(url.as_str(), OFFICE_URL);
+    assert_eq!(url.as_str(), STUDIO_SERVER_URL);
 }
 
 #[test]
 fn attached_loopback_view_uses_the_verified_server_origin() {
     let app_url = tauri::WebviewUrl::App(PathBuf::from("index.html"));
-    let url = startup_window_url(&app_url, &StartupView::ExistingOffice)
+    let url = startup_window_url(&app_url, &StartupView::ExistingStudioServer)
         .expect("verified desktop server URL should parse");
 
     assert_eq!(
         url,
         tauri::WebviewUrl::External(
-            tauri::Url::parse(OFFICE_URL).expect("Office URL should parse")
+            tauri::Url::parse(STUDIO_SERVER_URL).expect("Studio Server URL should parse")
         )
     );
 }

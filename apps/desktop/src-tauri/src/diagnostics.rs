@@ -50,7 +50,7 @@ pub(crate) fn log_event(message: &str) {
 pub(crate) fn child_stdio_paths() -> Option<(PathBuf, PathBuf)> {
     let dir = diagnostic_log_dir()?;
     fs::create_dir_all(&dir).ok()?;
-    Some((dir.join("office-server.stdout.log"), dir.join("office-server.stderr.log")))
+    Some((dir.join("studio-server.stdout.log"), dir.join("studio-server.stderr.log")))
 }
 
 pub(crate) fn scrub_secrets(value: &str) -> String {

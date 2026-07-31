@@ -11,7 +11,7 @@ import {
   shouldRecoverOfficeWebSocket,
 } from "../src/office-api.ts";
 import { initializeInventory, sessionInventoryState } from "../src/inventory.ts";
-import { applyOfficeSnapshot, officeAccess, officeConnection, officeSnapshot, registerOfficeRetry, requireDeviceLogin, retryOfficeServer, sessions, setOfficeAuthenticated, setOfficeError } from "../src/store.ts";
+import { applyOfficeSnapshot, officeAccess, officeConnection, officeSnapshot, registerOfficeRetry, requireDeviceLogin, retryStudioServer, sessions, setOfficeAuthenticated, setOfficeError } from "../src/store.ts";
 import { localizeRuntimeMessage } from "../src/i18n.ts";
 import {
   BareWebSocket,
@@ -229,7 +229,7 @@ test("renew 403 preserves LKG and waits for trusted proxy repair without device 
       assert.equal(timerDelays.filter((delay) => delay >= 3_000).length, reconnectTimersBeforeFailure);
 
       proxyHealthy = true;
-      retryOfficeServer();
+      retryStudioServer();
       await waitFor(() => renewals === 2 && officeSnapshot.value?.sequence === 2 && BareWebSocket.byPath("/api/v1/events").length === 2);
       assert.equal(officeAccess.value.state, "authenticated");
       assert.equal(enrollments, 1);

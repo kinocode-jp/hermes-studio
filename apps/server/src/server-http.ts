@@ -1,7 +1,7 @@
 import { createHmac } from "node:crypto";
 import type { EventEnvelope, EventTopic, Operation, ProtocolError } from "@hermes-studio/protocol";
 import { WebSocket } from "ws";
-import { OFFICE_PROTOCOL_VERSION } from "./demo-state.js";
+import { STUDIO_SERVER_PROTOCOL_VERSION } from "./demo-state.js";
 import { normalizeOrigin } from "./origin.js";
 import type { StaticWebAsset } from "./static-web.js";
 
@@ -156,7 +156,7 @@ export function makeEvent<T>(
   aggregateId?: string,
 ): EventEnvelope<T> {
   return {
-    protocolVersion: OFFICE_PROTOCOL_VERSION,
+    protocolVersion: STUDIO_SERVER_PROTOCOL_VERSION,
     eventId: `event-${sequence}`,
     topic,
     sequence,

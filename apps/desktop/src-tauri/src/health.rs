@@ -4,7 +4,7 @@ use std::{
     time::Instant,
 };
 
-use crate::constants::{HEALTH_RESPONSE_TIMEOUT, MAX_HEALTH_RESPONSE, OFFICE_PROTOCOL_VERSION};
+use crate::constants::{HEALTH_RESPONSE_TIMEOUT, MAX_HEALTH_RESPONSE, STUDIO_SERVER_PROTOCOL_VERSION};
 use crate::http::{
     http_status_is_ok, read_bounded_response, remaining_timeout, response_deadline,
     set_write_timeout_until, BoundedReadError,
@@ -50,7 +50,7 @@ pub(crate) fn classify_health_body(body: &str) -> HealthCompatibility {
         None => return HealthCompatibility::Malformed,
     };
     match version.as_i64() {
-        Some(v) if v == OFFICE_PROTOCOL_VERSION => HealthCompatibility::Compatible,
+        Some(v) if v == STUDIO_SERVER_PROTOCOL_VERSION => HealthCompatibility::Compatible,
         Some(_) => HealthCompatibility::Incompatible,
         None => HealthCompatibility::Malformed,
     }

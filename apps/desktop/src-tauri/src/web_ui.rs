@@ -64,7 +64,7 @@ pub(crate) fn probe_existing_web_ui(address: SocketAddr) -> WebUiProbeOutcome {
     let Some((headers, body)) = text.split_once("\r\n\r\n") else {
         return WebUiProbeOutcome::Unavailable;
     };
-    if !http_status_is_ok(headers) || !content_type_is_html(headers) || !body_is_office_web_ui(body)
+    if !http_status_is_ok(headers) || !content_type_is_html(headers) || !body_is_studio_web_ui(body)
     {
         return WebUiProbeOutcome::Unavailable;
     }
@@ -87,7 +87,7 @@ pub(crate) fn content_type_is_html(headers: &str) -> bool {
     content_type.is_some_and(|media_type| media_type.eq_ignore_ascii_case("text/html"))
 }
 
-pub(crate) fn body_is_office_web_ui(body: &str) -> bool {
+pub(crate) fn body_is_studio_web_ui(body: &str) -> bool {
     let normalized = body.to_ascii_lowercase();
     normalized.contains("<!doctype html>")
         && normalized.contains("<title>hermes studio</title>")

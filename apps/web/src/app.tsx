@@ -9,7 +9,7 @@ import { SideRail } from "./components/side-rail";
 import { locale, localizeRuntimeMessage, setLocale, t } from "./i18n";
 import { SettingsIcon } from "./components/icons";
 import { sidebarWidth } from "./sidebar-layout";
-import { officeAccess, officeConnection, openSessionIds, closeSettingsModal, openSettingsModal, retryOfficeServer, settingsModalOpen, settingsTab, workspaceSessionDropPreview } from "./store";
+import { officeAccess, officeConnection, openSessionIds, closeSettingsModal, openSettingsModal, retryStudioServer, settingsModalOpen, settingsTab, workspaceSessionDropPreview } from "./store";
 import { activateDashboardContainingPanel } from "./dashboard-actions";
 
 export function App() {
@@ -72,7 +72,7 @@ export function App() {
         {connection.state === "error" && (
           <div class="runtime-error-banner" role="alert">
             <span>{localizeRuntimeMessage(connection.message)}</span>
-            <button type="button" onClick={retryOfficeServer}>{t("connection.retry")}</button>
+            <button type="button" onClick={retryStudioServer}>{t("connection.retry")}</button>
           </div>
         )}
         <DashboardView />

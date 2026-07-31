@@ -9,7 +9,7 @@ use sha2::Sha256;
 
 use crate::constants::{
     DESKTOP_PROOF_DOMAIN, DESKTOP_PROOF_NONCE_BYTES, DESKTOP_PROOF_VERSION, MAX_HEALTH_RESPONSE,
-    OFFICE_HOST, OFFICE_PORT,
+    STUDIO_SERVER_HOST, STUDIO_SERVER_PORT,
 };
 use crate::hex_util::{decode_lower_hex_32, random_hex};
 use crate::http::{
@@ -50,7 +50,7 @@ pub(crate) fn desktop_readiness_proof_outcome(
         return DesktopProofOutcome::TransientUnavailable;
     }
     let request = format!(
-        "GET /api/v1/health/desktop-proof?nonce={nonce}&domain={DESKTOP_PROOF_DOMAIN}&version={DESKTOP_PROOF_VERSION} HTTP/1.1\r\nHost: {OFFICE_HOST}:{OFFICE_PORT}\r\nConnection: close\r\n\r\n"
+        "GET /api/v1/health/desktop-proof?nonce={nonce}&domain={DESKTOP_PROOF_DOMAIN}&version={DESKTOP_PROOF_VERSION} HTTP/1.1\r\nHost: {STUDIO_SERVER_HOST}:{STUDIO_SERVER_PORT}\r\nConnection: close\r\n\r\n"
     );
     if stream.write_all(request.as_bytes()).is_err() {
         return DesktopProofOutcome::TransientUnavailable;

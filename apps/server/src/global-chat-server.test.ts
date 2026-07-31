@@ -4,9 +4,9 @@ import { WebSocket } from "ws";
 import type { HermesRuntimeSource } from "./hermes-backend.js";
 import type { HermesChatInternalRequestOptions, HermesChatRequest } from "./hermes-chat.js";
 import { createDemoRuntimeStatus, createDemoSnapshot } from "./demo-state.js";
-import { createOfficeServer } from "./server.js";
+import { createStudioServer } from "./server.js";
 
-test("Office Server seeds session.create and reinforces follow-ups on every prompt", async (t) => {
+test("Studio Server seeds session.create and reinforces follow-ups on every prompt", async (t) => {
   const captured: Array<{ request: HermesChatRequest; internal?: HermesChatInternalRequestOptions }> = [];
   let contextReads = 0;
   const runtime = {
@@ -36,7 +36,7 @@ test("Office Server seeds session.create and reinforces follow-ups on every prom
       sessionCreateContext: async () => { contextReads += 1; return "Office-only shared context"; },
     }),
   } as unknown as HermesRuntimeSource;
-  const server = createOfficeServer({ port: 0, runtimeSource: runtime, allowedOrigins: ["http://localhost:4173"] });
+  const server = createStudioServer({ port: 0, runtimeSource: runtime, allowedOrigins: ["http://localhost:4173"] });
   const address = await server.listen();
   t.after(() => server.close());
   const origin = `http://127.0.0.1:${address.port}`;

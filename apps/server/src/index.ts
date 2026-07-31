@@ -1,4 +1,4 @@
-import { createOfficeServer } from "./server.js";
+import { createStudioServer } from "./server.js";
 import { HermesBackend } from "./hermes-backend.js";
 import { OfficeTeamsStore } from "./office-teams.js";
 import { brandEnv, brandEnvIsTrue, brandStatePath } from "./brand-env.js";
@@ -45,7 +45,7 @@ const runtimeSource = hermesMode === "demo"
       });
 
 let shuttingDown = false;
-let server: ReturnType<typeof createOfficeServer> | undefined;
+let server: ReturnType<typeof createStudioServer> | undefined;
 let initialization: Promise<void> | undefined;
 let shutdownFlight: Promise<void> | undefined;
 
@@ -102,7 +102,7 @@ initialization = (async () => {
     const remoteToken = brandEnv("REMOTE_TOKEN");
     const desktopCapability = brandEnv("DESKTOP_CAPABILITY");
     const webRoot = brandEnv("WEB_ROOT");
-    const candidate = createOfficeServer({
+    const candidate = createStudioServer({
       host,
       port,
       ...(configuredOrigins === undefined ? {} : { allowedOrigins: configuredOrigins }),
@@ -143,6 +143,6 @@ function positiveBrandInteger(name: string): number | undefined {
   return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : undefined;
 }
 
-export { createOfficeServer } from "./server.js";
+export { createStudioServer } from "./server.js";
 export { HermesBackend } from "./hermes-backend.js";
 export { discoverHermesRuntime } from "./hermes-runtime.js";

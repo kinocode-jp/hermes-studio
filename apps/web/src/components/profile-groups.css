@@ -94,6 +94,35 @@
   padding-left: 2px;
 }
 
+.project-group-header-button {
+  width: 100%;
+  grid-template-columns: 10px minmax(0, 1fr) auto 11px;
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.project-group-header-button:hover,
+.project-group-header-button:focus-visible {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+
+.project-group-header-button:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+.sidebar-project-session-list {
+  margin-left: 8px;
+}
+
+.sidebar-project-session-list .sidebar-session > small {
+  max-width: 92px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
 .sidebar-section-head-tools {
   display: inline-flex;
   flex: 0 0 auto;

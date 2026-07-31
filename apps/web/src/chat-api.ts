@@ -1,7 +1,7 @@
 import type { ApprovalChoice, ChatMessage } from "./domain";
 import {
   officeFetchJson,
-  officeServerUrl,
+  studioServerUrl,
   OfficeDeviceAuthRequiredError,
   OfficeSessionUnavailableError,
   openOfficeWebSocket,
@@ -157,7 +157,7 @@ const MAX_HISTORY_PAGES = DEFAULT_CLIENT_HISTORY_LIMITS.maxPages;
 const SESSION_SLOT_RETRY_MS = 750;
 
 export function connectChatApi(callbacks: ChatApiCallbacks, dependencies: ChatApiDependencies = {}): ChatApiConnection {
-  const serverUrl = dependencies.serverUrl ?? officeServerUrl();
+  const serverUrl = dependencies.serverUrl ?? studioServerUrl();
   const openWebSocket = dependencies.openWebSocket ?? (dependencies.createWebSocket
     ? async (url: string) => ({ socket: await dependencies.createWebSocket!(url), authRevision: 0 })
     : openOfficeWebSocket);

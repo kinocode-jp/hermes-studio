@@ -13,14 +13,14 @@ use std::{
 use tauri::Manager;
 
 use crate::constants::{
-    CHILD_POLL_INTERVAL, HEALTH_RESPONSE_TIMEOUT, OFFICE_PORT, OWNED_SERVER_MONITOR_INTERVAL,
+    CHILD_POLL_INTERVAL, HEALTH_RESPONSE_TIMEOUT, STUDIO_SERVER_PORT, OWNED_SERVER_MONITOR_INTERVAL,
     OWNED_SERVER_TRANSIENT_FAILURE_LIMIT,
 };
 use crate::hex_util::{decode_lower_hex_32, random_hex};
 use crate::http::remaining_timeout;
 use crate::proof::{desktop_readiness_proof_outcome, DesktopProofOutcome};
 
-pub(crate) struct OfficeServerProcess(pub(crate) Mutex<Option<Child>>);
+pub(crate) struct StudioServerProcess(pub(crate) Mutex<Option<Child>>);
 pub(crate) struct DesktopCapability(pub(crate) Mutex<Option<String>>);
 pub(crate) struct AttachedServerCapability(pub(crate) Mutex<Option<String>>);
 pub(crate) struct DesktopProofGate(pub(crate) Mutex<()>);
@@ -42,7 +42,7 @@ pub(crate) async fn desktop_capability(app: tauri::AppHandle) -> Option<String> 
             close_owned_desktop_window(&app);
             None
         }
-        // Attached existing Office: no capability, no window close.
+        // Attached existing Studio Server: no capability, no window close.
         OwnedCapabilityOutcome::NotOwned | OwnedCapabilityOutcome::TransientUnavailable => None,
     }
 }
@@ -133,7 +133,7 @@ pub(crate) fn authenticated_owned_capability(app: &tauri::AppHandle) -> OwnedCap
             return OwnedCapabilityOutcome::TransientUnavailable;
         }
     }
-    let address = SocketAddr::from((Ipv4Addr::LOCALHOST, OFFICE_PORT));
+    let address = SocketAddr::from((Ipv4Addr::LOCALHOST, STUDIO_SERVER_PORT));
     match desktop_readiness_proof_outcome(
         address,
         &capability,
@@ -210,7 +210,7 @@ enum OwnedChildOutcome {
 }
 
 fn owned_child_outcome(app: &tauri::AppHandle, deadline: Instant) -> OwnedChildOutcome {
-    let process_state = app.state::<OfficeServerProcess>();
+    let process_state = app.state::<StudioServerProcess>();
     let mut process = match lock_until(&process_state.0, deadline) {
         Ok(process) => process,
         Err(BoundedLockError::TimedOut) => return OwnedChildOutcome::TransientUnavailable,
@@ -287,7 +287,7 @@ pub(crate) fn start_attached_server_monitor(app: tauri::AppHandle) {
                 return;
             };
             let deadline = Instant::now() + HEALTH_RESPONSE_TIMEOUT;
-            let address = SocketAddr::from((Ipv4Addr::LOCALHOST, OFFICE_PORT));
+            let address = SocketAddr::from((Ipv4Addr::LOCALHOST, STUDIO_SERVER_PORT));
             let outcome = match desktop_readiness_proof_outcome(address, &capability, deadline) {
                 DesktopProofOutcome::Valid => OwnedCapabilityOutcome::Valid(capability),
                 DesktopProofOutcome::Invalid => OwnedCapabilityOutcome::Invalid,

@@ -1,8 +1,8 @@
 import { Fragment } from "preact";
 import { useEffect, useRef, useState } from "preact/hooks";
-import type { Profile, WorkTask } from "../domain";
+import type { ChatSession, Profile, WorkTask } from "../domain";
 import { chatSessionTitle, localizeRuntimeMessage, t, type TranslationKey } from "../i18n";
-import { loadMoreProfiles, profileInventoryState } from "../inventory";
+import { loadMoreProfiles, loadMoreSessions, profileInventoryState, sessionInventoryState } from "../inventory";
 import { deleteTask, tasks } from "../kanban-store";
 import { profileDisplayName, profileDisplayNameMap, profileSecondaryName } from "../profile-names";
 import {
@@ -38,6 +38,7 @@ import {
   SIDEBAR_MIN_WIDTH,
   isSidebarIconOnly,
   isSidebarProfileOpen,
+  isSidebarProjectOpen,
   setSidebarProfilesOpen,
   setSidebarMode,
   setSidebarTasksOpen,
@@ -50,9 +51,10 @@ import {
   sidebarTeamsOpen,
   sidebarWidth,
   toggleSidebarProfileOpen,
+  toggleSidebarProjectOpen,
 } from "../sidebar-layout";
 import { CharacterPortrait } from "./character-portrait";
-import { BoardIcon, CardsIcon, ChatIcon, GroupIcon, HomeIcon, ListIcon, ScheduleIcon, TrashIcon, UsersIcon } from "./icons";
+import { BoardIcon, CardsIcon, ChatIcon, FolderIcon, GroupIcon, HomeIcon, ListIcon, ScheduleIcon, TrashIcon, UsersIcon } from "./icons";
 import { StatusPill } from "./status-pill";
 import { TeamBadges } from "./team-badges";
 import { teams } from "../teams-store";
@@ -69,6 +71,7 @@ import { isPhoneViewport } from "../viewport";
 import { createProfileSession } from "./profile-panel";
 import { SessionDeleteDialog } from "./session-delete-dialog";
 import { useMobileOverlay } from "./use-mobile-overlay";
+import { groupSessionsByProject, type ProjectSessionGroup } from "../project-session-groups";
 
 
 function sidebarTaskStatusLabel(status: string): string {
@@ -112,6 +115,7 @@ export function SideRail() {
     openMenuSession,
   } = useProfileContextMenu();
   const inventory = profileInventoryState.value;
+  const sessionInventory = sessionInventoryState.value;
   const iconOnly = isSidebarIconOnly();
   const [phoneViewport, setPhoneViewport] = useState(isPhoneViewport());
   const [mobileTabKind, setMobileTabKind] = useState<DashboardPanelKind>(() =>
@@ -263,12 +267,17 @@ export function SideRail() {
 
   void profileDisplayNameMap();
   const hasTeams = teams.value.length > 0;
-  const groupMode = hasTeams && sidebarGroupMode.value === "teams" ? "teams" : "profiles";
+  const groupMode = sidebarGroupMode.value === "projects"
+    ? "projects"
+    : hasTeams && sidebarGroupMode.value === "teams" ? "teams" : "profiles";
   const orderedProfiles = sortProfilesBySidebarOrder(profileList.value);
   const defaultProfile = profileList.value.find((profile) => profile.id === "default");
   const grouping = groupMode === "teams"
     ? groupProfilesByTeams(orderedProfiles, teams.value)
     : { mode: "flat" as const, profiles: orderedProfiles };
+  const projectGroups = groupSessionsByProject(
+    sessions.value.filter((session) => !isScheduledSessionHidden(session)),
+  );
 
   const copy = {
     displayMode: t(sidebarMode.value === "rows" ? "sidebar.mode.cards" : "sidebar.mode.rows"),
@@ -551,6 +560,93 @@ export function SideRail() {
     </section>
   );
 
+  const renderProjectSession = (session: ChatSession) => {
+    const profile = profileList.value.find((item) => item.id === session.profileId);
+    const displayName = profile ? profileDisplayName(profile) : session.profileId;
+    const isOpen = openSessionIds.value.includes(session.id);
+    return (
+      <div
+        key={`${session.profileId}\0${session.id}`}
+        class={`sidebar-session-row ${isOpen ? "is-open" : ""} ${activeSessionId.value === session.id ? "is-active" : ""}`}
+      >
+        <button
+          class="sidebar-session"
+          type="button"
+          data-session-id={session.id}
+          style={isOpen && profile ? { "--session-color": profile.color } : undefined}
+          aria-current={activeSessionId.value === session.id ? "true" : undefined}
+          aria-keyshortcuts="Shift+Enter"
+          aria-label={`${displayName} — ${chatSessionTitle(session)}${session.conversationKind === "delegated" ? ` — ${t("profile.delegatedChat")}` : ""}`}
+          onClick={(event) => onSessionClick(event, session.id, session.profileId)}
+          onKeyDown={(event) => onSessionKeyDown(event, session.id)}
+          onContextMenu={(event) => openSessionMenu(event, session.id, session.profileId)}
+          onPointerDown={(event) => {
+            if (event.pointerType === "mouse") beginSidebarSessionPointerDrag(event, session.id);
+          }}
+        >
+          <i
+            aria-hidden="true"
+            onPointerDown={(event) => {
+              if (event.pointerType === "mouse") return;
+              event.stopPropagation();
+              beginSidebarSessionPointerDrag(event, session.id);
+            }}
+          />
+          <span>
+            {chatSessionTitle(session)}
+            {session.conversationKind === "delegated" && <em class="delegated-chat-badge">{t("profile.delegatedChat")}</em>}
+          </span>
+          <small>{displayName}{session.status === "streaming" ? ` · ${t("profile.running")}` : ""}</small>
+          {isOpen && <em aria-hidden="true">●</em>}
+        </button>
+        <button
+          class="sidebar-item-menu-trigger sidebar-session-delete"
+          type="button"
+          aria-label={t("chat.sessionDelete")}
+          title={t("chat.sessionDelete")}
+          onClick={() => setSessionDeleteRequestId(session.id)}
+        ><TrashIcon width={14} height={14} /></button>
+        <button
+          class="sidebar-item-menu-trigger"
+          type="button"
+          aria-label={t("sidebar.menu.trigger")}
+          title={t("sidebar.menu.trigger")}
+          onClick={(event) => openSessionMenu(event, session.id, session.profileId)}
+        >⋯</button>
+      </div>
+    );
+  };
+
+  const renderProjectGroup = (group: ProjectSessionGroup) => {
+    const label = group.kind === "project" ? group.name : t("project.group.unassigned");
+    const open = isSidebarProjectOpen(group.key);
+    return (
+      <section
+        key={group.key}
+        class={`profile-group project-session-group ${group.kind === "unassigned" ? "profile-group--unassigned" : ""}`}
+        aria-label={label}
+      >
+        <button
+          type="button"
+          class="profile-group-header project-group-header-button"
+          aria-expanded={open}
+          title={label}
+          onClick={() => toggleSidebarProjectOpen(group.key)}
+        >
+          <i aria-hidden="true" />
+          <b>{label}</b>
+          <small>{t("project.group.count", { count: group.sessions.length })}</small>
+          <span class="sidebar-profile-chevron" aria-hidden="true">{open ? "▾" : "▸"}</span>
+        </button>
+        {open && (
+          <div class="sidebar-session-list sidebar-project-session-list" aria-label={copy.sessionCount(group.sessions.length)}>
+            {group.sessions.map(renderProjectSession)}
+          </div>
+        )}
+      </section>
+    );
+  };
+
   const activeSidebarTasks = tasks.value
     .filter((task) => task.status !== "done" && task.status !== "archived")
     .slice()
@@ -649,8 +745,7 @@ export function SideRail() {
     >
       {sidebarProfilesOpen.value && (
         <>
-          {hasTeams && (
-            <header class="sidebar-section-head sidebar-profile-tools">
+          <header class="sidebar-section-head sidebar-profile-tools">
               <div class="sidebar-section-head-tools">
                 <div class="profile-group-toggle" role="group" aria-label={t("sidebar.group.aria")}>
                   <button
@@ -661,31 +756,50 @@ export function SideRail() {
                     aria-label={t("sidebar.group.profiles")}
                     onClick={() => setSidebarGroupMode("profiles")}
                   ><ListIcon /></button>
+                  {hasTeams && (
+                    <button
+                      type="button"
+                      class={groupMode === "teams" ? "is-active" : ""}
+                      aria-pressed={groupMode === "teams"}
+                      title={t("sidebar.group.teams")}
+                      aria-label={t("sidebar.group.teams")}
+                      onClick={() => setSidebarGroupMode("teams")}
+                    ><GroupIcon /></button>
+                  )}
                   <button
                     type="button"
-                    class={groupMode === "teams" ? "is-active" : ""}
-                    aria-pressed={groupMode === "teams"}
-                    title={t("sidebar.group.teams")}
-                    aria-label={t("sidebar.group.teams")}
-                    onClick={() => setSidebarGroupMode("teams")}
-                  ><GroupIcon /></button>
+                    class={groupMode === "projects" ? "is-active" : ""}
+                    aria-pressed={groupMode === "projects"}
+                    title={t("sidebar.group.projects")}
+                    aria-label={t("sidebar.group.projects")}
+                    onClick={() => setSidebarGroupMode("projects")}
+                  ><FolderIcon /></button>
                 </div>
               </div>
             </header>
-          )}
           <div class="sidebar-profile-list">
-            {grouping.mode === "flat"
+            {groupMode === "projects"
+              ? projectGroups.map(renderProjectGroup)
+              : grouping.mode === "flat"
               ? grouping.profiles.map((profile) => renderProfileEntry(profile, profile.id))
               : grouping.groups.map((group) => renderGroup(group))}
-            {profileList.value.length === 0 && <p class="sidebar-profile-empty">-</p>}
+            {(groupMode === "projects" ? projectGroups.length === 0 : profileList.value.length === 0)
+              && <p class="sidebar-profile-empty">-</p>}
           </div>
-          {inventory.hasMore && !iconOnly && (
-            <button class="sidebar-more" type="button" disabled={inventory.loading} onClick={() => void loadMoreProfiles()}>
-              {inventory.loading ? t("inventory.loading") : t("inventory.showMore")}
+          {(groupMode === "projects" ? sessionInventory.hasMore : inventory.hasMore) && !iconOnly && (
+            <button
+              class="sidebar-more"
+              type="button"
+              disabled={groupMode === "projects" ? sessionInventory.loading : inventory.loading}
+              onClick={() => void (groupMode === "projects" ? loadMoreSessions() : loadMoreProfiles())}
+            >
+              {(groupMode === "projects" ? sessionInventory.loading : inventory.loading) ? t("inventory.loading") : t("inventory.showMore")}
             </button>
           )}
-          {inventory.error && !iconOnly && (
-            <small class="inventory-note inventory-note--error">{localizeRuntimeMessage(inventory.error)}</small>
+          {(groupMode === "projects" ? sessionInventory.error : inventory.error) && !iconOnly && (
+            <small class="inventory-note inventory-note--error">
+              {localizeRuntimeMessage((groupMode === "projects" ? sessionInventory.error : inventory.error)!)}
+            </small>
           )}
         </>
       )}

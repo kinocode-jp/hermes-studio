@@ -49,7 +49,7 @@ authentication implementation. It defines three operations:
 3. `subscribe` for non-RPC streams such as Kanban events.
 
 The Tauri shell can implement this boundary in Rust. The PWA should call the
-Hermes Studio server, which proxies to Hermes after enforcing the Office device
+Studio Server, which proxies to Hermes after enforcing the Office device
 and role policy. This keeps Hermes administrative credentials and filesystem
 paths out of browser JavaScript.
 
@@ -89,7 +89,7 @@ live identities from its response. Do not rewrite resume through
 `/api/sessions/{id}/latest-descendant`: that REST traversal also follows newer
 branch, delegate, and tool children that native resume intentionally excludes.
 
-Office Server multiplexes every Browser Chat WebSocket over one Hermes gateway
+Studio Server multiplexes every Browser Chat WebSocket over one Hermes gateway
 connection. This keeps Hermes' process-global live transport stable while
 Office routes each normalized live event only to the Browser socket that owns
 that live id. A Browser disconnect waits a bounded interval for its in-flight
@@ -196,6 +196,10 @@ or home directory. See [Profiles](https://hermes-agent.nousresearch.com/docs/use
   rows keep their first observed order. Hermes `errors`, an incomplete page, or
   a safety ceiling produce an explicit truncated inventory instead of a silent
   complete-looking list.
+  Studio Server also converts each row's persisted `git_repo_root`/`cwd` into
+  an opaque project-group id and a bounded basename for the Web sidebar. The
+  absolute host path is never included in the browser snapshot, and this
+  grouping does not start profile-scoped Hermes backends.
 - `GET /api/sessions` is profile-scoped and supports pagination/filtering.
 - `GET /api/sessions/{id}` and `/messages` load detail/history.
 - `PATCH /api/sessions/{id}` renames or archives.
@@ -305,7 +309,7 @@ Recommended remote path:
 ```text
 PWA / mobile browser
   -> HTTPS + Office session + device policy
-Hermes Studio server
+Studio Server
   -> loopback REST / WS
 stock hermes serve
 ```

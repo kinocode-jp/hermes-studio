@@ -4,7 +4,7 @@ import { locale, localizeRuntimeMessage, setLocale, t } from "../i18n";
 import { InfoTip } from "./info-tip";
 import {
   officeAccess,
-  retryOfficeServer,
+  retryStudioServer,
   setDeviceLoginFailure,
   setDeviceLoginSubmitting
 } from "../store";
@@ -167,7 +167,7 @@ export function DeviceLogin() {
     credentialInput.value = "";
     try {
       const result = await login;
-      if (result.ok) retryOfficeServer();
+      if (result.ok) retryStudioServer();
       else setDeviceLoginFailure(result);
     } catch {
       setDeviceLoginFailure(classifyDeviceLoginFailure(0, null));
@@ -234,7 +234,7 @@ export function DeviceLogin() {
         )}
 
         {access.state === "unavailable" && (
-          <button class="dl-retry" type="button" onClick={retryOfficeServer}>
+          <button class="dl-retry" type="button" onClick={retryStudioServer}>
             <span class="dl-retry-icon">↻</span>
             {t("login.reconnect")}
           </button>

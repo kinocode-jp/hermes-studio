@@ -22,7 +22,7 @@ export {
   fetchRemoteConfigStatus,
   logoutRemoteDevice,
   officeFetchJson,
-  officeServerUrl,
+  studioServerUrl,
   openOfficeWebSocket,
   recoverOfficeWebSocketAuthentication,
   revokeRemoteDevice,

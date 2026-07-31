@@ -1,4 +1,4 @@
-use crate::constants::OFFICE_URL;
+use crate::constants::STUDIO_SERVER_URL;
 use crate::diagnostics::log_event;
 use crate::startup::StartupFailure;
 #[cfg(test)]
@@ -26,7 +26,7 @@ pub(crate) enum StartupView {
     /// readiness. This preserves desktop capability auth and local app storage.
     BundledApp,
     /// A verified attached listener serving the packaged Web UI.
-    ExistingOffice,
+    ExistingStudioServer,
     /// Recoverable failure with a fixed self-contained notice page.
     Notice(StartupFailure),
 }
@@ -111,8 +111,8 @@ pub(crate) fn startup_window_url(
             &startup_loading_data_url(),
         )?)),
         StartupView::BundledApp => Ok(app_url.clone()),
-        StartupView::ExistingOffice => Ok(tauri::WebviewUrl::External(tauri::Url::parse(
-            OFFICE_URL,
+        StartupView::ExistingStudioServer => Ok(tauri::WebviewUrl::External(tauri::Url::parse(
+            STUDIO_SERVER_URL,
         )?)),
         StartupView::Notice(notice) => Ok(tauri::WebviewUrl::CustomProtocol(tauri::Url::parse(
             &startup_notice_data_url(notice),
@@ -170,8 +170,8 @@ pub(crate) fn startup_notice_html(notice: &StartupFailure) -> String {
         })
         .unwrap_or_default();
     format!(
-        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>{title}</title><style>html{{color-scheme:light dark}}body{{margin:0;min-height:100vh;display:grid;place-items:center;font:16px/1.55 system-ui,-apple-system,sans-serif;background:#111827;color:#f8fafc}}main{{box-sizing:border-box;width:min(720px,calc(100% - 40px));padding:32px;border:1px solid #374151;border-radius:16px;background:#1f2937}}h1{{margin:0 0 16px;font-size:26px}}p,ol{{margin:12px 0}}li+li{{margin-top:8px}}pre{{white-space:pre-wrap;word-break:break-word;padding:12px;border-radius:8px;background:#111827;border:1px solid #374151;font:13px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace;color:#e5e7eb}}code{{font:13px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace}}</style></head><body><main><h1>{title}</h1><p>{explanation}</p><p>No external server or process was stopped or replaced.</p>{detail}{log}<p><strong>What to do next</strong></p><ol>{recovery_steps}</ol><p>Office API target remains <code>{}</code> when the owned server is running.</p></main></body></html>",
-        html_escape(OFFICE_URL.trim_end_matches('/'))
+        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>{title}</title><style>html{{color-scheme:light dark}}body{{margin:0;min-height:100vh;display:grid;place-items:center;font:16px/1.55 system-ui,-apple-system,sans-serif;background:#111827;color:#f8fafc}}main{{box-sizing:border-box;width:min(720px,calc(100% - 40px));padding:32px;border:1px solid #374151;border-radius:16px;background:#1f2937}}h1{{margin:0 0 16px;font-size:26px}}p,ol{{margin:12px 0}}li+li{{margin-top:8px}}pre{{white-space:pre-wrap;word-break:break-word;padding:12px;border-radius:8px;background:#111827;border:1px solid #374151;font:13px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace;color:#e5e7eb}}code{{font:13px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace}}</style></head><body><main><h1>{title}</h1><p>{explanation}</p><p>No external server or process was stopped or replaced.</p>{detail}{log}<p><strong>What to do next</strong></p><ol>{recovery_steps}</ol><p>Studio Server API target remains <code>{}</code> when the owned server is running.</p></main></body></html>",
+        html_escape(STUDIO_SERVER_URL.trim_end_matches('/'))
     )
 }
 

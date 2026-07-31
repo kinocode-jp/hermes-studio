@@ -17,7 +17,7 @@ the selected profile and sends all profile settings calls to that process. The
 resolver may pool these processes with an idle TTL. It must not pass a primary
 profile's memory call through `?profile=` and assume it was scoped.
 
-The backend token remains inside Office Server. Browsers receive normalized DTOs
+The backend token remains inside Studio Server. Browsers receive normalized DTOs
 only; they never receive the Hermes origin, token, filesystem paths, raw provider
 objects, or backend exception details.
 
@@ -135,7 +135,7 @@ Global writes carry an integer `expectedRevision`. Skill/SOUL/provider/memory-fi
 document writes and schema-driven Hermes config writes carry a SHA-256
 `expectedRevision`; toggles/provider selection carry the previous effective
 value. Stale writes return HTTP 409. Office serializes each profile/resource
-compare-and-write pair, so concurrent writes through the same Office Server
+compare-and-write pair, so concurrent writes through the same Studio Server
 re-read after the prior write and cannot both accept one revision. Raw
 memory-file **reads and writes** use the `memory.update` policy (manager tier,
 local step-up for remote devices; CSRF on mutations only) and are auditable
@@ -203,7 +203,7 @@ Hermes does not currently expose a conditional-write contract for these routes.
 An out-of-process writer that edits Hermes directly can therefore race between
 Office's upstream read and write. `expectedRevision` is an in-process Office
 concurrency guarantee, not a cross-process transaction; operators should route
-interactive settings edits through one Office Server instance.
+interactive settings edits through one Studio Server instance.
 
 ### Privileged config + secrets (desktop-capability owner)
 

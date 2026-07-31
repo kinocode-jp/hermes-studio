@@ -6,14 +6,14 @@ import test from "node:test";
 import type { HermesRuntimeSource } from "./hermes-backend.js";
 import type { HermesSettingsAdapter } from "./hermes-settings.js";
 import { OfficeGlobalSettingsStore } from "./hermes-settings.js";
-import { createOfficeServer } from "./server.js";
+import { createStudioServer } from "./server.js";
 import { createDemoSnapshot, createDemoRuntimeStatus } from "./demo-state.js";
 import { settingsOperation } from "./server-http.js";
 import { OPERATION_POLICIES } from "@hermes-studio/protocol";
 
 const REVISION = "a".repeat(43);
 
-test("Office Server settings API requires authentication and CSRF on writes", async (t) => {
+test("Studio Server settings API requires authentication and CSRF on writes", async (t) => {
   const directory = await mkdtemp(join(tmpdir(), "hermes-studio-settings-server-"));
   t.after(() => rm(directory, { recursive: true, force: true }));
   const global = new OfficeGlobalSettingsStore(join(directory, "global.json"));
@@ -33,7 +33,7 @@ test("Office Server settings API requires authentication and CSRF on writes", as
     settings: () => settings,
     globalSettings: () => global,
   };
-  const server = createOfficeServer({
+  const server = createStudioServer({
     port: 0,
     runtimeSource: runtime,
     allowedOrigins: ["http://localhost:4173"],
@@ -224,7 +224,7 @@ test("raw memory file GETs map to memory.update and are denied without that auth
   const remoteToken = "settings-memory-auth-token-with-32chars!"; // gitleaks:allow -- synthetic auth fixture
   const remoteOrigin = "https://office.tailnet.example";
   const localOrigin = "http://localhost:4173";
-  const server = createOfficeServer({
+  const server = createStudioServer({
     port: 0,
     runtimeSource: runtime,
     allowedOrigins: [localOrigin, remoteOrigin],

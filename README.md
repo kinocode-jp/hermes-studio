@@ -95,7 +95,7 @@ docs                     Design and integration documentation
 
 ## Requirements
 
-- Node.js/npm versions from `.node-version` and `package.json` (**Node.js 22.x** is required for the desktop launcher’s managed Office Server)
+- Node.js/npm versions from `.node-version` and `package.json` (**Node.js 22.x** is required for the desktop launcher’s managed Studio Server)
 - Hermes Agent installed for the same OS user (`hermes --version` must report a valid Hermes Agent semantic version). Studio does not pin a particular Hermes Agent release; API response shapes are still validated at runtime. The desktop shell looks for absolute, user-owned binaries under paths such as `~/.hermes/node/bin/node`, `~/.local/bin/hermes`, Homebrew, nvm/fnm/asdf Node 22 installs, and optional overrides `HERMES_STUDIO_NODE` / `HERMES_STUDIO_HERMES_EXECUTABLE`
 - Rust toolchain from `rust-toolchain.toml` and the Tauri host prerequisites
   when developing the desktop shell
@@ -114,11 +114,11 @@ npm ci
 npm run dev
 ```
 
-This starts the PWA on port `4173` and Office Server on port `4317`. By default,
-Office Server starts a managed stock `hermes serve` process on an OS-selected
+This starts the PWA on port `4173` and Studio Server on port `4317`. By default,
+Studio Server starts a managed stock `hermes serve` process on an OS-selected
 loopback port. The development command explicitly allows the two Vite origins;
 production does not trust port `4173`. The Hermes backend credential stays in
-Office Server.
+Studio Server.
 
 Run surfaces individually with:
 
@@ -180,7 +180,7 @@ npm run start:tailnet
 To launch the installed macOS desktop app and have its single owned Office
 Server serve both the desktop WebView and Tailnet browsers, quit the app fully
 and use `npm run start:tailnet:desktop` with the same token environment. This
-avoids running a second Office Server or moving the desktop app to another port.
+avoids running a second Studio Server or moving the desktop app to another port.
 The first integrated launch stores the validated remote configuration in macOS
 Keychain; subsequent Finder or Dock launches restore it automatically. Use
 `npm run forget:tailnet:desktop` to make future icon launches local-only.
@@ -209,7 +209,7 @@ Full operator steps, fail-closed conditions, and day-2 operations are in
 Hermes Studio is web-first: the shared web UI is the primary interface. The
 optional Tauri desktop shell is a **one-click local launcher**: click the app,
 and when port `4317` is free and the managed runtimes are present it starts an
-owned Office Server child, proves readiness, then opens the packaged Web UI.
+owned Studio Server child, proves readiness, then opens the packaged Web UI.
 You should not need a separate terminal or `npm start` for normal desktop use.
 
 ### Prerequisites for “click and run”
@@ -217,7 +217,7 @@ You should not need a separate terminal or `npm start` for normal desktop use.
 | Component | Bundled in `.app`? | Required on the machine |
 | --- | --- | --- |
 | Web UI assets | Yes (Tauri `frontendDist`) | No |
-| Office Server JS | Yes (`resources/server/hermes-studio-server.mjs`) | No |
+| Studio Server JS | Yes (`resources/server/hermes-studio-server.mjs`) | No |
 | Optional same-origin web copy for browser use of `:4317` | Yes when built via `npm run build:desktop-assets` (`resources/web`) | No |
 | Node.js **22.x** | **No** (not redistributed) | **Yes** — preferred `~/.hermes/node/bin/node` |
 | Hermes Agent | **No** (not redistributed) | **Yes** — preferred `~/.local/bin/hermes`; no release pin |
@@ -269,7 +269,7 @@ port 4317.
 Diagnostic logs scrub remote tokens and desktop capabilities. They do not replace
 Hermes’ own logging.
 
-Remote access is implemented by the Office Server and the web UI; the desktop
+Remote access is implemented by the Studio Server and the web UI; the desktop
 shell is not a relay and is not required on remote client devices.
 
 ## Security status
@@ -380,8 +380,9 @@ devices, session cookies, proof verification, and signed/installed desktop
 bundles remain compatible. Browser storage keys use `hermes-studio…` with a
 dual-read of matching `hermes-office…` keys where needed.
 
-“Office” in feature names (Office Server, Office Teams, office floor, and so on)
-refers to the in-product workspace model and is not a leftover product brand.
+Studio Server is the runtime/control-plane name. “Office” remains only in
+workspace feature names such as Office Teams and office floor; it refers to the
+in-product workspace model and is not a leftover product brand.
 
 ## Documentation
 

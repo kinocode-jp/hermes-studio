@@ -8,8 +8,8 @@ import { promisify } from "node:util";
 
 const execFileAsync = promisify(execFile);
 
-const OFFICE_PORT = 4317;
-const LOOPBACK_TARGET = `http://127.0.0.1:${OFFICE_PORT}`;
+const STUDIO_SERVER_PORT = 4317;
+const LOOPBACK_TARGET = `http://127.0.0.1:${STUDIO_SERVER_PORT}`;
 const MIN_TOKEN_LENGTH = 32;
 const MAX_TOKEN_LENGTH = 4_096;
 const SERVE_HTTPS_PORT = "443";
@@ -37,7 +37,7 @@ const LEGACY_ENV_SUFFIXES = [
   "REMOTE_PRIVILEGED",
 ];
 
-const officeLauncher = fileURLToPath(new URL("./start-studio.mjs", import.meta.url));
+const studioLauncher = fileURLToPath(new URL("./start-studio.mjs", import.meta.url));
 const webIndex = fileURLToPath(new URL("../apps/web/dist/index.html", import.meta.url));
 const serverEntry = fileURLToPath(new URL("../apps/server/dist/index.js", import.meta.url));
 
@@ -46,7 +46,7 @@ function launchTarget() {
   if (args.length === 0) return "office";
   if (args.length === 1 && args[0] === DESKTOP_ARGUMENT) return "desktop";
   if (args.length === 1 && args[0] === FORGET_DESKTOP_ARGUMENT) return "forget-desktop";
-  fail(`unsupported arguments. Use no arguments for Office Server, ${DESKTOP_ARGUMENT} for the installed desktop app, or ${FORGET_DESKTOP_ARGUMENT} to remove its saved remote configuration.`);
+  fail(`unsupported arguments. Use no arguments for Studio Server, ${DESKTOP_ARGUMENT} for the installed desktop app, or ${FORGET_DESKTOP_ARGUMENT} to remove its saved remote configuration.`);
 }
 
 function fail(message) {
@@ -191,7 +191,7 @@ async function discoverCanonicalOrigin() {
 }
 
 /**
- * Preserve a single canonical remote Office URL.
+ * Preserve a single canonical remote Studio Server URL.
  * Valid loopback origins may remain. Any pre-existing non-loopback remote origin
  * that differs from the host-derived canonical Tailscale HTTPS origin is rejected
  * (not merged). The canonical origin is always present in the result.
@@ -272,7 +272,7 @@ function validateHostBinding() {
   const host = process.env.HERMES_STUDIO_HOST ?? "127.0.0.1";
   if (!isLoopbackHost(host)) {
     fail(
-      `HERMES_STUDIO_HOST=${host} is not loopback. Private Tailnet deployment requires the Office listener on 127.0.0.1 (or ::1/localhost) behind Tailscale Serve.`,
+      `HERMES_STUDIO_HOST=${host} is not loopback. Private Tailnet deployment requires the Studio Server listener on 127.0.0.1 (or ::1/localhost) behind Tailscale Serve.`,
     );
   }
 
@@ -281,13 +281,13 @@ function validateHostBinding() {
     // Require a canonical base-10 integer string (reject "4317junk", "4317.5", etc.).
     if (!/^(?:0|[1-9]\d*)$/u.test(portRaw)) {
       fail(
-        `HERMES_STUDIO_PORT must be ${OFFICE_PORT} for start:tailnet (Serve is fixed to ${LOOPBACK_TARGET}). Unset it or set it to ${OFFICE_PORT}.`,
+        `HERMES_STUDIO_PORT must be ${STUDIO_SERVER_PORT} for start:tailnet (Serve is fixed to ${LOOPBACK_TARGET}). Unset it or set it to ${STUDIO_SERVER_PORT}.`,
       );
     }
     const port = Number(portRaw);
-    if (!Number.isSafeInteger(port) || port !== OFFICE_PORT) {
+    if (!Number.isSafeInteger(port) || port !== STUDIO_SERVER_PORT) {
       fail(
-        `HERMES_STUDIO_PORT must be ${OFFICE_PORT} for start:tailnet (Serve is fixed to ${LOOPBACK_TARGET}). Unset it or set it to ${OFFICE_PORT}.`,
+        `HERMES_STUDIO_PORT must be ${STUDIO_SERVER_PORT} for start:tailnet (Serve is fixed to ${LOOPBACK_TARGET}). Unset it or set it to ${STUDIO_SERVER_PORT}.`,
       );
     }
   }
@@ -326,9 +326,9 @@ async function assertProductionAssets() {
   }
 
   try {
-    await access(officeLauncher, constants.R_OK);
+    await access(studioLauncher, constants.R_OK);
   } catch {
-    fail(`production launcher is missing at ${officeLauncher}.`);
+    fail(`production launcher is missing at ${studioLauncher}.`);
   }
 }
 
@@ -369,7 +369,7 @@ async function assertDesktopApplication(executable) {
 
 /**
  * A running desktop app would attach to its existing local-only child instead
- * of starting a new remote-enabled child. Require a free Office port before
+ * of starting a new remote-enabled child. Require a free Studio Server port before
  * launching the desktop target so that failure mode is explicit.
  */
 async function assertDesktopOfficePortAvailable() {
@@ -379,16 +379,16 @@ async function assertDesktopOfficePortAvailable() {
     probe.once("error", (error) => {
       if (error && typeof error === "object" && "code" in error && error.code === "EADDRINUSE") {
         fail(
-          `port ${OFFICE_PORT} is already in use. Quit Hermes Studio completely (closing its window is not enough on macOS), confirm ${LOOPBACK_TARGET} is no longer serving, and retry.`,
+          `port ${STUDIO_SERVER_PORT} is already in use. Quit Hermes Studio completely (closing its window is not enough on macOS), confirm ${LOOPBACK_TARGET} is no longer serving, and retry.`,
         );
       }
       const message = error instanceof Error ? error.message : String(error);
-      fail(`could not verify that port ${OFFICE_PORT} is available before desktop launch: ${message}`);
+      fail(`could not verify that port ${STUDIO_SERVER_PORT} is available before desktop launch: ${message}`);
     });
-    probe.listen({ host: "127.0.0.1", port: OFFICE_PORT, exclusive: true }, () => {
+    probe.listen({ host: "127.0.0.1", port: STUDIO_SERVER_PORT, exclusive: true }, () => {
       probe.close((error) => {
         if (error) {
-          fail(`could not release the port ${OFFICE_PORT} preflight listener: ${error.message}`);
+          fail(`could not release the port ${STUDIO_SERVER_PORT} preflight listener: ${error.message}`);
         }
         resolve();
       });
@@ -622,7 +622,7 @@ function printOperatorGuidance(canonicalOrigin, trustedProxyHops, allowedOrigins
     "",
     target === "desktop"
       ? "Starting Hermes Studio desktop app with the remote configuration…"
-      : "Starting production Office launcher…",
+      : "Starting production Studio launcher…",
     "",
   ];
   process.stdout.write(`${lines.join("\n")}\n`);
@@ -659,7 +659,7 @@ function startChild(executable, args, description) {
 }
 
 function startOffice() {
-  startChild(process.execPath, [officeLauncher], "production Office launcher");
+  startChild(process.execPath, [studioLauncher], "production Studio launcher");
 }
 
 function startDesktop(executable) {
@@ -692,7 +692,7 @@ async function main() {
   process.env.HERMES_STUDIO_ALLOWED_ORIGINS = allowedOrigins.join(",");
   // Keep the default listener explicit for the child without writing any secrets.
   process.env.HERMES_STUDIO_HOST ||= "127.0.0.1";
-  process.env.HERMES_STUDIO_PORT ||= String(OFFICE_PORT);
+  process.env.HERMES_STUDIO_PORT ||= String(STUDIO_SERVER_PORT);
   // Tailscale-only path: intentionally enable remote owner privileged settings
   // and one-shot secret deposit over authenticated HTTPS. Default is off for all
   // other launchers. Tailscale is the network boundary; Office owner auth remains mandatory.

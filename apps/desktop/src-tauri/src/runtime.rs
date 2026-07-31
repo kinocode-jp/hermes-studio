@@ -302,9 +302,9 @@ pub(crate) fn inherit_safe_environment(command: &mut Command) {
     }
 }
 
-/// Office host configuration is only meaningful to the Office server child.
+/// Studio Server host configuration is only meaningful to the Studio Server child.
 /// Preserve it across env_clear without forwarding it to Hermes runtimes.
-pub(crate) fn inherit_office_remote_environment(
+pub(crate) fn inherit_studio_server_remote_environment(
     command: &mut Command,
     lookup: impl Fn(&str) -> Option<OsString>,
 ) {

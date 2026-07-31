@@ -378,6 +378,7 @@ function mapSessions(rows: Record<string, unknown>[]): MappingResult<ChatSession
       const conversationKind = readString(row, "conversation_kind") === "delegated" ? "delegated" as const : undefined;
       const delegationTaskId = safeIdentifier(readString(row, "delegation_task_id"), SESSION_ID_PATTERN);
       const delegatedByProfileId = safeIdentifier(readString(row, "delegated_by_profile"), PROFILE_PATTERN);
+      const projectGroup = sessionProjectGroup(row);
       items.push({
         id,
         profileId: profile,
@@ -386,6 +387,7 @@ function mapSessions(rows: Record<string, unknown>[]): MappingResult<ChatSession
         createdAt,
         updatedAt,
         ...(preview === undefined ? {} : { lastMessagePreview: preview }),
+        ...(projectGroup === undefined ? {} : projectGroup),
         ...(conversationKind === undefined ? {} : { conversationKind }),
         ...(delegationTaskId === undefined ? {} : { delegationTaskId }),
         ...(delegatedByProfileId === undefined ? {} : { delegatedByProfileId }),
@@ -393,6 +395,22 @@ function mapSessions(rows: Record<string, unknown>[]): MappingResult<ChatSession
     } catch { failures += 1; }
   }
   return { items, failures };
+}
+
+/**
+ * Convert Hermes' persisted git root/cwd into browser-safe grouping metadata.
+ * The host path is hashed for identity and only its final segment is exposed.
+ */
+function sessionProjectGroup(row: Record<string, unknown>): Pick<ChatSessionSummary, "projectGroupId" | "projectGroupName"> | undefined {
+  const rawPath = readString(row, "git_repo_root")?.trim() || readString(row, "cwd")?.trim();
+  if (!rawPath || rawPath.includes("\0")) return undefined;
+  const normalized = rawPath.replace(/\\/g, "/").replace(/\/+$/, "");
+  const name = safeInventoryText(normalized.split("/").filter(Boolean).at(-1), 120);
+  if (!name) return undefined;
+  return {
+    projectGroupId: createHash("sha256").update(normalized).digest("base64url").slice(0, 24),
+    projectGroupName: name,
+  };
 }
 
 function safeInventoryText(value: string | undefined, maxChars: number): string | undefined {

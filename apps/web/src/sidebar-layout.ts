@@ -17,6 +17,7 @@ type SidebarPreferences = {
   teamsOpen: boolean;
   profilesOpen: boolean;
   openProfileIds: string[];
+  openProjectIds: string[];
 };
 
 const initial = readPreferences();
@@ -27,6 +28,7 @@ export const sidebarTasksOpen = signal(initial.tasksOpen);
 export const sidebarTeamsOpen = signal(initial.teamsOpen);
 export const sidebarProfilesOpen = signal(initial.profilesOpen);
 export const sidebarOpenProfileIds = signal<string[]>(initial.openProfileIds);
+export const sidebarOpenProjectIds = signal<string[]>(initial.openProjectIds);
 
 export function previewSidebarWidth(width: number): void {
   sidebarWidth.value = clampSidebarWidth(width);
@@ -77,6 +79,19 @@ export function toggleSidebarProfileOpen(profileId: string): void {
   setSidebarProfileOpen(profileId, !isSidebarProfileOpen(profileId));
 }
 
+export function isSidebarProjectOpen(projectId: string): boolean {
+  return sidebarOpenProjectIds.value.includes(projectId);
+}
+
+export function toggleSidebarProjectOpen(projectId: string): void {
+  const key = projectId.trim();
+  if (!key) return;
+  sidebarOpenProjectIds.value = sidebarOpenProjectIds.value.includes(key)
+    ? sidebarOpenProjectIds.value.filter((id) => id !== key)
+    : [...sidebarOpenProjectIds.value, key];
+  persistPreferences();
+}
+
 export function isSidebarIconOnly(width = sidebarWidth.value): boolean {
   return width <= SIDEBAR_ICON_THRESHOLD;
 }
@@ -95,6 +110,7 @@ function readPreferences(): SidebarPreferences {
     // On phones the profile sheet overlays the whole screen, so it starts closed.
     profilesOpen: !isPhoneViewport(),
     openProfileIds: [],
+    openProjectIds: [],
   };
   if (typeof localStorage === "undefined") return fallback;
   try {
@@ -108,6 +124,9 @@ function readPreferences(): SidebarPreferences {
       openProfileIds: Array.isArray(parsed?.openProfileIds)
         ? parsed.openProfileIds.filter((id): id is string => typeof id === "string" && id.trim().length > 0)
         : fallback.openProfileIds,
+      openProjectIds: Array.isArray(parsed?.openProjectIds)
+        ? parsed.openProjectIds.filter((id): id is string => typeof id === "string" && id.trim().length > 0)
+        : fallback.openProjectIds,
     };
   } catch {
     return fallback;
@@ -124,6 +143,7 @@ function persistPreferences(): void {
       teamsOpen: sidebarTeamsOpen.value,
       profilesOpen: sidebarProfilesOpen.value,
       openProfileIds: sidebarOpenProfileIds.value,
+      openProjectIds: sidebarOpenProjectIds.value,
     } satisfies SidebarPreferences));
   } catch {
     // The sidebar remains usable when storage is unavailable.

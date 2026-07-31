@@ -9,7 +9,7 @@ goals. It is not a claim that every roadmap security control exists.
 
 ```text
 Tauri WebView ─┐
-Browser / PWA ─┼── HTTP + WebSocket ── Office Server ── loopback ── Hermes Agent
+Browser / PWA ─┼── HTTP + WebSocket ── Studio Server ── loopback ── Hermes Agent
                │                         │
                └── same Preact UI        ├── global settings state
                                          ├── Office teams (profile groups)
@@ -32,10 +32,10 @@ prune assignments. Malformed stored slot data is compacted before use.
 A profile can override its portrait with browser-local
 image data.
 
-The interface talks to Office Server, not directly to Hermes. Hermes backend
+The interface talks to Studio Server, not directly to Hermes. Hermes backend
 tokens and backend URLs are not part of the public browser DTOs.
 
-### Office Server
+### Studio Server
 
 `apps/server` is a Node.js HTTP/WebSocket process. It:
 
@@ -72,7 +72,7 @@ the explicit host environment or, for integrated macOS desktop launches, a
 validated encrypted Keychain item. Explicit environment values take precedence
 over the stored desktop fallback as one deployment configuration; stored and
 explicit remote fields are never mixed. The desktop or Node launchers pass these
-values only to the Office server child; they are not forwarded to the managed
+values only to the Studio Server child; they are not forwarded to the managed
 Hermes Agent runtime. The optional
 `npm run start:tailnet` entry point (`scripts/start-tailnet.mjs`) discovers the
 host Tailscale MagicDNS name, enforces the single canonical HTTPS origin
@@ -80,7 +80,7 @@ host Tailscale MagicDNS name, enforces the single canonical HTTPS origin
 trusted proxy hops for Serve, creates private Tailscale Serve to loopback port
 4317 only when empty or already exact (never overwriting a different Serve
 config; production assets preflighted first), and then starts the production
-Office launcher—without Funnel, LAN binding, a second URL, or browser endpoint
+Studio launcher—without Funnel, LAN binding, a second URL, or browser endpoint
 switching. Operator documentation: [`TAILSCALE.md`](TAILSCALE.md). The server exposes an owner-only
 `/api/v1/host/remote` endpoint that reports the canonical configured HTTPS
 origin(s), trusted proxy-hop count, and device metadata without returning the
@@ -150,14 +150,14 @@ Chat can use an explicitly selected Profile. Settings endpoints that are
 process-scoped are routed through a lazily created Profile-pinned backend.
 
 Managed mode starts a user-installed Hermes executable and supervises it. The
-desktop shell starts the bundled Office Server JavaScript using a Node runtime
+desktop shell starts the bundled Studio Server JavaScript using a Node runtime
 available on the machine. These are local runtime integrations, not bundled,
 signed Hermes or Node distributions. The desktop launcher discovers absolute,
 user-owned Node 22.x and Hermes Agent binaries (including common
 Homebrew/nvm/fnm/asdf layouts and `HERMES_STUDIO_NODE` /
 `HERMES_STUDIO_HERMES_EXECUTABLE` overrides), writes a secret-scrubbed diagnostic
 log under `~/Library/Logs/HermesStudio/` (macOS) or `~/.hermes-studio/logs/`, and
-captures owned Office Server child stdout/stderr there in release builds so
+captures owned Studio Server child stdout/stderr there in release builds so
 startup failures are diagnosable without discarding process output.
 
 Host application installation is a separate fixed-function boundary. The
@@ -185,11 +185,11 @@ The exact upstream research and known compatibility uncertainties are in
 ### Desktop shell
 
 `apps/desktop` is a small Tauri 2 wrapper intended as a **click-to-run local
-launcher**. Production builds bundle the generated Office Server module and web
+launcher**. Production builds bundle the generated Studio Server module and web
 assets (WebView `frontendDist` plus optional `resources/web` for same-origin
 browser access to `:4317`). At launch, the desktop shell probes the configured
 loopback port. If the port is free, release and development launches both
-generate a launch-scoped random desktop capability, start an owned Office Server
+generate a launch-scoped random desktop capability, start an owned Studio Server
 child, verify its health and a capability-keyed proof, open the packaged Web UI,
 and stop only that child on exit. If Node/Hermes or bundle resources are missing,
 or the child fails readiness, the shell keeps a fixed notice with concrete

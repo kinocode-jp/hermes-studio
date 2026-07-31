@@ -6,8 +6,8 @@ use std::{
 };
 
 use crate::constants::MAX_WEB_UI_RESPONSE;
-use crate::server::classify_office_startup;
-use crate::startup::{OfficeStartup, StartupProbeError};
+use crate::server::classify_studio_server_startup;
+use crate::startup::{StudioServerStartup, StartupProbeError};
 
 #[test]
 fn classify_free_port_allows_startup() {
@@ -17,63 +17,63 @@ fn classify_free_port_allows_startup() {
     drop(listener);
 
     assert_eq!(
-        classify_office_startup(actual).expect("free port should classify"),
-        OfficeStartup::PortFree
+        classify_studio_server_startup(actual).expect("free port should classify"),
+        StudioServerStartup::PortFree
     );
 }
 
 #[test]
 fn classify_compatible_existing_server_as_unauthenticated_candidate() {
-    let address = bind_office_server(
+    let address = bind_studio_server(
         "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{\"ok\":true,\"protocolVersion\":1,\"runtime\":\"ready\"}",
         "HTTP/1.1 200 OK\r\ncontent-type: Text/HTML; charset=utf-8\r\n\r\n<!doctype html><html><head><title>Hermes Studio</title></head><body><div id=\"app\"></div></body></html>",
     );
     assert_eq!(
-        classify_office_startup(address).expect("compatible candidate should classify"),
-        OfficeStartup::CompatibleCandidate
+        classify_studio_server_startup(address).expect("compatible candidate should classify"),
+        StudioServerStartup::CompatibleCandidate
     );
 }
 
 #[test]
 fn classify_compatible_health_without_root_web_ui_rejects() {
-    let address = bind_office_server(
+    let address = bind_studio_server(
         "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{\"ok\":true,\"protocolVersion\":1,\"runtime\":\"ready\"}",
         "HTTP/1.1 404 Not Found\r\nContent-Type: text/plain\r\n\r\nnot found",
     );
-    let error = classify_office_startup(address)
+    let error = classify_studio_server_startup(address)
         .expect_err("a health-only server must not be treated as attachable");
     assert!(error.to_string().contains("not the expected Hermes Studio Web UI shape"));
 }
 
 #[test]
 fn classify_compatible_health_with_non_html_root_rejects() {
-    let address = bind_office_server(
+    let address = bind_studio_server(
         "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{\"ok\":true,\"protocolVersion\":1,\"runtime\":\"ready\"}",
         "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{\"title\":\"Hermes Studio\",\"id\":\"app\"}",
     );
-    let error = classify_office_startup(address)
+    let error = classify_studio_server_startup(address)
         .expect_err("a non-HTML root must not be treated as attachable");
     assert!(error.to_string().contains("not the expected Hermes Studio Web UI shape"));
 }
 
 #[test]
 fn classify_compatible_health_with_unrelated_html_rejects() {
-    let address = bind_office_server(
+    let address = bind_studio_server(
         "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{\"ok\":true,\"protocolVersion\":1,\"runtime\":\"ready\"}",
         "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n<!doctype html><html><head><title>Other App</title></head><body><div id=\"app\"></div></body></html>",
     );
-    let error = classify_office_startup(address)
+    let error = classify_studio_server_startup(address)
         .expect_err("unrelated HTML must not be treated as Hermes Studio");
     assert!(error.to_string().contains("not the expected Hermes Studio Web UI shape"));
 }
 
 #[test]
 fn classify_compatible_health_with_malformed_root_rejects() {
-    let address = bind_office_server(
+    let address = bind_studio_server(
         "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{\"ok\":true,\"protocolVersion\":1,\"runtime\":\"ready\"}",
         "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n<!doctype html><title>Hermes Studio</title><div id=\"app\"></div>",
     );
-    let error = classify_office_startup(address)
+    let error = classify_studio_server_startup(address)
         .expect_err("a malformed root response must not be attachable");
     assert!(error.to_string().contains("not the expected Hermes Studio Web UI shape"));
 }
@@ -83,8 +83,8 @@ fn classify_listener_with_only_protocol_version_rejects() {
     let address = bind_health_server(
         "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{\"protocolVersion\":1}",
     );
-    let error = classify_office_startup(address)
-        .expect_err("an incomplete health contract must not be treated as Office Server");
+    let error = classify_studio_server_startup(address)
+        .expect_err("an incomplete health contract must not be treated as Studio Server");
     assert!(error.to_string().contains("malformed"));
 }
 
@@ -93,7 +93,7 @@ fn classify_incompatible_existing_server_rejects() {
     let address = bind_health_server(
         "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{\"ok\":true,\"protocolVersion\":2,\"runtime\":\"ready\"}",
     );
-    let error = classify_office_startup(address).expect_err("incompatible server should error");
+    let error = classify_studio_server_startup(address).expect_err("incompatible server should error");
     assert!(error.to_string().contains("incompatible protocol version"));
 }
 
@@ -101,7 +101,7 @@ fn classify_incompatible_existing_server_rejects() {
 fn classify_malformed_health_response_rejects() {
     let address =
         bind_health_server("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\nnot-json");
-    let error = classify_office_startup(address).expect_err("malformed health should error");
+    let error = classify_studio_server_startup(address).expect_err("malformed health should error");
     assert!(error.to_string().contains("malformed"));
 }
 
@@ -110,7 +110,7 @@ fn classify_nonnumeric_protocol_version_rejects_malformed() {
     let address = bind_health_server(
         "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{\"ok\":true,\"protocolVersion\":\"1\",\"runtime\":\"ready\"}",
     );
-    let error = classify_office_startup(address).expect_err("nonnumeric version should error");
+    let error = classify_studio_server_startup(address).expect_err("nonnumeric version should error");
     assert!(error.to_string().contains("malformed"));
 }
 
@@ -119,7 +119,7 @@ fn classify_other_service_rejects() {
     let address = bind_health_server(
         "HTTP/1.1 404 Not Found\r\nContent-Type: text/plain\r\n\r\nnot found",
     );
-    let error = classify_office_startup(address).expect_err("other service should error");
+    let error = classify_studio_server_startup(address).expect_err("other service should error");
     assert!(error.to_string().contains("not recognized as Hermes Studio"));
 }
 
@@ -127,7 +127,7 @@ fn bind_health_server(response: &'static str) -> SocketAddr {
     bind_http_server(vec![response])
 }
 
-fn bind_office_server(health_response: &'static str, root_response: &'static str) -> SocketAddr {
+fn bind_studio_server(health_response: &'static str, root_response: &'static str) -> SocketAddr {
     bind_http_server(vec![health_response, root_response])
 }
 
@@ -154,7 +154,7 @@ fn serve_one_response(listener: &TcpListener, response: &[u8]) {
 #[test]
 fn classify_compatible_health_with_oversized_root_rejects() {
     let listener = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
-        .expect("bind temporary Office server");
+        .expect("bind temporary Studio Server");
     let address = listener.local_addr().expect("local address");
     thread::spawn(move || {
         let health = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{\"ok\":true,\"protocolVersion\":1,\"runtime\":\"ready\"}";
@@ -162,7 +162,7 @@ fn classify_compatible_health_with_oversized_root_rejects() {
         let oversized = vec![b'x'; MAX_WEB_UI_RESPONSE + 1];
         serve_one_response(&listener, &oversized);
     });
-    let error = classify_office_startup(address)
+    let error = classify_studio_server_startup(address)
         .expect_err("an oversized root response must not be attachable");
     assert!(error.to_string().contains("not the expected Hermes Studio Web UI shape"));
 }
@@ -180,7 +180,7 @@ fn classify_stalling_health_response_is_timeout() {
         let _ = stream.read(&mut buffer);
         thread::sleep(Duration::from_millis(800));
     });
-    let error = classify_office_startup(address).expect_err("stalling server should error");
+    let error = classify_studio_server_startup(address).expect_err("stalling server should error");
     assert_eq!(error, StartupProbeError::Timeout);
 }
 
@@ -202,7 +202,7 @@ fn classify_slow_drip_health_response_obeys_absolute_deadline() {
     });
 
     let started = Instant::now();
-    let error = classify_office_startup(address)
+    let error = classify_studio_server_startup(address)
         .expect_err("a slow-drip response must not extend the probe indefinitely");
     let elapsed = started.elapsed();
 
@@ -216,7 +216,7 @@ fn classify_slow_drip_health_response_obeys_absolute_deadline() {
 #[test]
 fn classify_stalling_root_response_is_web_ui_timeout() {
     let listener = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
-        .expect("bind temporary Office server");
+        .expect("bind temporary Studio Server");
     let address = listener.local_addr().expect("local address");
     thread::spawn(move || {
         let health = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{\"ok\":true,\"protocolVersion\":1,\"runtime\":\"ready\"}";
@@ -228,7 +228,7 @@ fn classify_stalling_root_response_is_web_ui_timeout() {
     });
 
     let started = Instant::now();
-    let error = classify_office_startup(address)
+    let error = classify_studio_server_startup(address)
         .expect_err("a stalling Web UI must not extend the probe indefinitely");
     let elapsed = started.elapsed();
 
