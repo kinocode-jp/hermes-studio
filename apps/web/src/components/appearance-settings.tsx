@@ -3,20 +3,28 @@ import {
   activeFontScale,
   activeTheme,
   fontScales,
+  richLinkPreviewsEnabled,
   setFontScale,
+  setRichLinkPreviewsEnabled,
   setTheme,
   themes,
   type Theme,
 } from "../appearance";
-import { locale } from "../i18n";
+import { t, type TranslationKey } from "../i18n";
 import { InfoTip } from "./info-tip";
 import { canRestoreModalFocus, hasOpenModal, isTopmostModal, registerModal } from "../modal-layer";
 import { resetWorkspaceLayout, setWorkspacePlacement, workspacePlacement, workspacePlacements, type WorkspacePlacement } from "../workspace-layout";
 
-const themeDetails: Record<Theme, { name: string; ja: string; en: string }> = {
-  paper: { name: "Paper", ja: "白", en: "Pure white" },
-  mint: { name: "Mint", ja: "やさしい緑", en: "Soft green" },
-  midnight: { name: "Midnight", ja: "ダーク", en: "Dark" },
+const themeDetailKeys: Record<Theme, TranslationKey> = {
+  paper: "appearance.theme.paper",
+  mint: "appearance.theme.mint",
+  midnight: "appearance.theme.midnight",
+};
+
+const themeNames: Record<Theme, string> = {
+  paper: "Paper",
+  mint: "Mint",
+  midnight: "Midnight",
 };
 
 export function AppearanceSettings() {
@@ -25,28 +33,6 @@ export function AppearanceSettings() {
   const panel = useRef<HTMLElement>(null);
   const previousFocus = useRef<HTMLElement | null>(null);
   const restoreFocusTimer = useRef<number | undefined>(undefined);
-  const isJapanese = locale.value === "ja";
-  const copy = isJapanese ? {
-    trigger: "表示設定",
-    close: "閉じる",
-    title: "表示",
-    theme: "テーマ",
-    textSize: "文字サイズ",
-    hint: "文字の大きさとペイン配置をこの端末向けに保存します。",
-    layout: "チャット欄の配置",
-    reset: "デフォルトに戻す",
-    resetDone: "表示レイアウトをデフォルトに戻しました。",
-  } : {
-    trigger: "Appearance settings",
-    close: "Close",
-    title: "Appearance",
-    theme: "Theme",
-    textSize: "Text size",
-    hint: "Text size and pane layout are saved on this device.",
-    layout: "Chat placement",
-    reset: "Restore defaults",
-    resetDone: "The display layout was restored to its defaults.",
-  };
 
   useEffect(() => {
     window.clearTimeout(restoreFocusTimer.current);
@@ -58,7 +44,7 @@ export function AppearanceSettings() {
       if (!isTopmostModal(panel.current)) return;
       if (event.key === "Escape") { event.preventDefault(); setOpen(false); return; }
       if (event.key !== "Tab") return;
-      const controls = [...(panel.current?.querySelectorAll<HTMLElement>('button, [tabindex]:not([tabindex="-1"])') ?? [])];
+      const controls = [...(panel.current?.querySelectorAll<HTMLElement>('button, input, [tabindex]:not([tabindex="-1"])') ?? [])];
       if (controls.length === 0) return;
       const first = controls[0]!;
       const last = controls[controls.length - 1]!;
@@ -83,7 +69,8 @@ export function AppearanceSettings() {
       <button
         class={`appearance-trigger ${open ? "is-open" : ""}`}
         type="button"
-        aria-label={copy.trigger}
+        aria-label={t("appearance.trigger")}
+        title={t("appearance.trigger")}
         aria-expanded={open}
         aria-controls="appearance-panel"
         onClick={() => setOpen((current) => current ? false : hasOpenModal() ? false : true)}
@@ -93,19 +80,19 @@ export function AppearanceSettings() {
 
       {open && (
         <>
-          <button class="appearance-scrim" data-modal-affordance="true" type="button" aria-label={copy.close} onPointerDown={() => setOpen(false)} onClick={() => setOpen(false)} />
+          <button class="appearance-scrim" data-modal-affordance="true" type="button" aria-label={t("common.close")} onPointerDown={() => setOpen(false)} onClick={() => setOpen(false)} />
           <aside ref={panel} id="appearance-panel" class="appearance-panel" role="dialog" aria-modal="true" aria-labelledby="appearance-title">
             <header>
               <div>
-                <p>DISPLAY CONSOLE</p>
-                <h2 id="appearance-title">{copy.title} <span>{isJapanese ? "/ Appearance" : "/ 表示"}</span></h2>
+                <p>{t("appearance.kicker")}</p>
+                <h2 id="appearance-title">{t("appearance.title")} <span>/ {t("appearance.titleAlt")}</span></h2>
               </div>
-              <button type="button" aria-label={copy.close} onPointerDown={() => setOpen(false)} onClick={() => setOpen(false)}>×</button>
+              <button type="button" aria-label={t("common.close")} onPointerDown={() => setOpen(false)} onClick={() => setOpen(false)}>×</button>
             </header>
 
             <section aria-labelledby="theme-heading">
               <div class="appearance-section-title">
-                <h3 id="theme-heading">{copy.theme}</h3>
+                <h3 id="theme-heading">{t("appearance.theme")}</h3>
                 <small>{activeTheme.value}</small>
               </div>
               <div class="theme-choices">
@@ -118,8 +105,8 @@ export function AppearanceSettings() {
                     onClick={() => setTheme(theme)}
                   >
                     <i aria-hidden="true"><span /><span /><span /></i>
-                    <b>{themeDetails[theme].name}</b>
-                    <small>{isJapanese ? themeDetails[theme].ja : themeDetails[theme].en}</small>
+                    <b>{themeNames[theme]}</b>
+                    <small>{t(themeDetailKeys[theme])}</small>
                   </button>
                 ))}
               </div>
@@ -128,12 +115,12 @@ export function AppearanceSettings() {
             <section aria-labelledby="font-heading">
               <div class="appearance-section-title">
                 <div class="heading-info-group">
-                  <h3 id="font-heading">{copy.textSize}</h3>
-                  <InfoTip text={copy.hint} align="start" />
+                  <h3 id="font-heading">{t("appearance.textSize")}</h3>
+                  <InfoTip text={t("appearance.hint")} align="start" />
                 </div>
                 <output>{Math.round(activeFontScale.value * 100)}%</output>
               </div>
-              <div class="font-size-choices" role="group" aria-label={copy.textSize}>
+              <div class="font-size-choices" role="group" aria-label={t("appearance.textSize")}>
                 {fontScales.map((scale) => (
                   <button
                     key={scale}
@@ -151,18 +138,18 @@ export function AppearanceSettings() {
 
             <section aria-labelledby="layout-heading">
               <div class="appearance-section-title">
-                <h3 id="layout-heading">{copy.layout}</h3>
-                <small>{placementLabel(workspacePlacement.value, isJapanese)}</small>
+                <h3 id="layout-heading">{t("appearance.layout")}</h3>
+                <small>{placementLabel(workspacePlacement.value)}</small>
               </div>
-              <div class="layout-placement-choices" role="group" aria-label={copy.layout}>
+              <div class="layout-placement-choices" role="group" aria-label={t("appearance.layout")}>
                 {workspacePlacements.map((placement) => (
                   <button
                     key={placement}
                     type="button"
                     class={workspacePlacement.value === placement ? "is-active" : ""}
                     aria-pressed={workspacePlacement.value === placement}
-                    aria-label={placementLabel(placement, isJapanese)}
-                    title={placementLabel(placement, isJapanese)}
+                    aria-label={placementLabel(placement)}
+                    title={placementLabel(placement)}
                     onClick={() => { setLayoutAnnouncement(""); setWorkspacePlacement(placement); }}
                   ><span aria-hidden="true">{placementGlyph(placement)}</span></button>
                 ))}
@@ -170,9 +157,30 @@ export function AppearanceSettings() {
               <button
                 class="appearance-reset-layout"
                 type="button"
-                onClick={() => { resetWorkspaceLayout(); setLayoutAnnouncement(copy.resetDone); }}
-              >{copy.reset}</button>
+                onClick={() => { resetWorkspaceLayout(); setLayoutAnnouncement(t("appearance.resetDone")); }}
+              >{t("appearance.reset")}</button>
               <p class="visually-hidden" aria-live="polite" aria-atomic="true">{layoutAnnouncement}</p>
+            </section>
+
+            <section aria-labelledby="link-preview-heading">
+              <div class="appearance-section-title">
+                <div class="heading-info-group">
+                  <h3 id="link-preview-heading">{t("appearance.linkPreviews")}</h3>
+                  <InfoTip text={t("appearance.linkPreviewsDetail")} align="start" />
+                </div>
+                <small>{richLinkPreviewsEnabled.value ? t("common.on") : t("common.off")}</small>
+              </div>
+              <label class="appearance-toggle-row">
+                <span>
+                  <b>{t("appearance.linkPreviews")}</b>
+                  <small>{t("appearance.linkPreviewsSites")}</small>
+                </span>
+                <input
+                  type="checkbox"
+                  checked={richLinkPreviewsEnabled.value}
+                  onChange={(event) => setRichLinkPreviewsEnabled(event.currentTarget.checked)}
+                />
+              </label>
             </section>
           </aside>
         </>
@@ -181,11 +189,14 @@ export function AppearanceSettings() {
   );
 }
 
-function placementLabel(placement: WorkspacePlacement, japanese: boolean): string {
-  const labels = japanese
-    ? { top: "上", right: "右", bottom: "下", left: "左" }
-    : { top: "Top", right: "Right", bottom: "Bottom", left: "Left" };
-  return labels[placement];
+function placementLabel(placement: WorkspacePlacement): string {
+  const keys: Record<WorkspacePlacement, TranslationKey> = {
+    top: "appearance.placement.top",
+    right: "appearance.placement.right",
+    bottom: "appearance.placement.bottom",
+    left: "appearance.placement.left",
+  };
+  return t(keys[placement]);
 }
 
 function placementGlyph(placement: WorkspacePlacement): string {

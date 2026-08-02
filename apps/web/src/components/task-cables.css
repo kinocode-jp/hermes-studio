@@ -14,16 +14,16 @@
 }
 
 .task-cable {
-  --cable-color: var(--amber, #f2b84b);
+  --cable-color: var(--amber);
   color: var(--cable-color);
 }
 
 .task-cable--active {
-  --cable-color: var(--aqua, #55d6be);
+  --cable-color: var(--accent);
 }
 
 .task-cable--blocked {
-  --cable-color: var(--coral, #f06a57);
+  --cable-color: var(--coral);
 }
 
 .task-cable__shadow,
@@ -36,7 +36,7 @@
 }
 
 .task-cable__shadow {
-  stroke: var(--night, #101827);
+  stroke: var(--surface);
   stroke-width: 5px;
   opacity: 0.86;
 }
@@ -50,7 +50,7 @@
 .task-cable__terminal,
 .task-cable__pulse {
   fill: currentColor;
-  stroke: var(--night, #101827);
+  stroke: var(--surface);
   stroke-width: 1.5px;
   vector-effect: non-scaling-stroke;
 }
@@ -72,19 +72,19 @@
 }
 
 .task-cable:focus-visible .task-cable__line {
-  stroke: var(--paper, #f3e8d1);
+  stroke: var(--ink);
   stroke-width: 4px;
   opacity: 1;
 }
 
 .task-cable:focus-visible .task-cable__shadow {
-  stroke: var(--aqua, #55d6be);
+  stroke: var(--accent);
   stroke-width: 8px;
   opacity: 1;
 }
 
 .task-cable.is-selected .task-cable__terminal {
-  filter: drop-shadow(0 0 4px currentColor);
+  filter: none;
 }
 
 .task-cable__pulse {

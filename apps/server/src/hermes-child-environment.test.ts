@@ -8,12 +8,12 @@ test("Hermes child environment inherits only runtime essentials", () => {
     {
       HOME: "/Users/example", PATH: "/usr/bin:/bin", LANG: "ja_JP.UTF-8",
       HERMES_HOME: "/Users/example/.hermes",
-      HERMES_OFFICE_REMOTE_TOKEN: "office-secret",
-      HERMES_OFFICE_ALLOWED_ORIGINS: "https://office.example",
-      HERMES_OFFICE_TRUSTED_PROXY_HOPS: "1",
-      HERMES_OFFICE_DESKTOP_CAPABILITY: "desktop-secret",
-      AWS_SECRET_ACCESS_KEY: "cloud-secret", OPENAI_API_KEY: "provider-secret",
-      GITHUB_TOKEN: "ci-secret", CI_JOB_TOKEN: "ci-secret",
+      HERMES_STUDIO_REMOTE_TOKEN: "office-secret", // gitleaks:allow -- synthetic exclusion fixture
+      HERMES_STUDIO_ALLOWED_ORIGINS: "https://office.example",
+      HERMES_STUDIO_TRUSTED_PROXY_HOPS: "1",
+      HERMES_STUDIO_DESKTOP_CAPABILITY: "desktop-secret",
+      AWS_SECRET_ACCESS_KEY: "cloud-secret", OPENAI_API_KEY: "provider-secret", // gitleaks:allow -- synthetic exclusion fixtures
+      GITHUB_TOKEN: "ci-secret", CI_JOB_TOKEN: "ci-secret", // gitleaks:allow -- synthetic exclusion fixtures
       SSH_AUTH_SOCK: "/tmp/agent.sock", NODE_OPTIONS: "--require=/tmp/inject.cjs",
     },
   );
@@ -26,9 +26,9 @@ test("Hermes child environment inherits only runtime essentials", () => {
   });
 
   const record = environment as Readonly<Record<string, string | undefined>>;
-  assert.equal(record.HERMES_OFFICE_REMOTE_TOKEN, undefined);
-  assert.equal(record.HERMES_OFFICE_ALLOWED_ORIGINS, undefined);
-  assert.equal(record.HERMES_OFFICE_TRUSTED_PROXY_HOPS, undefined);
+  assert.equal(record.HERMES_STUDIO_REMOTE_TOKEN, undefined);
+  assert.equal(record.HERMES_STUDIO_ALLOWED_ORIGINS, undefined);
+  assert.equal(record.HERMES_STUDIO_TRUSTED_PROXY_HOPS, undefined);
 });
 
 test("Hermes child environment rejects inherited NUL values", () => {

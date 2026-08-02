@@ -1,5 +1,5 @@
 blank_issues_enabled: true
 contact_links:
   - name: Private security report
-    url: https://github.com/kinocode-jp/hermes-office/security/advisories/new
+    url: https://github.com/kinocode-jp/hermes-studio/security/advisories/new
     about: Report suspected vulnerabilities privately; do not open a public issue.

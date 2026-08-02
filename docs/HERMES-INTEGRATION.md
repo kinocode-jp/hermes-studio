@@ -13,7 +13,7 @@ but the pinned upstream source is the contract reference.
 
 ## Decision
 
-Hermes Office follows Hermes without forking it. The product talks to a stock
+Hermes Studio follows Hermes without forking it. The product talks to a stock
 `hermes serve` process through a small adapter and keeps Office-only concepts
 (character appearance, global inheritance, window layout, remote device policy)
 outside Hermes-owned files and databases.
@@ -28,7 +28,7 @@ The backend is a mixed protocol, not one JSON-RPC API:
 
 | Concern | Official surface | Office adapter use |
 | --- | --- | --- |
-| Liveness and management | REST under `/api/*` | status, profiles, stored sessions, skills, memory config |
+| Liveness and management | REST under `/api/*` | status, profiles, stored sessions, skills, memory config, schema-driven config (`/api/config`, `/api/config/schema`) |
 | Live chat | JSON-RPC 2.0 over WebSocket `/api/ws` | create/resume multiple sessions, submit, interrupt, approvals |
 | Gateway events | JSON-RPC notification `method: "event"` on `/api/ws` | streaming text, tools, status, prompts |
 | Kanban | REST + `/api/plugins/kanban/events` WebSocket | board CRUD, assignment, comments, live task events |
@@ -49,7 +49,7 @@ authentication implementation. It defines three operations:
 3. `subscribe` for non-RPC streams such as Kanban events.
 
 The Tauri shell can implement this boundary in Rust. The PWA should call the
-Hermes Office server, which proxies to Hermes after enforcing the Office device
+Studio Server, which proxies to Hermes after enforcing the Office device
 and role policy. This keeps Hermes administrative credentials and filesystem
 paths out of browser JavaScript.
 
@@ -62,6 +62,16 @@ query string”. A production runtime can keep one machine backend for chat and
 explicitly scoped reads, then lazily start `hermes -p <name> serve --isolated`
 on an OS-assigned loopback port only for profile-implicit management calls. Use
 an idle TTL; do not keep one Hermes process per character permanently.
+
+Office stage-1 advanced config uses profile-pinned backends and the official
+dashboard endpoints `GET /api/config/schema`, `GET /api/config`, and
+`PUT /api/config`. Hermes 0.18.2 schema inference maps `DEFAULT_CONFIG` null
+leaves to `"string"` (`_infer_type`); Office value-aware projection denies
+ambiguous leaves and exposes string-lists only. Hermes deep-merges PUT bodies
+and does not offer conditional
+writes; Office therefore serializes per-profile config mutations, re-reads the
+safe-leaf projection, and enforces SHA-256 `expectedRevision` concurrency
+itself. Browsers never call Hermes config routes directly.
 
 UI code must preserve two session identities:
 
@@ -79,7 +89,7 @@ live identities from its response. Do not rewrite resume through
 `/api/sessions/{id}/latest-descendant`: that REST traversal also follows newer
 branch, delegate, and tool children that native resume intentionally excludes.
 
-Office Server multiplexes every Browser Chat WebSocket over one Hermes gateway
+Studio Server multiplexes every Browser Chat WebSocket over one Hermes gateway
 connection. This keeps Hermes' process-global live transport stable while
 Office routes each normalized live event only to the Browser socket that owns
 that live id. A Browser disconnect waits a bounded interval for its in-flight
@@ -173,7 +183,9 @@ Important behavior from the current server:
 A profile is a separate Hermes home with its own config, secrets, SOUL, memory,
 sessions, skills, cron and gateway state. “Profile equals character” is therefore
 a stable Office mapping. The default profile is still a profile; it is not a
-global configuration layer. See [Profiles](https://hermes-agent.nousresearch.com/docs/user-guide/profiles/).
+global configuration layer. Office may show a local display-name alias for any
+profile (including `default`); that alias never renames the Hermes profile id
+or home directory. See [Profiles](https://hermes-agent.nousresearch.com/docs/user-guide/profiles/).
 
 ### Stored sessions
 
@@ -184,6 +196,10 @@ global configuration layer. See [Profiles](https://hermes-agent.nousresearch.com
   rows keep their first observed order. Hermes `errors`, an incomplete page, or
   a safety ceiling produce an explicit truncated inventory instead of a silent
   complete-looking list.
+  Studio Server also converts each row's persisted `git_repo_root`/`cwd` into
+  an opaque project-group id and a bounded basename for the Web sidebar. The
+  absolute host path is never included in the browser snapshot, and this
+  grouping does not start profile-scoped Hermes backends.
 - `GET /api/sessions` is profile-scoped and supports pagination/filtering.
 - `GET /api/sessions/{id}` and `/messages` load detail/history.
 - `PATCH /api/sessions/{id}` renames or archives.
@@ -234,11 +250,14 @@ multiple profiles at one writable `SKILL.md` directory.
 - `POST /api/memory/reset` deletes built-in memory/user files.
 
 Hermes does not currently publish a stable dashboard REST endpoint for arbitrary
-raw editing of built-in `MEMORY.md` and `USER.md`. Office should initially offer
-provider selection/status/reset plus SOUL editing. A future rich memory editor
-must be an Office server feature with backups and its own versioned contract,
-not a guessed Hermes API. Memory files are frozen into a session at its start,
-so edits affect later sessions. See [Persistent Memory](https://hermes-agent.nousresearch.com/docs/user-guide/features/memory/).
+raw editing of built-in `MEMORY.md` and `USER.md`. Office therefore provides its
+own versioned raw-edit API under
+`/api/v1/profiles/{profile}/memory/files…`, reading and writing only the
+resolved profile home's `memories/MEMORY.md` and `memories/USER.md`, while
+reset continues to use profile-pinned `POST /api/memory/reset`. Memory files
+are frozen into a session at its start, so edits affect later sessions. See
+[Persistent Memory](https://hermes-agent.nousresearch.com/docs/user-guide/features/memory/)
+and [HERMES-SETTINGS.md](HERMES-SETTINGS.md).
 
 ## Kanban
 
@@ -247,6 +266,12 @@ queue. It is a bundled dashboard plugin mounted under
 `/api/plugins/kanban/`; do not read or mutate `kanban.db` directly. The current
 router is
 [`plugins/kanban/dashboard/plugin_api.py`](https://github.com/NousResearch/hermes-agent/blob/1f89f3102f701dea3a2706d174197ecbefac20be/plugins/kanban/dashboard/plugin_api.py).
+
+Office Teams are **not** a Hermes concept. They are Office-owned metadata that
+group Hermes profile IDs many-to-many for roster context, workload aggregation,
+and Kanban filtering. Card assignment remains to one individual Hermes profile;
+Office never invents a synthetic team assignee and never writes upstream
+`kanban.db` for team membership.
 
 Minimum UI routes:
 
@@ -284,7 +309,7 @@ Recommended remote path:
 ```text
 PWA / mobile browser
   -> HTTPS + Office session + device policy
-Hermes Office server
+Studio Server
   -> loopback REST / WS
 stock hermes serve
 ```
@@ -326,9 +351,11 @@ administration.
   required.
 - Some official docs lag source during rapid releases. The pinned source wins
   for wire behavior; docs win for user-supported intent.
-- Raw built-in memory editing is not a stable official API.
+- Raw built-in memory editing is not a stable official Hermes API; Office owns
+  the versioned file surface under `/api/v1/profiles/{profile}/memory/files`
+  (raw body GET/PUT require `memory.update`, not ordinary `state.read`).
 - Profile selection is not consistent across every REST handler. In particular,
-  current memory endpoints are process-scoped, so the runtime needs lazy
+  current Hermes memory endpoints are process-scoped, so the runtime needs lazy
   per-profile routing or a future upstream profile parameter.
 - Office global skills/memory/defaults are new product semantics and require an
   Office-owned inheritance/provenance model.

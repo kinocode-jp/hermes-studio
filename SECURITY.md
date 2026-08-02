@@ -2,7 +2,7 @@
 
 ## Supported versions
 
-Hermes Office is experimental, pre-1.0 software. Security fixes are applied to
+Hermes Studio is experimental, pre-1.0 software. Security fixes are applied to
 the current `main` branch; no released version is currently supported. This
 repository does not yet publish official desktop binaries.
 
@@ -13,7 +13,7 @@ request, discussion, or chat transcript.
 
 Use GitHub's **Report a vulnerability** form in this repository's Security tab:
 
-<https://github.com/kinocode-jp/hermes-office/security/advisories/new>
+<https://github.com/kinocode-jp/hermes-studio/security/advisories/new>
 
 Include the affected commit/version, impact, prerequisites, and the smallest
 safe reproduction you can provide. Remove tokens, prompts, profile data, and
@@ -28,10 +28,12 @@ response or remediation SLA is promised for this experimental project.
 ## Deployment warning
 
 The current supported trust model is one trusted operator on one machine. Keep
-Hermes and Hermes Office bound to loopback. Remote access is experimental and
+Hermes and Hermes Studio bound to loopback. Remote access is experimental and
 should only be placed behind an authenticated HTTPS private-network proxy used
-by that same trusted operator. Direct public-internet exposure and untrusted
-multi-user/tenant deployments are unsupported.
+by that same trusted operator. For Tailscale, use `npm run start:tailnet`, or
+`npm run start:tailnet:desktop` for the installed macOS app; see
+[`docs/TAILSCALE.md`](docs/TAILSCALE.md). Direct public-internet exposure,
+Tailscale Funnel, and untrusted multi-user/tenant deployments are unsupported.
 
 The implementation status and known limitations are documented in
 [`docs/SECURITY.md`](docs/SECURITY.md). That document is descriptive, not a

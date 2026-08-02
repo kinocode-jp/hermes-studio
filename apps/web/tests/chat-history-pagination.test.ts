@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { normalizeHistoryPage } from "../src/chat-api";
+import { nextChatTimelineSequence } from "../src/chat-store-utils";
 
 test("history page metadata and stable cross-page message indexes are normalized", () => {
   const page = normalizeHistoryPage({
@@ -17,6 +18,10 @@ test("history page metadata and stable cross-page message indexes are normalized
     "history-stored-requested-25",
     "history-stored-requested-26",
   ]);
+  assert.deepEqual(page.messages.map((message) => message.timelineSequence), [25_000_000, 26_000_000]);
+  const localSequence = nextChatTimelineSequence({ messages: page.messages, operationEvidence: [] });
+  assert.equal(localSequence, 26_000_001);
+  assert.ok(localSequence < 27_000_000, "local events stay before the next durable history anchor");
   assert.equal(page.hasMore, true);
   assert.equal(page.nextCursor, "djE6Mjc");
   assert.equal(page.truncated, false);
@@ -55,4 +60,23 @@ test("history timestamps stay locale-neutral while legacy clock text is preserve
     "12:00",
     "around noon",
   ]);
+});
+
+test("history rows without a stable upstream index do not receive page-local sequence numbers", () => {
+  const body = {
+    messages: [
+      { role: "user", text: "first page-local row" },
+      { role: "assistant", text: "second page-local row" },
+    ],
+    pagination: { direction: "older", hasMore: false },
+  };
+  const firstPage = normalizeHistoryPage(body, "stored-1", 0);
+  const secondPage = normalizeHistoryPage(body, "stored-1", 1);
+
+  assert.deepEqual(firstPage.messages.map(({ timelineSequence }) => timelineSequence), [undefined, undefined]);
+  assert.deepEqual(firstPage.messages.map(({ id }) => id), [
+    "history-stored-1-page-0-row-0",
+    "history-stored-1-page-0-row-1",
+  ]);
+  assert.equal(new Set([...firstPage.messages, ...secondPage.messages].map(({ id }) => id)).size, 4);
 });

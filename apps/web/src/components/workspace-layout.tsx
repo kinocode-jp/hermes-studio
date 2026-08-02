@@ -1,6 +1,17 @@
-import { Fragment, type ComponentChildren } from "preact";
+import type { ComponentChildren } from "preact";
 import { useEffect, useRef, useState } from "preact/hooks";
-import { locale } from "../i18n";
+import { t } from "../i18n";
+import { PHONE_VIEWPORT_QUERY } from "../viewport";
+import {
+  clearWorkspaceSessionDropPreview,
+  openMobileWorkspace,
+  openSession,
+  profileChatModalId,
+  setWorkspaceSessionDropPlacement,
+  setWorkspaceSessionDropPreview,
+  workspaceSessionDropPlacement,
+  workspaceSessionDropPreview,
+} from "../store";
 import {
   WORKSPACE_RATIO_MAX,
   WORKSPACE_RATIO_MIN,
@@ -25,6 +36,7 @@ type WorkspaceLayoutProps = {
   main: ComponentChildren;
   workspace: ComponentChildren;
   hasChats: boolean;
+  surfaceVisible?: boolean;
 };
 
 type DragSource = "office" | "chat";
@@ -37,7 +49,7 @@ type ResizeGesture = {
   axisSize: number;
 };
 
-export function WorkspaceLayout({ main, workspace, hasChats }: WorkspaceLayoutProps) {
+export function WorkspaceLayout({ main, workspace, hasChats, surfaceVisible = true }: WorkspaceLayoutProps) {
   const host = useRef<HTMLDivElement>(null);
   const ratioRef = useRef(workspaceRatio.value);
   const effectiveRatioRef = useRef(workspaceRatio.value);
@@ -54,28 +66,25 @@ export function WorkspaceLayout({ main, workspace, hasChats }: WorkspaceLayoutPr
   const [layoutAnnouncement, setLayoutAnnouncement] = useState({ text: "", token: 0 });
   const placement = workspacePlacement.value;
   const preferredRatio = workspaceRatio.value;
-  const isJapanese = locale.value === "ja";
-  const copy = isJapanese ? {
-    separator: (position: string) => `オフィスとチャットのサイズを変更（チャットは${position}）`,
-    dockGroup: "ペインの配置を変更",
-    officeHandle: "オフィス画面をドラッグして配置を変更",
-    chatHandle: "チャット欄をドラッグして配置を変更",
-    handleTitle: "端へドラッグ、またはAlt＋矢印キーで配置",
-    placed: (position: string) => `チャットを${position}へ配置しました。`,
-    dropZone: (source: DragSource, edge: string) => `${source === "office" ? "オフィス" : "チャット"}: ${edge}`,
-  } : {
-    separator: (position: string) => `Resize office and chat (chat is ${position})`,
-    dockGroup: "Change pane placement",
-    officeHandle: "Drag the office pane to change placement",
-    chatHandle: "Drag the chat pane to change placement",
-    handleTitle: "Drag to an edge, or use Alt+Arrow keys",
-    placed: (position: string) => `Chat placed on the ${position}.`,
-    dropZone: (source: DragSource, edge: string) => `${source === "office" ? "Office" : "Chat"}: ${edge}`,
+  const sessionDropPreview = workspaceSessionDropPreview.value && !profileChatModalId.value;
+  const sessionDropPlacement = workspaceSessionDropPlacement.value;
+  const sessionDropEdges = workspacePlacements;
+  const copy = {
+    separator: (position: string) => t("layout.separator", { position }),
+    dockGroup: t("layout.dockGroup"),
+    officeHandle: t("layout.officeHandle"),
+    chatHandle: t("layout.chatHandle"),
+    handleTitle: t("layout.handleTitle"),
+    placed: (position: string) => t("layout.placed", { position }),
+    dropZone: (source: DragSource, edge: string) => t("layout.dropZone", {
+      source: t(source === "office" ? "layout.source.office" : "layout.source.chat"),
+      edge,
+    }),
   };
 
   useEffect(() => {
     if (typeof matchMedia !== "function") return;
-    const query = matchMedia("(max-width: 767px)");
+    const query = matchMedia(PHONE_VIEWPORT_QUERY);
     const update = () => setMobile(query.matches);
     update();
     query.addEventListener("change", update);
@@ -114,10 +123,10 @@ export function WorkspaceLayout({ main, workspace, hasChats }: WorkspaceLayoutPr
       : preferredRatio);
   }, [placement, preferredRatio]);
 
-  const placementName = labelForPlacement(placement, isJapanese);
+  const placementName = labelForPlacement(placement);
   const announcePlacement = (next: WorkspacePlacement) => {
     setLayoutAnnouncement((current) => ({
-      text: copy.placed(labelForPlacement(next, isJapanese)),
+      text: copy.placed(labelForPlacement(next)),
       token: current.token + 1,
     }));
   };
@@ -249,65 +258,47 @@ export function WorkspaceLayout({ main, workspace, hasChats }: WorkspaceLayoutPr
     if (shouldPersist) persistWorkspaceLayout();
   }, []);
 
-  const surfacePane = <div key="surface-pane" class="workspace-layout-surface">{main}</div>;
+  const onSessionEdgeDragOver = (edge: WorkspacePlacement) => (event: DragEvent) => {
+    if (profileChatModalId.value) return;
+    const types = event.dataTransfer?.types;
+    const isSession = Boolean(types && ([...types].includes("application/x-hermes-session") || [...types].includes("text/plain")));
+    if (!isSession && !workspaceSessionDropPreview.value) return;
+    event.preventDefault();
+    event.stopPropagation();
+    if (event.dataTransfer) event.dataTransfer.dropEffect = "copy";
+    setWorkspaceSessionDropPreview(true);
+    setWorkspaceSessionDropPlacement(edge);
+  };
+
+  const onSessionEdgeDrop = (edge: WorkspacePlacement) => (event: DragEvent) => {
+    if (profileChatModalId.value) {
+      clearWorkspaceSessionDropPreview();
+      return;
+    }
+    event.preventDefault();
+    event.stopPropagation();
+    const sessionId = event.dataTransfer?.getData("application/x-hermes-session")
+      || event.dataTransfer?.getData("text/plain")
+      || "";
+    clearWorkspaceSessionDropPreview();
+    if (!sessionId) return;
+    setWorkspacePlacement(edge);
+    openSession(sessionId, { workspace: true });
+    openMobileWorkspace();
+  };
+
+  const layoutPlacement = sessionDropPreview && sessionDropPlacement ? sessionDropPlacement : placement;
+  const surfacePane = surfaceVisible ? <div key="surface-pane" class="workspace-layout-surface">{main}</div> : null;
   const chatPane = <div key="chat-pane" class="workspace-layout-chat">{workspace}</div>;
-  const chatFirst = workspaceChatPrecedesSurface(placement, mobile, hasChats);
-  const desktopDivider = hasChats && !mobile ? (
-    <Fragment key="desktop-divider">
-      <div
-        class="workspace-separator"
-        role="separator"
-        tabIndex={0}
-        aria-label={copy.separator(placementName)}
-        aria-orientation={placement === "left" || placement === "right" ? "vertical" : "horizontal"}
-        aria-valuemin={Math.round(effectiveBounds.min * 100)}
-        aria-valuemax={Math.round(effectiveBounds.max * 100)}
-        aria-valuenow={Math.round(effectiveRatio * 100)}
-        aria-keyshortcuts={workspaceSeparatorKeyShortcuts(placement)}
-        onPointerDown={beginResize}
-        onPointerMove={(event) => { if (event.currentTarget.hasPointerCapture(event.pointerId)) resize(event); }}
-        onPointerUp={finishResize}
-        onPointerCancel={finishResize}
-        onLostPointerCapture={(event) => finishResize(event)}
-        onKeyDown={resizeWithKeyboard}
-      />
-      <div class="workspace-dock-controls" role="group" aria-label={copy.dockGroup}>
-        <button
-          type="button"
-          class="workspace-dock-handle workspace-dock-handle--office"
-          aria-label={copy.officeHandle}
-          aria-keyshortcuts="Alt+ArrowUp Alt+ArrowRight Alt+ArrowDown Alt+ArrowLeft"
-          title={copy.handleTitle}
-          onPointerDown={(event) => { event.stopPropagation(); beginDockDrag("office", event); }}
-          onPointerMove={moveDockDrag}
-          onPointerUp={finishDockDrag}
-          onPointerCancel={cancelDockDrag}
-          onLostPointerCapture={(event) => cancelDockDrag(event)}
-          onKeyDown={(event) => dockWithKeyboard("office", event)}
-        >O</button>
-        <span aria-hidden="true" />
-        <button
-          type="button"
-          class="workspace-dock-handle workspace-dock-handle--chat"
-          aria-label={copy.chatHandle}
-          aria-keyshortcuts="Alt+ArrowUp Alt+ArrowRight Alt+ArrowDown Alt+ArrowLeft"
-          title={copy.handleTitle}
-          onPointerDown={(event) => { event.stopPropagation(); beginDockDrag("chat", event); }}
-          onPointerMove={moveDockDrag}
-          onPointerUp={finishDockDrag}
-          onPointerCancel={cancelDockDrag}
-          onLostPointerCapture={(event) => cancelDockDrag(event)}
-          onKeyDown={(event) => dockWithKeyboard("chat", event)}
-        >C</button>
-      </div>
-    </Fragment>
-  ) : null;
+  const chatFirst = surfaceVisible && workspaceChatPrecedesSurface(layoutPlacement, mobile, hasChats);
+  // Visible center divider / dock handles removed. Placement is controlled from the chat header.
+  const desktopDivider = null;
 
   return (
     <div
       ref={host}
-      class={`workspace-layout-host ${hasChats ? "has-chats" : "is-empty"} ${drag ? "is-docking" : ""}`}
-      data-workspace-placement={placement}
+      class={`workspace-layout-host ${hasChats ? "has-chats" : "is-empty"} ${surfaceVisible ? "" : "surface-hidden"} ${drag ? "is-docking" : ""} ${sessionDropPreview ? "is-session-dropping" : ""}`}
+      data-workspace-placement={layoutPlacement}
       style={`--workspace-ratio: ${effectiveRatio * 100}%`}
     >
       {chatFirst && chatPane}
@@ -322,8 +313,23 @@ export function WorkspaceLayout({ main, workspace, hasChats }: WorkspaceLayoutPr
         <div class="workspace-drop-zones" aria-hidden="true">
           {workspacePlacements.map((edge) => (
             <span key={edge} data-edge={edge} class={drag.candidate === chatPlacementForEdge(drag.source, edge) ? "is-target" : ""}>
-              {copy.dropZone(drag.source, labelForPlacement(edge, isJapanese))}
+              {copy.dropZone(drag.source, labelForPlacement(edge))}
             </span>
+          ))}
+        </div>
+      )}
+      {sessionDropPreview && !mobile && (
+        <div class="session-drop-zones" aria-hidden="true">
+          {sessionDropEdges.map((edge) => (
+            <button
+              key={edge}
+              type="button"
+              data-edge={edge}
+              class={sessionDropPlacement === edge ? "is-target" : ""}
+              aria-label={edgeLabel(edge)}
+              onDragOver={onSessionEdgeDragOver(edge)}
+              onDrop={onSessionEdgeDrop(edge)}
+            />
           ))}
         </div>
       )}
@@ -349,11 +355,20 @@ function resizeAxisCoordinate(placement: WorkspacePlacement, x: number, y: numbe
   return placement === "left" || placement === "right" ? x : y;
 }
 
-function labelForPlacement(placement: WorkspacePlacement, japanese: boolean): string {
-  if (japanese) return placement === "top" ? "上" : placement === "right" ? "右" : placement === "bottom" ? "下" : "左";
-  return placement;
+function labelForPlacement(placement: WorkspacePlacement): string {
+  return placement === "top" ? t("appearance.placement.top")
+    : placement === "right" ? t("appearance.placement.right")
+    : placement === "bottom" ? t("appearance.placement.bottom")
+    : t("appearance.placement.left");
+}
+
+function edgeLabel(placement: WorkspacePlacement): string {
+  return placement === "top" ? t("workspace.dock.top")
+    : placement === "right" ? t("workspace.dock.right")
+    : placement === "bottom" ? t("workspace.dock.bottom")
+    : t("workspace.dock.left");
 }
 
 function matchesMobile(): boolean {
-  return typeof matchMedia === "function" && matchMedia("(max-width: 767px)").matches;
+  return typeof matchMedia === "function" && matchMedia(PHONE_VIEWPORT_QUERY).matches;
 }

@@ -75,6 +75,24 @@ function fixturesFor(layout: OfficeLayoutId, cols: number, rows: number): Office
   ];
 }
 
+/** Front-door reception desk: first free 2×2 island just inside the wall. */
+function receptionDesk(cols: number, objects: readonly OfficeObject[]): DeskSlot {
+  for (let x = 2; x + 2 <= cols - 2; x += 1) {
+    const island = { x, y: 1, w: 2, h: 2 };
+    if (!objects.some((object) => object.solid && overlaps(island, object, 0))) {
+      return { x, y: 1, chair: { x, y: 2 } };
+    }
+  }
+  // Fallback one row deeper if the wall fixtures fill the entrance row.
+  for (let x = 2; x + 2 <= cols - 2; x += 1) {
+    const island = { x, y: 2, w: 2, h: 2 };
+    if (!objects.some((object) => object.solid && overlaps(island, object, 0))) {
+      return { x, y: 2, chair: { x, y: 3 } };
+    }
+  }
+  return { x: 2, y: 2, chair: { x: 2, y: 3 } };
+}
+
 /**
  * Builds a walkable office. Desks are placed procedurally so the floor grows
  * with the roster: when a size preset runs out of space, rows are appended.
@@ -85,17 +103,25 @@ export function generateWorld(layout: OfficeLayoutId, size: OfficeSizeId, deskCo
   let objects = fixturesFor(layout, cols, rows);
   const desks: DeskSlot[] = [];
 
-  let y = 3;
+  // Seat 0 is the reception desk near the entrance for the default profile.
+  let reception = receptionDesk(cols, objects);
+  desks.push(reception);
+
+  // Keep the first procedural chair a full character box away from reception.
+  let y = 4;
   while (desks.length < deskCount) {
     if (y + 2 >= rows - 1) {
       rows += 3;
       objects = fixturesFor(layout, cols, rows);
       desks.length = 0;
-      y = 3;
+      reception = receptionDesk(cols, objects);
+      desks.push(reception);
+      y = 4;
       continue;
     }
     for (let x = 2; x + 2 <= cols - 2 && desks.length < deskCount; x += 3) {
       const island = { x, y, w: 2, h: 2 };
+      if (overlaps(island, { x: reception.x, y: reception.y, w: 2, h: 2 }, 0)) continue;
       const collides = objects.some((object) => object.solid && overlaps(island, object, 1));
       if (!collides) desks.push({ x, y, chair: { x, y: y + 1 } });
     }

@@ -1,9 +1,9 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import type { HermesRuntimeSource } from "./hermes-backend.js";
-import type { HermesChatConnection, HermesChatRequest } from "./hermes-chat.js";
+import { HermesChatTransportError, type HermesChatConnection, type HermesChatRequest } from "./hermes-chat.js";
 import { ChatSessionCoordinator } from "./chat-session-coordinator.js";
-import { ChatUpstreamHub } from "./chat-upstream-hub.js";
+import { ChatCommitUnconfirmedError, ChatUpstreamHub } from "./chat-upstream-hub.js";
 
 test("a detach while connect is pending prevents normal and owned upstream requests", async () => {
   let resolveConnection!: (connection: HermesChatConnection) => void;
@@ -222,7 +222,84 @@ test("owned mutation settlement fails closed across same-owner live-id lease reu
   assert.notEqual(coordinator.liveLeaseToken(owner, "live"), oldToken);
   gate.resolve();
 
-  await assert.rejects(response, /ownership changed/);
+  await assert.rejects(response, (error: unknown) => error instanceof ChatCommitUnconfirmedError);
+  await hub.close();
+});
+
+test("a stale slash settlement does not reset unrelated sessions on the shared transport", async () => {
+  const gate = deferred();
+  let connectionCloseCount = 0;
+  const requests: HermesChatRequest[] = [];
+  const connection: HermesChatConnection = {
+    closed: false,
+    request: async (request) => {
+      requests.push(request);
+      if (request.method === "slash.exec") await gate.promise;
+      return { method: request.method, value: { status: "ok" } };
+    },
+    close: async () => { connectionCloseCount += 1; },
+  };
+  const coordinator = new ChatSessionCoordinator();
+  const staleOwner = {};
+  const currentOwner = {};
+  const claim = coordinator.claimResume(staleOwner, "coder", "stored-old");
+  assert.ok(claim);
+  assert.equal(coordinator.bind(claim, { storedSessionId: "stored-old", liveSessionId: "live" }, false), "bound");
+  const staleToken = coordinator.liveLeaseToken(staleOwner, "live");
+  assert.ok(staleToken);
+  const hub = new ChatUpstreamHub(runtimeWithConnect(async () => connection), coordinator, 64 * 1024);
+  let unrelatedUnavailable = 0;
+  await hub.attach(staleOwner, { onEvent: () => undefined, onUnavailable: () => undefined });
+  await hub.attach(currentOwner, { onEvent: () => undefined, onUnavailable: () => { unrelatedUnavailable += 1; } });
+
+  const response = hub.requestOwnedSession(staleOwner, "live", staleToken, {
+    method: "slash.exec", params: { session_id: "live", command: "/compact" },
+  });
+  await waitFor(() => requests.length === 1);
+  assert.equal(coordinator.releaseLease(staleOwner, staleToken), true);
+  const replacement = coordinator.claimResume(currentOwner, "coder", "stored-new");
+  assert.ok(replacement);
+  assert.equal(coordinator.bind(replacement, { storedSessionId: "stored-new", liveSessionId: "live" }, false), "bound");
+  gate.resolve();
+
+  await assert.rejects(response, (error: unknown) => error instanceof ChatCommitUnconfirmedError);
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(connectionCloseCount, 0);
+  assert.equal(unrelatedUnavailable, 0);
+  await hub.request(currentOwner, { method: "complete.slash", params: { text: "/" } });
+  assert.equal(requests.at(-1)?.method, "complete.slash");
+  await hub.close();
+});
+
+test("a read-only slash timeout is not reported as an unconfirmed mutation", async () => {
+  let connectionCloseCount = 0;
+  const connection: HermesChatConnection = {
+    closed: false,
+    request: async (request) => {
+      if (request.method === "slash.exec") {
+        throw new HermesChatTransportError("timed_out", "read-only timeout");
+      }
+      return { method: request.method, value: { status: "ok" } };
+    },
+    close: async () => { connectionCloseCount += 1; },
+  };
+  const coordinator = new ChatSessionCoordinator();
+  const owner = {};
+  const claim = coordinator.claimResume(owner, "coder", "stored");
+  assert.ok(claim);
+  assert.equal(coordinator.bind(claim, { storedSessionId: "stored", liveSessionId: "live" }, false), "bound");
+  const token = coordinator.liveLeaseToken(owner, "live");
+  assert.ok(token);
+  const hub = new ChatUpstreamHub(runtimeWithConnect(async () => connection), coordinator, 64 * 1024);
+  await hub.attach(owner, { onEvent: () => undefined, onUnavailable: () => undefined });
+
+  await assert.rejects(
+    hub.requestOwnedSession(owner, "live", token, {
+      method: "slash.exec", params: { session_id: "live", command: "/help" },
+    }),
+    (error: unknown) => error instanceof HermesChatTransportError && error.code === "timed_out",
+  );
+  assert.equal(connectionCloseCount, 0);
   await hub.close();
 });
 

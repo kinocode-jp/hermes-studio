@@ -1,36 +1,51 @@
-import { createOfficeServer } from "./server.js";
+import { createStudioServer } from "./server.js";
 import { HermesBackend } from "./hermes-backend.js";
-import { homedir } from "node:os";
-import { join } from "node:path";
+import { OfficeTeamsStore } from "./office-teams.js";
+import { brandEnv, brandEnvIsTrue, brandStatePath } from "./brand-env.js";
+import { HermesAgentUpdateManager } from "./hermes-agent-update.js";
 
-const host = process.env.HERMES_OFFICE_HOST ?? "127.0.0.1";
-const configuredPort = Number.parseInt(process.env.HERMES_OFFICE_PORT ?? "4317", 10);
+const host = brandEnv("HOST") ?? "127.0.0.1";
+const configuredPort = Number.parseInt(brandEnv("PORT") ?? "4317", 10);
 const port = Number.isSafeInteger(configuredPort) && configuredPort >= 0 ? configuredPort : 4317;
-const configuredOrigins = process.env.HERMES_OFFICE_ALLOWED_ORIGINS
+const configuredOrigins = brandEnv("ALLOWED_ORIGINS")
   ?.split(",")
   .map((origin) => origin.trim())
   .filter((origin) => origin.length > 0);
-const desktopOrigins = process.env.HERMES_OFFICE_DESKTOP_ORIGINS
+const desktopOrigins = brandEnv("DESKTOP_ORIGINS")
   ?.split(",")
   .map((origin) => origin.trim())
   .filter((origin) => origin.length > 0);
-const parsedTrustedProxyHops = Number.parseInt(process.env.HERMES_OFFICE_TRUSTED_PROXY_HOPS ?? "0", 10);
+const parsedTrustedProxyHops = Number.parseInt(brandEnv("TRUSTED_PROXY_HOPS") ?? "0", 10);
 const trustedProxyHops = Number.isInteger(parsedTrustedProxyHops) && parsedTrustedProxyHops >= 0 && parsedTrustedProxyHops <= 8
   ? parsedTrustedProxyHops
   : 0;
+const maxChatSessionLeasesPerOwner = positiveBrandInteger("CHAT_SESSION_LEASES_PER_OWNER");
+const maxChatSessionLeasesPerProfile = positiveBrandInteger("CHAT_SESSION_LEASES_PER_PROFILE");
+const maxChatSessionLeasesTotal = positiveBrandInteger("CHAT_SESSION_LEASES_TOTAL");
 
-const hermesMode = process.env.HERMES_OFFICE_HERMES_MODE ?? "managed";
+const teamsPath = brandEnv("TEAMS_PATH") ?? brandStatePath("teams.json");
+const teamsStore = new OfficeTeamsStore(teamsPath);
+const listTeamLayers = async () => await teamsStore.listSkillLayers();
+const hermesExecutable = brandEnv("HERMES_EXECUTABLE") ?? "hermes";
+const hermesAgentUpdate = new HermesAgentUpdateManager(hermesExecutable);
+
+const hermesMode = brandEnv("HERMES_MODE") ?? "managed";
+const hermesToken = brandEnv("HERMES_TOKEN");
 const runtimeSource = hermesMode === "demo"
   ? undefined
   : hermesMode === "existing"
     ? new HermesBackend({
-        baseUrl: process.env.HERMES_OFFICE_HERMES_URL ?? "",
-        ...(process.env.HERMES_OFFICE_HERMES_TOKEN === undefined ? {} : { sessionToken: process.env.HERMES_OFFICE_HERMES_TOKEN }),
+        baseUrl: brandEnv("HERMES_URL") ?? "",
+        ...(hermesToken === undefined ? {} : { sessionToken: hermesToken }),
+        listTeamLayers,
       })
-    : new HermesBackend({ executable: process.env.HERMES_OFFICE_HERMES_EXECUTABLE ?? "hermes" });
+    : new HermesBackend({
+        executable: hermesExecutable,
+        listTeamLayers,
+      });
 
 let shuttingDown = false;
-let server: ReturnType<typeof createOfficeServer> | undefined;
+let server: ReturnType<typeof createStudioServer> | undefined;
 let initialization: Promise<void> | undefined;
 let shutdownFlight: Promise<void> | undefined;
 
@@ -38,8 +53,20 @@ function shutdown(): Promise<void> {
   if (shutdownFlight !== undefined) return shutdownFlight;
   shuttingDown = true;
   const flight = (async () => {
-    await runtimeSource?.close();
-    await initialization?.catch(() => undefined);
+    const activeServer = server;
+    if (activeServer !== undefined) {
+      // The server owns the bounded shutdown order: persistence and listener
+      // closure start immediately while managed Hermes children stop in parallel.
+      await activeServer.close();
+      return;
+    }
+    // During startup there may be no server object yet. Abort the runtime and
+    // wait for initialization together; a candidate that wins the race checks
+    // shuttingDown and closes itself before publishing the listener.
+    await Promise.allSettled([
+      runtimeSource?.close(),
+      initialization,
+    ]);
     await server?.close();
   })();
   shutdownFlight = flight;
@@ -55,28 +82,53 @@ process.once("SIGTERM", () => {
   void shutdown().finally(() => process.exit(0));
 });
 
+// The packaged desktop launcher owns this server through a private stdin pipe.
+// If the native parent crashes or is force-quit, the kernel closes the pipe;
+// follow the same cleanup path as SIGTERM so port 4317 is not orphaned.
+if (brandEnvIsTrue("DESKTOP_PARENT_PIPE")) {
+  process.stdin.resume();
+  const parentPipeClosed = (): void => {
+    void shutdown().finally(() => process.exit(0));
+  };
+  process.stdin.once("end", parentPipeClosed);
+  process.stdin.once("error", parentPipeClosed);
+}
+
 initialization = (async () => {
   try {
     if (runtimeSource !== undefined) await runtimeSource.start();
     if (shuttingDown) return;
 
-    const candidate = createOfficeServer({
+    const remoteToken = brandEnv("REMOTE_TOKEN");
+    const desktopCapability = brandEnv("DESKTOP_CAPABILITY");
+    const webRoot = brandEnv("WEB_ROOT");
+    const candidate = createStudioServer({
       host,
       port,
       ...(configuredOrigins === undefined ? {} : { allowedOrigins: configuredOrigins }),
-      allowNonLoopback: process.env.HERMES_OFFICE_ALLOW_NON_LOOPBACK === "true",
+      allowNonLoopback: brandEnvIsTrue("ALLOW_NON_LOOPBACK"),
       trustedProxyHops,
-      deviceRegistryPath: process.env.HERMES_OFFICE_DEVICE_REGISTRY_PATH ?? join(homedir(), ".hermes-office", "devices.json"),
-      ...(process.env.HERMES_OFFICE_REMOTE_TOKEN === undefined ? {} : { remoteToken: process.env.HERMES_OFFICE_REMOTE_TOKEN }),
-      ...(process.env.HERMES_OFFICE_DESKTOP_CAPABILITY === undefined ? {} : { desktopCapability: process.env.HERMES_OFFICE_DESKTOP_CAPABILITY }),
+      deviceRegistryPath: brandEnv("DEVICE_REGISTRY_PATH") ?? brandStatePath("devices.json"),
+      tokenUsagePath: brandEnv("TOKEN_USAGE_PATH") ?? brandStatePath("token-usage.json"),
+      teamsPath,
+      teamsStore,
+      ...(remoteToken === undefined ? {} : { remoteToken }),
+      ...(desktopCapability === undefined ? {} : { desktopCapability }),
       ...(desktopOrigins === undefined ? {} : { desktopOrigins }),
-      ...(process.env.HERMES_OFFICE_WEB_ROOT === undefined ? {} : { staticWebRoot: process.env.HERMES_OFFICE_WEB_ROOT }),
+      ...(webRoot === undefined ? {} : { staticWebRoot: webRoot }),
+      // Fail closed unless the Tailscale launcher (or operator) sets this explicitly.
+      // Accepts HERMES_STUDIO_REMOTE_PRIVILEGED or deprecated HERMES_OFFICE_REMOTE_PRIVILEGED.
+      remotePrivilegedEnabled: brandEnvIsTrue("REMOTE_PRIVILEGED"),
+      ...(maxChatSessionLeasesPerOwner === undefined ? {} : { maxChatSessionLeasesPerOwner }),
+      ...(maxChatSessionLeasesPerProfile === undefined ? {} : { maxChatSessionLeasesPerProfile }),
+      ...(maxChatSessionLeasesTotal === undefined ? {} : { maxChatSessionLeasesTotal }),
       ...(runtimeSource === undefined ? {} : { runtimeSource }),
+      hermesAgentUpdate,
     });
     const address = await candidate.listen();
     if (shuttingDown) { await candidate.close(); return; }
     server = candidate;
-    process.stdout.write(`Hermes Office Server listening on http://${address.address}:${address.port}\n`);
+    process.stdout.write(`Hermes Studio Server listening on http://${address.address}:${address.port}\n`);
   } catch (error) {
     await runtimeSource?.close().catch(() => undefined);
     throw error;
@@ -84,6 +136,13 @@ initialization = (async () => {
 })();
 await initialization;
 
-export { createOfficeServer } from "./server.js";
+function positiveBrandInteger(name: string): number | undefined {
+  const raw = brandEnv(name);
+  if (raw === undefined) return undefined;
+  const parsed = Number.parseInt(raw, 10);
+  return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : undefined;
+}
+
+export { createStudioServer } from "./server.js";
 export { HermesBackend } from "./hermes-backend.js";
 export { discoverHermesRuntime } from "./hermes-runtime.js";

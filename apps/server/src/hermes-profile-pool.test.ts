@@ -83,6 +83,31 @@ test("profile output is drained after readiness without retaining it", async () 
   }
 });
 
+test("reusing a live profile backend does not repeat global profile validation", async () => {
+  const fixture = await createFixture();
+  let knownProfileChecks = 0;
+  const pool = new HermesProfileBackendPool({
+    executable: fixture.executable,
+    cwd: fixture.directory,
+    maxBackends: 1,
+    startTimeoutMs: 2_000,
+    isKnownProfile: async () => {
+      knownProfileChecks += 1;
+      return true;
+    },
+  });
+  try {
+    const first = await pool.resolve("one");
+    first.release();
+    const second = await pool.resolve("one");
+    second.release();
+    assert.equal(knownProfileChecks, 1);
+  } finally {
+    await pool.close();
+    await fixture.close();
+  }
+});
+
 test("an active lease is never evicted to serve another profile", async () => {
   const fixture = await createFixture();
   const pool = new HermesProfileBackendPool({
@@ -143,6 +168,33 @@ test("capacity timeout does not consume a slot and recovers after release", asyn
   }
 });
 
+test("an expired capacity waiter never starts a profile after capacity is released", async () => {
+  const fixture = await createFixture();
+  const pool = new HermesProfileBackendPool({
+    executable: fixture.executable,
+    cwd: fixture.directory,
+    maxBackends: 1,
+    startTimeoutMs: 2_000,
+    isKnownProfile: async () => true,
+  });
+  try {
+    const first = await pool.resolve("one");
+    await assert.rejects(
+      pool.resolve("expired", { deadlineMs: Date.now() + 50 }),
+      /acquisition timed out/,
+    );
+    first.release();
+    await delay(100);
+    assert.equal((await readdir(fixture.directory)).includes("expired.pid"), false);
+
+    const next = await pool.resolve("two");
+    next.release();
+  } finally {
+    await pool.close();
+    await fixture.close();
+  }
+});
+
 test("close wakes capacity waiters and stops leased processes", async () => {
   const fixture = await createFixture();
   const pool = new HermesProfileBackendPool({
@@ -172,7 +224,7 @@ async function createFixture(): Promise<{
   executable: string;
   close(): Promise<void>;
 }> {
-  const directory = await mkdtemp(join(tmpdir(), "hermes-office-profile-pool-"));
+  const directory = await mkdtemp(join(tmpdir(), "hermes-studio-profile-pool-"));
   const executable = join(directory, "fake-hermes.mjs");
   await writeFile(executable, `#!/usr/bin/env node
 import { readdirSync, rmSync, writeFileSync } from "node:fs";

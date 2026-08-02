@@ -9,11 +9,12 @@ import { GlobalInheritanceCoordinator } from "./global-inheritance.js";
 import type { HermesSettingsAdapter } from "./hermes-settings.js";
 import { HermesSettingsError, OfficeGlobalSettingsStore } from "./hermes-settings.js";
 import { routeSettingsHttp } from "./settings-http.js";
+import { SecretTransferStore } from "./secret-transfer.js";
 
 const REVISION = "a".repeat(43);
 
 test("settings HTTP routes reads and revisioned mutations without exposing backend details", async (t) => {
-  const directory = await mkdtemp(join(tmpdir(), "hermes-office-http-settings-"));
+  const directory = await mkdtemp(join(tmpdir(), "hermes-studio-http-settings-"));
   t.after(() => rm(directory, { recursive: true, force: true }));
   const calls: Array<{ method: string; args: unknown[] }> = [];
   const adapter = makeAdapter(calls);
@@ -54,18 +55,39 @@ test("settings HTTP routes reads and revisioned mutations without exposing backe
   assert.equal((await jsonFetch(`${origin}/api/v1/profiles/coder/soul`, "PUT", { content: "identity", expectedRevision: REVISION })).status, 200);
   assert.equal((await jsonFetch(`${origin}/api/v1/profiles/coder/memory/provider`, "PUT", { provider: "honcho", expectedProvider: "builtin" })).status, 200);
   assert.equal((await jsonFetch(`${origin}/api/v1/profiles/coder/memory/providers/honcho`, "PATCH", { values: { mode: "local" }, expectedRevision: REVISION })).status, 200);
+  assert.equal((await fetch(`${origin}/api/v1/profiles/coder/memory/files`)).status, 200);
+  assert.equal((await jsonFetch(`${origin}/api/v1/profiles/coder/memory/files/memory`, "PUT", { content: "note", expectedRevision: REVISION })).status, 200);
+  assert.equal((await jsonFetch(`${origin}/api/v1/profiles/coder/memory/reset`, "POST", { target: "user" })).status, 200);
 
-  assert.deepEqual(calls.filter((call) => call.method.startsWith("set") || call.method.startsWith("update")), [
+  assert.equal((await fetch(`${origin}/api/v1/profiles/coder/config/schema`)).status, 200);
+  assert.equal((await fetch(`${origin}/api/v1/profiles/coder/config`)).status, 200);
+  const configPatch = await jsonFetch(`${origin}/api/v1/profiles/coder/config`, "PATCH", {
+    expectedRevision: REVISION,
+    changes: { model: "anthropic/claude-opus-4" },
+  });
+  assert.equal(configPatch.status, 200);
+  assert.equal((configPatch.body as { values: { model: string } }).values.model, "anthropic/claude-opus-4");
+
+  const configRootRejected = await jsonFetch(`${origin}/api/v1/profiles/coder/config`, "PATCH", {
+    expectedRevision: REVISION,
+    config: { model: "x" },
+  });
+  assert.equal(configRootRejected.status, 400);
+
+  assert.deepEqual(calls.filter((call) => call.method.startsWith("set") || call.method.startsWith("update") || call.method.startsWith("reset")), [
     { method: "setSkillEnabled", args: ["coder", "local", false, true] },
     { method: "updateSkillContent", args: ["coder", "local", "safe", REVISION] },
     { method: "updateProfileSoul", args: ["coder", "identity", REVISION] },
     { method: "setMemoryProvider", args: ["coder", "honcho", "builtin"] },
     { method: "updateMemoryProviderConfig", args: ["coder", "honcho", { mode: "local" }, REVISION] },
+    { method: "updateBuiltinMemoryFile", args: ["coder", "memory", "note", REVISION] },
+    { method: "resetBuiltinMemory", args: ["coder", "user"] },
+    { method: "updateProfileConfig", args: ["coder", { expectedRevision: REVISION, changes: { model: "anthropic/claude-opus-4" } }] },
   ]);
 });
 
-test("settings HTTP rejects unbounded/unknown input and omits memory reset and secret routes", async (t) => {
-  const directory = await mkdtemp(join(tmpdir(), "hermes-office-http-settings-safe-"));
+test("settings HTTP rejects unbounded/unknown input and secret routes", async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), "hermes-studio-http-settings-safe-"));
   t.after(() => rm(directory, { recursive: true, force: true }));
   const adapter = makeAdapter([]);
   let persistenceWrites = 0;
@@ -80,8 +102,8 @@ test("settings HTTP rejects unbounded/unknown input and omits memory reset and s
   const origin = await listen(server);
   t.after(() => server.close());
 
-  const reset = await jsonFetch(`${origin}/api/v1/profiles/coder/memory/reset`, "POST", { target: "all" });
-  assert.equal(reset.status, 404);
+  const badReset = await jsonFetch(`${origin}/api/v1/profiles/coder/memory/reset`, "POST", { target: "bogus" });
+  assert.equal(badReset.status, 400);
   const secret = await jsonFetch(`${origin}/api/v1/profiles/coder/memory/providers/honcho/secret`, "PUT", { apiKey: "hidden" });
   assert.equal(secret.status, 404);
   const extra = await jsonFetch(`${origin}/api/v1/profiles/coder/skills/local`, "PATCH", { enabled: true, expectedEnabled: false, token: "hidden" });
@@ -114,7 +136,7 @@ test("settings HTTP rejects unbounded/unknown input and omits memory reset and s
 });
 
 test("settings HTTP maps adapter conflict and failure to stable public errors", async (t) => {
-  const directory = await mkdtemp(join(tmpdir(), "hermes-office-http-settings-errors-"));
+  const directory = await mkdtemp(join(tmpdir(), "hermes-studio-http-settings-errors-"));
   t.after(() => rm(directory, { recursive: true, force: true }));
   const adapter = makeAdapter([]);
   adapter.setSkillEnabled = async () => { throw new HermesSettingsError("conflict", "Hermes setting changed; refresh before saving."); };
@@ -137,7 +159,7 @@ test("settings HTTP maps adapter conflict and failure to stable public errors", 
 });
 
 test("profile skill override is persisted only after the Hermes mutation succeeds", async (t) => {
-  const directory = await mkdtemp(join(tmpdir(), "hermes-office-http-skill-override-"));
+  const directory = await mkdtemp(join(tmpdir(), "hermes-studio-http-skill-override-"));
   t.after(() => rm(directory, { recursive: true, force: true }));
   const store = new OfficeGlobalSettingsStore(join(directory, "global.json"));
   const staged = await store.beginMaterialization({ expectedRevision: 0, skills: ["local"] });
@@ -181,21 +203,200 @@ function makeAdapter(calls: Array<{ method: string; args: unknown[] }>): HermesS
   const memory = { activeProvider: "builtin", providers: [{ name: "builtin", description: "Built-in", configured: true }], builtin: { memoryBytes: 1, userBytes: 0, hasMemory: true, hasUser: false } };
   const soul = { profile: "coder", content: "identity", exists: true, redacted: false, revision: REVISION };
   const config = { name: "honcho", label: "Honcho", fields: [], revision: REVISION };
+  const memoryFile = { key: "memory" as const, content: "note", exists: true, bytes: 4, revision: REVISION };
+  const userFile = { key: "user" as const, content: "", exists: false, bytes: 0, revision: REVISION };
+  const files = { profile: "coder", memory: memoryFile, user: userFile };
   return {
     getProfileSettings: record("getProfileSettings", { profile: "coder", skills: [skill], memory, soul }),
     listSkills: record("listSkills", [skill]),
     setSkillEnabled: record("setSkillEnabled", undefined),
     getSkillContent: record("getSkillContent", { name: "local", content: "safe", redacted: false, revision: REVISION }),
-    updateSkillContent: record("updateSkillContent", undefined),
+    updateSkillContent: record("updateSkillContent", { name: "local", content: "safe", redacted: false, revision: REVISION }),
     getMemoryStatus: record("getMemoryStatus", memory),
-    setMemoryProvider: record("setMemoryProvider", undefined),
+    setMemoryProvider: record("setMemoryProvider", { ...memory, activeProvider: "honcho" }),
     getMemoryProviderConfig: record("getMemoryProviderConfig", config),
-    updateMemoryProviderConfig: record("updateMemoryProviderConfig", undefined),
-    resetBuiltinMemory: record("resetBuiltinMemory", undefined),
+    updateMemoryProviderConfig: record("updateMemoryProviderConfig", config),
+    getBuiltinMemoryFiles: record("getBuiltinMemoryFiles", files),
+    updateBuiltinMemoryFile: record("updateBuiltinMemoryFile", memoryFile),
+    resetBuiltinMemory: record("resetBuiltinMemory", { files, status: memory }),
     getProfileSoul: record("getProfileSoul", soul),
-    updateProfileSoul: record("updateProfileSoul", undefined),
+    updateProfileSoul: record("updateProfileSoul", soul),
+    getProfileConfigSchema: record("getProfileConfigSchema", {
+      profile: "coder",
+      categories: ["general"],
+      fields: [{ id: "model", category: "general", type: "string", description: "Default model", options: [] }],
+      excludedCount: 2,
+    }),
+    getProfileConfig: record("getProfileConfig", {
+      profile: "coder",
+      revision: REVISION,
+      categories: ["general"],
+      fields: [{ id: "model", category: "general", type: "string", description: "Default model", options: [] }],
+      values: { model: "anthropic/claude-sonnet-4" },
+      excludedCount: 2,
+    }),
+    updateProfileConfig: record("updateProfileConfig", {
+      profile: "coder",
+      revision: "b".repeat(43),
+      categories: ["general"],
+      fields: [{ id: "model", category: "general", type: "string", description: "Default model", options: [] }],
+      values: { model: "anthropic/claude-opus-4" },
+      excludedCount: 2,
+    }),
+    getPrivilegedProfileConfig: record("getPrivilegedProfileConfig", {
+      profile: "coder",
+      revision: REVISION,
+      categories: ["terminal"],
+      fields: [{
+        id: "terminal.timeout",
+        category: "terminal",
+        type: "number",
+        description: "Terminal timeout",
+        options: [],
+        impact: "restart",
+        requiresConfirmation: true,
+      }],
+      values: { "terminal.timeout": 30 },
+      unsupportedCount: 0,
+      secretFieldCount: 1,
+    }),
+    updatePrivilegedProfileConfig: record("updatePrivilegedProfileConfig", {
+      profile: "coder",
+      revision: "b".repeat(43),
+      categories: ["terminal"],
+      fields: [{
+        id: "terminal.timeout",
+        category: "terminal",
+        type: "number",
+        description: "Terminal timeout",
+        options: [],
+        impact: "restart",
+        requiresConfirmation: true,
+      }],
+      values: { "terminal.timeout": 60 },
+      unsupportedCount: 0,
+      secretFieldCount: 1,
+    }),
+    listProfileSecrets: record("listProfileSecrets", {
+      profile: "coder",
+      revision: REVISION,
+      fields: [
+        {
+          key: "OPENAI_API_KEY",
+          source: "env",
+          label: "OpenAI",
+          description: "API key",
+          category: "provider",
+          isSet: true,
+          isPassword: true,
+          canClear: true,
+        },
+        {
+          key: "api_key",
+          source: "memory-provider",
+          label: "API key",
+          description: "Hindsight key",
+          category: "memory-provider",
+          isSet: false,
+          isPassword: true,
+          canClear: false,
+          provider: "hindsight",
+          providerLabel: "Hindsight",
+        },
+      ],
+    }),
+    writeProfileSecret: record("writeProfileSecret", {
+      profile: "coder",
+      revision: "b".repeat(43),
+      fields: [{
+        key: "api_key",
+        source: "memory-provider",
+        label: "API key",
+        description: "Hindsight key",
+        category: "memory-provider",
+        isSet: true,
+        isPassword: true,
+        canClear: true,
+        provider: "hindsight",
+        providerLabel: "Hindsight",
+      }],
+    }),
   } as HermesSettingsAdapter;
 }
+
+test("profile projects routes proxy the official Hermes projects adapter", async (t) => {
+  const calls: Array<{ method: string; args: unknown[] }> = [];
+  const record = <T>(method: string, value: T) => async (...args: unknown[]): Promise<T> => { calls.push({ method, args }); return value; };
+  const project = {
+    id: "p1",
+    slug: "web",
+    name: "Web",
+    description: null,
+    icon: null,
+    color: null,
+    boardSlug: null,
+    primaryPath: "/repo",
+    archived: false,
+    createdAt: 1,
+    folders: [{ path: "/repo", label: null, isPrimary: true, addedAt: 1 }],
+  };
+  const projects = {
+    listProjects: record("listProjects", { projects: [project], activeId: null }),
+    createProject: record("createProject", { project }),
+    updateProject: record("updateProject", { project }),
+    deleteProject: record("deleteProject", { projects: [], activeId: null }),
+    addFolder: record("addFolder", { project }),
+    removeFolder: record("removeFolder", { project }),
+  };
+  const directory = await mkdtemp(join(tmpdir(), "hermes-studio-http-projects-"));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const server = createServer(async (request, response) => {
+    const result = await routeSettingsHttp(
+      request,
+      new URL(request.url ?? "/", "http://office.local"),
+      {
+        settings: makeAdapter([]),
+        globalSettings: new OfficeGlobalSettingsStore(join(directory, "global.json")),
+        projects,
+      },
+      4_096,
+    );
+    response.writeHead(result.status, { "Content-Type": "application/json" });
+    response.end(JSON.stringify(result.body));
+  });
+  const origin = await listen(server);
+  t.after(() => server.close());
+
+  const listed = await jsonFetch(`${origin}/api/v1/profiles/coder/projects`, "GET", undefined);
+  assert.equal(listed.status, 200);
+  assert.equal((listed.body as { projects: unknown[] }).projects.length, 1);
+
+  const created = await jsonFetch(`${origin}/api/v1/profiles/coder/projects`, "POST", { name: "Web", path: "/repo", isPrimary: true });
+  assert.equal(created.status, 200);
+  assert.deepEqual(calls.at(-1), { method: "createProject", args: ["coder", { name: "Web", path: "/repo", isPrimary: true }] });
+
+  const renamed = await jsonFetch(`${origin}/api/v1/profiles/coder/projects/p1`, "PATCH", { name: "Web 2" });
+  assert.equal(renamed.status, 200);
+  assert.deepEqual(calls.at(-1), { method: "updateProject", args: ["coder", "p1", { name: "Web 2" }] });
+
+  const added = await jsonFetch(`${origin}/api/v1/profiles/coder/projects/p1/folders`, "POST", { path: "/repo2" });
+  assert.equal(added.status, 200);
+  assert.deepEqual(calls.at(-1), { method: "addFolder", args: ["coder", "p1", { path: "/repo2" }] });
+
+  const unbound = await jsonFetch(`${origin}/api/v1/profiles/coder/projects/p1/folders`, "DELETE", { path: "/repo2" });
+  assert.equal(unbound.status, 200);
+  assert.deepEqual(calls.at(-1), { method: "removeFolder", args: ["coder", "p1", "/repo2"] });
+
+  const deleted = await jsonFetch(`${origin}/api/v1/profiles/coder/projects/p1`, "DELETE", undefined);
+  assert.equal(deleted.status, 200);
+  assert.deepEqual(calls.at(-1), { method: "deleteProject", args: ["coder", "p1"] });
+
+  const invalid = await jsonFetch(`${origin}/api/v1/profiles/coder/projects`, "POST", { name: "Web", bogus: true });
+  assert.equal(invalid.status, 400);
+
+  const missingName = await jsonFetch(`${origin}/api/v1/profiles/coder/projects`, "POST", { path: "/repo" });
+  assert.equal(missingName.status, 400);
+});
 
 async function listen(server: ReturnType<typeof createServer>): Promise<string> {
   await new Promise<void>((resolve, reject) => { server.once("error", reject); server.listen(0, "127.0.0.1", resolve); });
@@ -207,3 +408,130 @@ async function jsonFetch(url: string, method: string, body: unknown): Promise<{ 
   const response = await fetch(url, { method, headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
   return { status: response.status, body: await response.json() as unknown };
 }
+
+test("privileged config and secrets require desktop capability and never leak secret bytes", async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), "hermes-studio-http-privileged-"));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const calls: Array<{ method: string; args: unknown[] }> = [];
+  const adapter = makeAdapter(calls);
+  const globalSettings = new OfficeGlobalSettingsStore(join(directory, "global.json"));
+  const secretTransfers = new SecretTransferStore({ ttlMs: 30_000, maxPending: 4 });
+  const server = createServer(async (request, response) => {
+    const url = new URL(request.url ?? "/", "http://office.local");
+    // Ordinary browser session (no desktop capability) unless path sets the flag.
+    const desktop = url.searchParams.get("desktop") === "1";
+    const result = await routeSettingsHttp(
+      request,
+      url,
+      {
+        settings: adapter,
+        globalSettings,
+        secretTransfers,
+        privilegedOwnerSession: desktop,
+      },
+      16 * 1024,
+    );
+    response.writeHead(result.status, { "Content-Type": "application/json", ...(result.headers ?? {}) });
+    response.end(JSON.stringify(result.body));
+  });
+  const origin = await listen(server);
+  t.after(() => server.close());
+
+  assert.equal((await fetch(`${origin}/api/v1/profiles/coder/privileged-config`)).status, 403);
+  assert.equal((await fetch(`${origin}/api/v1/profiles/coder/secrets`)).status, 403);
+  assert.equal((await jsonFetch(`${origin}/api/v1/secret-transfers`, "POST", { value: "x" })).status, 403);
+
+  const privileged = await fetch(`${origin}/api/v1/profiles/coder/privileged-config?desktop=1`);
+  assert.equal(privileged.status, 200);
+  const privilegedBody = await privileged.json() as { values: Record<string, unknown>; secretFieldCount: number };
+  assert.equal(privilegedBody.values["terminal.timeout"], 30);
+  assert.equal(JSON.stringify(privilegedBody).includes("sk-"), false);
+
+  const secrets = await fetch(`${origin}/api/v1/profiles/coder/secrets?desktop=1`);
+  assert.equal(secrets.status, 200);
+  const secretsBody = await secrets.json() as { fields: Array<Record<string, unknown>> };
+  assert.equal(secretsBody.fields[0]?.isSet, true);
+  assert.equal("value" in (secretsBody.fields[0] ?? {}), false);
+  assert.equal(JSON.stringify(secretsBody).includes("sk-"), false);
+
+  const deposit = await jsonFetch(`${origin}/api/v1/secret-transfers?desktop=1`, "POST", { value: "native-only-secret" });
+  assert.equal(deposit.status, 200);
+  const transferId = (deposit.body as { transferId: string }).transferId;
+  assert.equal(typeof transferId, "string");
+  assert.equal(JSON.stringify(deposit.body).includes("native-only-secret"), false);
+
+  const consume = await jsonFetch(`${origin}/api/v1/profiles/coder/secrets?desktop=1`, "POST", {
+    transferId,
+    key: "OPENAI_API_KEY",
+    source: "env",
+    expectedRevision: REVISION,
+  });
+  assert.equal(consume.status, 200);
+  assert.equal(JSON.stringify(consume.body).includes("native-only-secret"), false);
+
+  const replay = await jsonFetch(`${origin}/api/v1/profiles/coder/secrets?desktop=1`, "POST", {
+    transferId,
+    key: "OPENAI_API_KEY",
+    source: "env",
+  });
+  assert.equal(replay.status, 404);
+
+  const writeCall = calls.find((call) => call.method === "writeProfileSecret");
+  assert.ok(writeCall);
+  // Adapter receives secret only after one-shot consume — never from browser JSON value field.
+  assert.equal((writeCall!.args[1] as { value: string }).value, "native-only-secret");
+  assert.equal((writeCall!.args[1] as { key: string }).key, "OPENAI_API_KEY");
+
+  // Memory-provider secret: transferId + provider + key only on the browser wire.
+  const memDeposit = await jsonFetch(`${origin}/api/v1/secret-transfers?desktop=1`, "POST", { value: "hindsight-secret" });
+  assert.equal(memDeposit.status, 200);
+  const memTransferId = (memDeposit.body as { transferId: string }).transferId;
+  const memConsume = await jsonFetch(`${origin}/api/v1/profiles/coder/secrets?desktop=1`, "POST", {
+    transferId: memTransferId,
+    key: "api_key",
+    source: "memory-provider",
+    provider: "hindsight",
+    expectedRevision: REVISION,
+  });
+  assert.equal(memConsume.status, 200);
+  const memBody = JSON.stringify(memConsume.body);
+  assert.equal(memBody.includes("hindsight-secret"), false);
+  // Response DTO may include field metadata for UI reload; never secret values.
+  assert.equal(memBody.includes("value"), false);
+  const memWrite = calls.filter((call) => call.method === "writeProfileSecret").at(-1);
+  assert.ok(memWrite);
+  assert.deepEqual(memWrite!.args[1], {
+    key: "api_key",
+    source: "memory-provider",
+    value: "hindsight-secret",
+    provider: "hindsight",
+    expectedRevision: REVISION,
+  });
+
+  // Reject memory-provider writes without a validated provider id.
+  const badDeposit = await jsonFetch(`${origin}/api/v1/secret-transfers?desktop=1`, "POST", { value: "x" });
+  const badTransfer = (badDeposit.body as { transferId: string }).transferId;
+  const missingProvider = await jsonFetch(`${origin}/api/v1/profiles/coder/secrets?desktop=1`, "POST", {
+    transferId: badTransfer,
+    key: "api_key",
+    source: "memory-provider",
+  });
+  assert.equal(missingProvider.status, 400);
+
+  // Clear/unset: empty-string deposit + consume still never returns secret material.
+  const clearDeposit = await jsonFetch(`${origin}/api/v1/secret-transfers?desktop=1`, "POST", { value: "" });
+  assert.equal(clearDeposit.status, 200);
+  const clearId = (clearDeposit.body as { transferId: string }).transferId;
+  const clearConsume = await jsonFetch(`${origin}/api/v1/profiles/coder/secrets?desktop=1`, "POST", {
+    transferId: clearId,
+    key: "OPENAI_API_KEY",
+    source: "env",
+    expectedRevision: REVISION,
+  });
+  assert.equal(clearConsume.status, 200);
+  assert.equal(JSON.stringify(clearConsume.body).includes("value"), false);
+  const clearWrite = calls.filter((call) => call.method === "writeProfileSecret").at(-1);
+  assert.ok(clearWrite);
+  assert.equal((clearWrite!.args[1] as { value: string }).value, "");
+  assert.equal((clearWrite!.args[1] as { key: string }).key, "OPENAI_API_KEY");
+});

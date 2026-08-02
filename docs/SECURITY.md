@@ -6,7 +6,7 @@ Hermes Agent can execute tools with the host user's authority. Prompts, Profile
 instructions, Skills, Memory, and Kanban-triggered activity are therefore
 execution-adjacent input rather than ordinary low-risk application data.
 
-Hermes Office is experimental, pre-1.0 software. Its currently supported model
+Hermes Studio is experimental, pre-1.0 software. Its currently supported model
 is one trusted operator on one machine, with Office and Hermes on loopback.
 Private-network remote access by that same operator is experimental. Direct
 public-internet exposure, untrusted multi-user use, and tenant isolation are not
@@ -19,8 +19,8 @@ independent audit, certification, or warranty.
 
 ### Listener and request boundary
 
-- Office Server binds to loopback by default.
-- Office Server requires a loopback listener; direct non-loopback binding is
+- Studio Server binds to loopback by default.
+- Studio Server requires a loopback listener; direct non-loopback binding is
   rejected. Remote browsers must arrive through the configured loopback proxy.
 - Local bootstrap checks the peer address, exact Host/Origin allowlists, and
   rejects forwarded requests rather than trusting proxy headers.
@@ -93,21 +93,85 @@ invalid-digest registry fails closed and does not reopen enrollment.
 
 - Browsers receive normalized Office DTOs rather than the Hermes token, Hermes
   backend URL, Profile filesystem paths, or raw provider-secret objects.
+- Local model discovery probes only fixed loopback OpenCodex/Ollama/LM Studio/
+  vLLM model-list URLs with short deadlines and bounded responses. It reads
+  provider/model identifiers only and reconciles only Studio-owned
+  `local-cli-*`/`local-runtime-*` custom endpoints with fixed loopback base URLs
+  (including removal of obsolete Studio-owned duplicates at those exact URLs);
+  it never imports CLI credentials or client-supplied endpoint addresses. The
+  remote-safe `local-model-providers.sync` operation is therefore a bounded
+  rescan of host-local public metadata, not arbitrary profile configuration.
+- Schema-driven Hermes config is filtered fail-closed by field-id policy (not
+  Hermes category merges alone): only ordinary non-secret, non-execution-
+  adjacent leaves cross the Office boundary on the Advanced surface. Whole
+  trees such as terminal, auxiliary, delegation, and write-approval surfaces
+  are excluded from Advanced. PATCH accepts dotted leaf changes only (no root
+  config object / raw YAML). Hermes 0.18.2 null→string schema inference is
+  rejected unless schema type and live value resolve unambiguously; list
+  editors accept string rows only (no silent boolean/number coercion).
+  Secret-shaped values are dropped on read and rejected on ordinary writes.
+  Audit/`profile.changed` omit field names and values. Operation
+  `profile-config.update` is manager + **step-up-required** and CSRF
+  protected, so remote devices without local step-up cannot mutate Advanced
+  config.
+- Privileged non-secret Hermes leaves and secret metadata use
+  `privileged-config.read` / `privileged-config.update` / `secret.write`
+  (owner tier). Local owners always receive these ops. Remote owner devices
+  receive them only when `HERMES_STUDIO_REMOTE_PRIVILEGED=true` (Tailscale
+  launcher sets this intentionally; default off elsewhere). Protocol
+  authorize + `allowedOperations` both enforce the flag; handlers use a
+  server-derived privileged-owner session bit (never client headers or
+  Tailscale IPs). Secret bytes deposit via Tauri native IPC on desktop, or
+  via authenticated `POST /api/v1/secret-transfers` `{ value }` for remote
+  owners (CSRF + owner + remote-safe); response is transferId only. Consume
+  carries transferId + field metadata only. Clear/unset remains a confirmed
+  empty transfer. Memory-provider clear deletes at most one env key under the
+  exact unique provider-match rule. Secrets never appear in responses, audit
+  events (kind/profile/count only), snapshots, or ordinary config DTOs.
+  Tailscale provides network privacy only; Office owner-device authentication
+  remains mandatory.
+- Fixed host application installation uses the auditable `host-app.install`
+  operation (owner tier). Remote owners receive it only under the same explicit
+  `HERMES_STUDIO_REMOTE_PRIVILEGED=true` deployment gate. The Obsidian handler
+  accepts no request body and runs one absolute Homebrew executable with the
+  fixed argument list `install --cask obsidian`; installer output is discarded. Local Hermes Agent updates use the same owner/remote-privileged gate with fixed argv `update --yes` (`hermes-agent.update`); updater output is discarded
+  and never reflected to clients or logs. See [`HOST-APPS.md`](HOST-APPS.md).
+- Obsidian graph reads use the owner-tier, remote-privileged
+  `obsidian.vault.read` operation. Vault paths come only from Obsidian's local
+  registry; request parameters are opaque ids. Responses exclude note bodies
+  and absolute paths, skip symlinks and application/config directories, and
+  enforce note, node, edge, and response-size bounds.
 - Managed and adopted Hermes endpoints are restricted to loopback.
 - Hermes child processes receive a constructed environment allowlist rather
-  than Office Server's complete environment; Office auth/proxy configuration
+  than Studio Server's complete environment; Office auth/proxy configuration
   and unrelated provider credentials are not inherited.
 - Profile settings that Hermes scopes to a process are routed to a
   Profile-pinned Hermes backend.
-- General provider-secret entry, Skill installation/deletion, destructive
-  Memory reset, raw Memory-file editing, and arbitrary Hermes RPC are excluded
-  from the GUI/API.
+- General provider-secret entry, Skill installation/deletion, and arbitrary
+  Hermes RPC remain excluded from the GUI/API. Destructive built-in Memory
+  reset and raw `MEMORY.md`/`USER.md` **read/edit** are available only through
+  the versioned Office settings surface under the `memory.update` policy
+  (minimum manager tier, step-up/local for remote devices; CSRF on mutations),
+  with fixed profile-home paths, rejection of symlink or non-directory
+  `memories/` components as well as leaf symlink/non-regular files,
+  UTF-8/NUL/size limits, atomic mode-0600 writes, and revision conflicts.
+  Document bodies are not copied into audit records or change events. Memory
+  status sizes and non-secret provider schema remain on ordinary `state.read`.
 - Office global context rejects likely credentials and is injected only into a
   newly created session through an internal server path.
+- Office Teams are user-owned Office metadata (opaque team IDs, name, color,
+  optional description/lead, ordered unique member profile IDs). They are stored
+  with atomic writes, mode-0600 files under mode-0700 directories by default,
+  bounded request/file size, and race-safe serialization. Because team context,
+  skills, and membership feed new-session inheritance, Team mutations require
+  manager tier plus verified local step-up. Teams never write
+  Hermes Agent `kanban.db` and never replace individual card assignees.
 
 The desktop shell canonicalizes local Node/Hermes executable paths, rejects
 group/world-writable or unexpected-owner files on Unix, bounds version probes,
-and requires Node 22.x plus Hermes Agent 0.18.x. These executables are not yet
+and requires Node 22.x plus an installed Hermes Agent with a valid semantic
+version. Hermes releases are not pinned; Studio instead validates the API
+response contracts it consumes. These executables are not yet
 verified against a project-signed digest manifest. Treat the local installation
 and user account as part of the trusted computing base.
 
@@ -140,7 +204,7 @@ If remote access is necessary:
 5. restrict the private network to devices controlled by the same trusted
    operator;
 6. if a device is lost, generate a different token, replace
-   `HERMES_OFFICE_REMOTE_TOKEN`, restart Office, and enroll the replacement;
+   `HERMES_STUDIO_REMOTE_TOKEN`, restart Office, and enroll the replacement;
    this revokes every older remote device;
 7. if the registry is corrupt, stop Office, move the registry aside as the local
    host owner, configure a different token, restart, and enroll again; never edit
@@ -148,6 +212,41 @@ If remote access is necessary:
    fails closed and remains enrollment-consumed, so the owner must inspect,
    replace, or remove it while Office is stopped;
 8. never expose stock `hermes serve` directly.
+
+For a private Tailscale tailnet (including phones), the supported host entry
+point is `npm run start:tailnet` (`scripts/start-tailnet.mjs`). It discovers the
+host MagicDNS name from `tailscale status --json`, requires
+`HERMES_STUDIO_REMOTE_TOKEN`, sets the single canonical `https://…ts.net` origin
+in `HERMES_STUDIO_ALLOWED_ORIGINS` (rejects any pre-existing non-loopback remote
+origin that differs; valid loopback origins may remain), defaults
+`HERMES_STUDIO_TRUSTED_PROXY_HOPS` to `1` when unset, inspects Serve JSON and
+creates persistent private Serve only when empty or already an exact private
+HTTPS root reverse-proxy
+(`tailscale serve --bg --https=443 http://127.0.0.1:4317`, without `--yes` so
+Tailscale may require interactive HTTPS/Serve consent), runs production asset
+preflight before creating Serve, and starts the production Studio launcher. It
+fails closed on missing Tailscale, invalid DNS names, non-HTTPS or alternate
+remote origins, missing/short tokens, non-loopback binds, missing production
+assets, conflicting or unrecognized Serve configuration, and Funnel mapping. It
+does not enable Funnel, bind Office to a LAN or tailnet address, invent a second
+Studio Server URL, or switch browser endpoints. Remote clients need the official
+Tailscale mobile app (same tailnet) and open the single HTTPS origin in a
+browser or PWA—there is no native Hermes Studio app. Tailscale selects direct
+peer-to-peer or DERP relay transport; Office remains same-origin. Operator
+detail: [`TAILSCALE.md`](TAILSCALE.md).
+
+The installed macOS desktop app can own that same remote-enabled Office process
+through `npm run start:tailnet:desktop`. This uses the same discovery, exact
+origin, proxy-hop, Serve-conflict, Funnel, and token checks, then directly
+launches the packaged executable so the validated environment reaches its owned
+Office child. It refuses to start while port `4317` is occupied, avoiding an
+accidental attachment to an already-running local-only desktop server. The
+native app stores that already-validated configuration as one encrypted macOS
+Keychain generic-password item. Normal icon launches use it only when no remote
+configuration environment value is explicitly present; an explicit environment
+deployment takes precedence as a whole. Malformed, unsupported, locked, or denied Keychain data fails closed
+with a desktop startup notice. `npm run forget:tailnet:desktop` removes the saved
+item but does not alter persistent Tailscale Serve configuration.
 
 ## Desktop host administration panel
 
@@ -161,24 +260,19 @@ The panel never displays the enrollment token, device credential digests, or
 cookies.
 
 When the desktop shell finds an existing listener with the compatible health
-contract and expected Hermes Office HTML shape, those public checks establish
-only a candidate and do not authenticate its identity. The shell keeps its
-window open on a fixed notice; it neither navigates to the listener nor opens a
-system browser. The operator must first verify that the process owning port 4317
-is their Hermes Office and only then manually open the fixed loopback URL in a
-normal browser. If the owner is unknown, the URL must not be opened; the process
-should be inspected or stopped through its normal management procedure. A
-manually opened browser page does not use Tauri IPC, including when the existing
-server carries an older protocol-v1 web bundle, so the
-ephemeral desktop capability is unavailable and the host administration panel is
-not rendered. The external server is not spawned, stopped, or killed by the
-launcher. The desktop app is optional and is not needed on remote clients.
-Automatic creation of the configured `main` window is disabled. The launcher
-creates no native window, WebView, or normal app bundle until classification has
-completed. It loads the normal app URL only after an owned child passes its
-capability-keyed HMAC readiness check. For every candidate or error, it creates the
-window with the fixed self-contained `data:` notice as the initial URL; there is
-no earlier bundle load or navigation that could contact the listener.
+contract and expected Hermes Studio HTML shape, it opens
+`http://127.0.0.1:4317/` in the WebView (same UI as a browser). Those public
+shape checks are **not** cryptographic identity of the process; they are the
+operator-local trust boundary for loopback Hermes Studio. The shell does not
+spawn a second server, generate an ephemeral desktop capability, or stop/kill
+the existing process when the app exits. Without the desktop capability, Tauri
+IPC and the host administration panel are unavailable—matching a normal browser
+session. Incompatible, malformed, timing-out, non-Hermes, or Web-UI-missing
+listeners still fail closed with a fixed self-contained `data:` notice and are
+never stopped or replaced. Automatic creation of the configured `main` window is
+disabled until classification (and owned-child readiness when the port is free)
+completes. The normal packaged app URL loads only after an owned child passes its
+capability-keyed HMAC readiness check.
 
 The owned-child readiness check is a challenge-response protocol; it is not an
 authenticated request that transmits the desktop capability. Every probe uses a
@@ -230,15 +324,22 @@ server-supplied content, scripts, external resources, or secrets and does not
 stop or replace the existing process. Recovery instructions are fixed per
 failure kind: port owner and normal-close checks for an unrelated listener;
 update or normal restart and log checks for compatibility and probe failures;
-combined development or built web assets only when the Web UI is unavailable;
-and identity/owner verification before manual loopback opening for a candidate.
+combined development or built web assets only when the Web UI is unavailable.
 Owned-server runtime, resource, child-launch, readiness, and internal-state
 failures also have separate fixed instructions.
 
-Changing remote access requires editing `HERMES_OFFICE_REMOTE_TOKEN`,
-`HERMES_OFFICE_ALLOWED_ORIGINS`, `HERMES_OFFICE_TRUSTED_PROXY_HOPS`, and
-restarting Office; no in-browser toggle, scheduler, or Tailscale automation
-modifies them.
+Changing server-only remote access requires updating the host environment
+(`HERMES_STUDIO_REMOTE_TOKEN`, and when not using `start:tailnet` also
+`HERMES_STUDIO_ALLOWED_ORIGINS` / `HERMES_STUDIO_TRUSTED_PROXY_HOPS`) and
+restarting Office. Desktop persistence is updated by rerunning
+`npm run start:tailnet:desktop` with the intended token and removed with
+`npm run forget:tailnet:desktop`. The optional `npm run start:tailnet` host
+launcher may set the single discovered HTTPS origin, default trusted proxy hops to `1`, and
+create private Tailscale Serve only when empty or already exact (never
+overwriting a different Serve config); no in-browser toggle, scheduler, or
+remote UI can modify those values. Serve configuration is owned by the host
+Tailscale daemon (`--bg` persists until cleared with `tailscale serve`
+off/reset).
 
 The `/api/v1/host/remote` status endpoint requires the Tauri desktop capability,
 while POST `/api/v1/devices/:id/revoke` deliberately remains local-owner + CSRF
@@ -274,7 +375,7 @@ review support that statement.
 - Never return Office, Hermes, provider, tunnel, or identity-provider secrets in
   browser DTOs, logs, audit records, errors, URLs, or WebSocket events.
 - Construct child-process environments from an explicit minimum allowlist; do
-  not inherit the entire Office Server environment.
+  not inherit the entire Studio Server environment.
 - Keep Hermes endpoints on loopback and reject redirects or alternate addresses
   that escape that boundary.
 - Apply authorization on the server for every request and socket operation;

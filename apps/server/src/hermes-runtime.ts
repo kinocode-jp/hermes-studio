@@ -4,9 +4,6 @@ import { redactSecrets } from "./secret-scrubber.js";
 const DEFAULT_TIMEOUT_MS = 2_000;
 const DEFAULT_MAX_RESPONSE_BYTES = 64 * 1024;
 const MAX_CLI_OUTPUT_BYTES = 8 * 1024;
-const SUPPORTED_HERMES_MAJOR = 0;
-const SUPPORTED_HERMES_MINOR = 18;
-
 export type HermesRuntimeState = "incompatible" | "ready" | "unavailable";
 export type HermesCliState = "available" | "incompatible" | "not_configured" | "unavailable";
 
@@ -125,43 +122,59 @@ export function normalizeBaseUrl(raw: string): URL {
 export async function probeHermesCli(
   executable: string | undefined,
   timeoutMs = DEFAULT_TIMEOUT_MS,
+  signal?: AbortSignal,
 ): Promise<HermesCliHealth> {
   if (executable === undefined || executable.trim() === "") {
     return { state: "not_configured" };
   }
   if (executable.includes("\0")) return { state: "unavailable" };
+  if (signal?.aborted === true) return { state: "unavailable" };
 
   const boundedTimeout = boundedInteger(timeoutMs, DEFAULT_TIMEOUT_MS, 100, 15_000);
 
   return await new Promise((resolve) => {
     let settled = false;
     let output = "";
-    const finish = (result: HermesCliHealth): void => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      resolve(result);
-    };
     const child = spawn(executable, ["--version"], {
       shell: false,
       stdio: ["ignore", "pipe", "pipe"],
       windowsHide: true,
       env: createVersionProbeEnvironment(),
     });
+    const finish = (result: HermesCliHealth, stopChild = false): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", abort);
+      child.stdout.off("data", capture);
+      child.stderr.off("data", capture);
+      child.off("error", onError);
+      child.off("close", onClose);
+      if (stopChild && child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+      resolve(result);
+    };
     const timer = setTimeout(() => {
       child.kill("SIGKILL");
       finish({ state: "unavailable" });
     }, boundedTimeout);
     timer.unref();
+    function abort(): void {
+      child.kill("SIGKILL");
+      finish({ state: "unavailable" });
+    }
 
     const capture = (chunk: Buffer): void => {
       if (output.length >= MAX_CLI_OUTPUT_BYTES) return;
       output += chunk.toString("utf8", 0, MAX_CLI_OUTPUT_BYTES - output.length);
+      const match = /^Hermes Agent v([^\s]+)/m.exec(output);
+      if (match?.[1] !== undefined) {
+        finish(isRecognizedHermesVersion(match[1])
+          ? { state: "available", version: match[1] }
+          : { state: "unavailable" }, true);
+      }
     };
-    child.stdout.on("data", capture);
-    child.stderr.on("data", capture);
-    child.on("error", () => finish({ state: "unavailable" }));
-    child.on("close", (code) => {
+    const onError = (): void => finish({ state: "unavailable" });
+    const onClose = (code: number | null): void => {
       if (code !== 0) {
         finish({ state: "unavailable" });
         return;
@@ -171,27 +184,31 @@ export async function probeHermesCli(
         finish({ state: "unavailable" });
         return;
       }
-      finish(isSupportedHermesVersion(match[1])
+      finish(isRecognizedHermesVersion(match[1])
         ? { state: "available", version: match[1] }
-        : { state: "incompatible", version: match[1] });
-    });
+        : { state: "unavailable" });
+    };
+    child.stdout.on("data", capture);
+    child.stderr.on("data", capture);
+    child.on("error", onError);
+    child.on("close", onClose);
+    signal?.addEventListener("abort", abort, { once: true });
+    if (signal?.aborted === true) abort();
   });
 }
 
-export function isSupportedHermesVersion(version: string): boolean {
+export function isRecognizedHermesVersion(version: string): boolean {
   const match = /^(\d+)\.(\d+)\.(\d+)(?:[-+][0-9A-Za-z.-]+)?$/.exec(version);
   if (match === null) return false;
   const major = Number(match[1]);
   const minor = Number(match[2]);
   const patch = Number(match[3]);
-  return Number.isSafeInteger(major) && Number.isSafeInteger(minor) && Number.isSafeInteger(patch)
-    && major === SUPPORTED_HERMES_MAJOR
-    && minor === SUPPORTED_HERMES_MINOR;
+  return Number.isSafeInteger(major) && Number.isSafeInteger(minor) && Number.isSafeInteger(patch);
 }
 
-function createVersionProbeEnvironment(source: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+export function createVersionProbeEnvironment(source: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
   const environment: NodeJS.ProcessEnv = {};
-  for (const key of ["HOME", "PATH", "USER", "LOGNAME", "SHELL", "TMPDIR", "TEMP", "TMP", "SYSTEMROOT", "WINDIR", "COMSPEC", "PATHEXT"] as const) {
+  for (const key of ["HOME", "PATH", "USER", "LOGNAME", "SHELL", "TMPDIR", "TEMP", "TMP", "SYSTEMROOT", "WINDIR", "COMSPEC", "PATHEXT", "HERMES_HOME"] as const) {
     const value = source[key];
     if (value !== undefined && value !== "" && !value.includes("\0")) environment[key] = value;
   }
@@ -228,7 +245,7 @@ async function probeStatus(
 
     const status = parseHermesStatus(body);
     if (status === undefined) return { state: "incompatible", reason: "invalid_response" };
-    if (!isSupportedHermesVersion(status.version)) {
+    if (!isRecognizedHermesVersion(status.version)) {
       return { state: "incompatible", reason: "unsupported_version" };
     }
 

@@ -37,12 +37,12 @@ export function classifyDeviceLoginFailure(status: number, retryAfterHeader: str
     };
   }
   if (status === 404) {
-    return { code: "disabled", message: "このOffice Serverではリモート端末ログインが無効です。" };
+    return { code: "disabled", message: "このStudio Serverではリモート端末ログインが無効です。" };
   }
   if (status === 400 || status === 401 || status === 403 || status === 413) {
     return { code: "invalid", message: "端末名またはアクセストークンを確認してください。" };
   }
-  return { code: "unavailable", message: "Office Serverへログインできませんでした。接続を確認してください。" };
+  return { code: "unavailable", message: "Studio Serverへログインできませんでした。接続を確認してください。" };
 }
 
 export function normalizeDeviceName(value: string): string | undefined {

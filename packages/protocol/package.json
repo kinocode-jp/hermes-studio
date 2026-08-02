@@ -1,11 +1,11 @@
 {
-  "name": "@hermes-office/protocol",
+  "name": "@hermes-studio/protocol",
   "version": "0.0.0",
   "private": true,
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/kinocode-jp/hermes-office.git",
+    "url": "git+https://github.com/kinocode-jp/hermes-studio.git",
     "directory": "packages/protocol"
   },
   "type": "module",

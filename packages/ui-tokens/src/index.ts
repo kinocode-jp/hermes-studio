@@ -1,5 +1,5 @@
 /**
- * Hermes Office shared visual tokens.
+ * Hermes Studio shared visual tokens.
  *
  * Values are framework-agnostic so the Tauri shell and PWA can consume the
  * same product language. Components should prefer semantic aliases over raw
@@ -7,20 +7,20 @@
  */
 
 export const palette = {
-  nightBlueprint: "#101827",
-  draftingBlue: "#1B2B43",
-  ledgerPaper: "#F3E8D1",
-  signalCoral: "#F06A57",
-  terminalAqua: "#55D6BE",
-  worklightAmber: "#F2B84B",
+  nightBlueprint: "#F4F7F9",
+  draftingBlue: "#EDF3F4",
+  ledgerPaper: "#1C2733",
+  signalCoral: "#E85B48",
+  terminalAqua: "#17A98C",
+  worklightAmber: "#E0A93E",
 } as const;
 
 export const color = {
   background: palette.nightBlueprint,
-  surface: palette.draftingBlue,
-  surfaceSelected: palette.ledgerPaper,
+  surface: "#FFFFFF",
+  surfaceSelected: "rgba(85, 214, 190, 0.16)",
   text: palette.ledgerPaper,
-  textOnPaper: palette.nightBlueprint,
+  textOnPaper: "#FFFFFF",
   focus: palette.terminalAqua,
   running: palette.terminalAqua,
   connected: palette.terminalAqua,
@@ -34,19 +34,18 @@ export const color = {
 } as const;
 
 export const fontFamily = {
-  display:
-    '"Dela Gothic One", "Arial Black", "Hiragino Kaku Gothic ProN", sans-serif',
-  body: '"IBM Plex Sans JP", system-ui, -apple-system, BlinkMacSystemFont, sans-serif',
-  utility: '"Martian Mono", ui-monospace, SFMono-Regular, Menlo, monospace',
+  display: '"Noto Sans JP", system-ui, sans-serif',
+  body: '"Noto Sans JP", system-ui, sans-serif',
+  utility: '"Noto Sans JP", system-ui, sans-serif',
 } as const;
 
 export const fontSize = {
-  utility: "0.6875rem",
+  utility: "0.75rem",
   caption: "0.75rem",
   body: "0.875rem",
-  chat: "0.9375rem",
-  title: "1.5rem",
-  display: "2rem",
+  chat: "1rem",
+  title: "1rem",
+  display: "1.25rem",
 } as const;
 
 export const lineHeight = {
@@ -60,7 +59,7 @@ export const fontWeight = {
   regular: 400,
   medium: 500,
   semibold: 600,
-  display: 400,
+  display: 700,
 } as const;
 
 export const letterSpacing = {
@@ -82,19 +81,19 @@ export const space = {
 
 export const radius = {
   none: "0",
-  control: "2px",
-  panel: "4px",
+  control: "8px",
+  panel: "12px",
   round: "999px",
 } as const;
 
 export const borderWidth = {
   hairline: "1px",
-  strong: "2px",
-  focus: "2px",
+  strong: "1px",
+  focus: "1px",
 } as const;
 
 export const size = {
-  pointerTargetDesktop: "40px",
+  pointerTargetDesktop: "36px",
   pointerTargetMobile: "44px",
   taskRailMin: "240px",
   taskRailMax: "360px",
@@ -174,6 +173,6 @@ export type PaletteToken = keyof typeof palette;
 export type ColorToken = keyof typeof color;
 export type StatusName = keyof typeof status;
 export type InheritanceLevel = keyof typeof inheritance;
-export type HermesOfficeTokens = typeof tokens;
+export type HermesStudioTokens = typeof tokens;
 
 export default tokens;

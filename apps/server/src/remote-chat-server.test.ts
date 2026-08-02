@@ -4,7 +4,7 @@ import { WebSocket } from "ws";
 import type { HermesRuntimeSource } from "./hermes-backend.js";
 import type { HermesChatRequest } from "./hermes-chat.js";
 import { createDemoRuntimeStatus, createDemoSnapshot } from "./demo-state.js";
-import { createOfficeServer } from "./server.js";
+import { createStudioServer } from "./server.js";
 
 const ORIGIN = "https://office.tailnet.example";
 const TOKEN = "remote-chat-enrollment-token-with-32-chars";
@@ -35,7 +35,7 @@ test("remote operator can resume, interrupt, and read visible single-tenant sess
       }),
     }),
   } as unknown as HermesRuntimeSource;
-  const server = createOfficeServer({ port: 0, runtimeSource: runtime, remoteToken: TOKEN, trustedProxyHops: 1, allowedOrigins: [ORIGIN] });
+  const server = createStudioServer({ port: 0, runtimeSource: runtime, remoteToken: TOKEN, trustedProxyHops: 1, allowedOrigins: [ORIGIN] });
   const address = await server.listen();
   t.after(() => server.close());
   const base = `http://127.0.0.1:${address.port}`;

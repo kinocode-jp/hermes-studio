@@ -5,14 +5,18 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 import { isIP } from "node:net";
 import { dirname, isAbsolute } from "node:path";
 import {
+  isRemotePrivilegedOperation,
   OPERATION_POLICIES,
   type DeviceSummary,
   type EffectiveAccess,
   type Operation,
   type PermissionTier,
-} from "@hermes-office/protocol";
+} from "@hermes-studio/protocol";
 import { isLoopbackOrigin, isTrustedLocalOrigin, normalizeOrigin } from "./origin.js";
 
+// Compatibility wire IDs: keep pre-rebrand cookie / capability names so enrolled
+// browsers (including Pixel Fold PWAs) and desktop sessions stay signed in.
+// Product brand is Hermes Studio; these are not user-facing product names.
 const COOKIE_NAME = "hermes_office_session";
 const DEVICE_COOKIE_NAME = "hermes_office_device";
 const SESSION_TTL_MS = 12 * 60 * 60 * 1_000;
@@ -72,6 +76,13 @@ export interface OfficeAuthOptions {
   allowedOrigins?: readonly string[];
   trustedProxyHops?: number;
   deviceRegistryPath?: string;
+  /**
+   * When true, remote owner sessions may use privileged-config.* and secret.write.
+   * Default false (fail closed). Local sessions are unaffected.
+   * Set via HERMES_STUDIO_REMOTE_PRIVILEGED (or deprecated HERMES_OFFICE_REMOTE_PRIVILEGED).
+   * Tailscale launcher enables intentionally.
+   */
+  remotePrivilegedEnabled?: boolean;
   onAudit?: (record: OfficeAuditRecord) => void;
 }
 
@@ -107,6 +118,7 @@ export class OfficeAuth {
   readonly #allowedOrigins: ReadonlySet<string>;
   readonly #trustedProxyHops: number;
   readonly #deviceRegistryPath: string | undefined;
+  readonly #remotePrivilegedEnabled: boolean;
   readonly #onAudit: ((record: OfficeAuditRecord) => void) | undefined;
   readonly #audit: OfficeAuditRecord[] = [];
   readonly #attempts = new Map<string, AttemptWindow>();
@@ -120,6 +132,7 @@ export class OfficeAuth {
     this.#desktopOrigins = validateDesktopOrigins(options.desktopOrigins ?? DEFAULT_DESKTOP_ORIGINS);
     this.#allowedOrigins = validateAllowedOrigins(options.allowedOrigins);
     this.#trustedProxyHops = boundedInteger(options.trustedProxyHops, 0, 0, 8);
+    this.#remotePrivilegedEnabled = options.remotePrivilegedEnabled === true;
     if (options.remoteToken !== undefined) {
       if (options.remoteToken.length < 32 || options.remoteToken.length > 4_096 || options.remoteToken.includes("\0")) {
         throw new Error("Remote enrollment token must contain 32 to 4096 characters.");
@@ -189,9 +202,17 @@ export class OfficeAuth {
     const credential = randomBytes(32).toString("base64url");
     const id = `device-${randomBytes(12).toString("hex")}`;
     const now = new Date().toISOString();
+    // Single trusted remote operator model: when remote privileged is enabled
+    // (Tailscale path), the one-time enrolled device is owner so privileged
+    // settings are usable. Without the flag, remain operator (chat/kanban only).
     const device: DeviceRecord = {
-      id, displayName: deviceName, tier: "operator", credentialDigest: tokenDigest(credential),
-      createdAt: now, lastSeenAt: now, expiresAtMs: Date.now() + DEVICE_TTL_MS,
+      id,
+      displayName: deviceName,
+      tier: this.#remotePrivilegedEnabled ? "owner" : "operator",
+      credentialDigest: tokenDigest(credential),
+      createdAt: now,
+      lastSeenAt: now,
+      expiresAtMs: Date.now() + DEVICE_TTL_MS,
     };
     this.#devices.set(id, device);
     this.#enrollmentConsumed = true;
@@ -199,8 +220,14 @@ export class OfficeAuth {
       this.#devices.delete(id);
       return { outcome: "storage_unavailable" };
     }
+    // Issue the short-lived session cookie first, then append the long-lived
+    // device cookie last. Some Android Chrome / Tailscale Serve paths retain
+    // only the final Set-Cookie header; losing the device cookie prevents
+    // /api/v1/auth/device/renew after the in-memory session path fails.
+    // Security attributes are unchanged (HttpOnly, SameSite=Strict, Secure).
+    const session = this.#issueDeviceSession(request, response, device);
     response.appendHeader("Set-Cookie", serializeDeviceCookie(`${id}.${credential}`, request, this.#trustedProxyHops));
-    return { outcome: "success", session: this.#issueDeviceSession(request, response, device), enrolled: true };
+    return { outcome: "success", session, enrolled: true };
   }
 
   renewDevice(request: IncomingMessage, response: ServerResponse): DeviceBootstrapResult {
@@ -263,7 +290,15 @@ export class OfficeAuth {
     if (TIER_RANK[session.principal.tier] < TIER_RANK[policy.minimumTier]) reason = "tier";
     else if (policy.boundary === "local-only" && !session.principal.local) reason = "local_only";
     else if (policy.boundary === "step-up-required" && !session.principal.local) reason = "step_up_required";
-    else {
+    // Privileged ops are remote-safe in protocol when flagged; without the flag
+    // remote sessions fail closed as local_only (Tailscale network alone is not auth).
+    else if (
+      isRemotePrivilegedOperation(operation)
+      && !session.principal.local
+      && !this.#remotePrivilegedEnabled
+    ) {
+      reason = "local_only";
+    } else {
       if (policy.auditable) this.#appendAudit(operation, "allowed", session, session.principal.local);
       return { allowed: true, session };
     }
@@ -271,11 +306,31 @@ export class OfficeAuth {
     return { allowed: false, reason };
   }
 
+  /**
+   * Owner session may use privileged settings / secrets when local, or when
+   * remote privileged is deployment-enabled for remote owners.
+   * Server-derived only — never from client headers.
+   */
+  allowsPrivilegedSettings(session: OfficeAuthSession): boolean {
+    if (session.principal.tier !== "owner") return false;
+    if (session.principal.local) return true;
+    return this.#remotePrivilegedEnabled;
+  }
+
+  get remotePrivilegedEnabled(): boolean {
+    return this.#remotePrivilegedEnabled;
+  }
+
   effectiveAccess(session: OfficeAuthSession): EffectiveAccess {
     const allowedOperations = (Object.keys(OPERATION_POLICIES) as Operation[]).filter((operation) => {
       const policy = OPERATION_POLICIES[operation];
       if (TIER_RANK[session.principal.tier] < TIER_RANK[policy.minimumTier]) return false;
-      return session.principal.local || (policy.boundary !== "local-only" && policy.boundary !== "step-up-required");
+      if (!session.principal.local) {
+        if (policy.boundary === "local-only" || policy.boundary === "step-up-required") return false;
+        // Hide privileged ops from remote capability lists unless deployment enables them.
+        if (isRemotePrivilegedOperation(operation) && !this.#remotePrivilegedEnabled) return false;
+      }
+      return true;
     });
     return {
       deviceId: session.principal.id,

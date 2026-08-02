@@ -11,14 +11,14 @@ import {
   OfficeGlobalSettingsStore,
 } from "./hermes-settings.js";
 
-const TOKEN = "0123456789abcdef0123456789abcdef";
-const DASHBOARD_SECRET = "dashboard-example-value-123456";
-const OPENAI_SECRET = "openai-example-value-123456";
-const AWS_SECRET = "aws-example-value-123456";
-const PASSWORD_SECRET = "password-example-value-123456";
-const ANTHROPIC_SECRET = "sk-ant-ABCDEFGHIJKLMNOPQRSTUVWXYZ123456";
-const AUTH_HEADER_SECRET = "opaque-settings-credential";
-const DATABASE_SECRET = "database-password-example-value";
+const TOKEN = "0123456789abcdef0123456789abcdef"; // gitleaks:allow -- synthetic test credential
+const DASHBOARD_SECRET = "dashboard-example-value-123456"; // gitleaks:allow -- synthetic test credential
+const OPENAI_SECRET = "openai-example-value-123456"; // gitleaks:allow -- synthetic test credential
+const AWS_SECRET = "aws-example-value-123456"; // gitleaks:allow -- synthetic test credential
+const PASSWORD_SECRET = "password-example-value-123456"; // gitleaks:allow -- synthetic test credential
+const ANTHROPIC_SECRET = "sk-ant-ABCDEFGHIJKLMNOPQRSTUVWXYZ123456"; // gitleaks:allow -- synthetic test credential
+const AUTH_HEADER_SECRET = "opaque-settings-credential"; // gitleaks:allow -- synthetic test credential
+const DATABASE_SECRET = "database-password-example-value"; // gitleaks:allow -- synthetic test credential
 
 test("profile settings use a profile-pinned backend and expose secret-safe DTOs", async (t) => {
   const requests: Array<{ method: string; token: string; url: string }> = [];
@@ -81,6 +81,8 @@ test("profile settings use a profile-pinned backend and expose secret-safe DTOs"
 });
 
 test("skill and memory mutations are validated and use official Hermes routes", async (t) => {
+  const memoryRoot = await mkdtemp(join(tmpdir(), "hermes-studio-settings-mutation-memory-"));
+  t.after(() => rm(memoryRoot, { recursive: true, force: true }));
   const mutations: Array<{ body: unknown; method: string; url: string }> = [];
   const server = createServer(async (request, response) => {
     if (request.method === "GET" && request.url === "/api/memory/providers/honcho/config?surface=declared") {
@@ -111,6 +113,18 @@ test("skill and memory mutations are validated and use official Hermes routes", 
       writeJson(response, { name: "local", content: `# Skill\ndatabase_password: >-\n  ${PASSWORD_SECRET}\n  second secret line\nsafe: visible`, path: "/private/SKILL.md" });
       return;
     }
+    if (request.method === "GET" && request.url === "/api/memory") {
+      writeJson(response, {
+        active_provider: "honcho",
+        providers: [{ name: "honcho", description: "Configured", configured: true }],
+        builtin: { memory_bytes: 0, user_bytes: 0, has_memory: false, has_user: false },
+      });
+      return;
+    }
+    if (request.method === "GET" && request.url === "/api/profiles/coder/soul") {
+      writeJson(response, { content: "You are a careful coding agent.", exists: true });
+      return;
+    }
     mutations.push({ method: request.method ?? "", url: request.url ?? "", body: await readJson(request) });
     writeJson(response, { ok: true, path: "/private/result", secret: "hidden" });
   });
@@ -118,6 +132,7 @@ test("skill and memory mutations are validated and use official Hermes routes", 
   t.after(() => server.close());
   const adapter = createHermesSettingsAdapter({
     resolveProfileBackend: async () => ({ baseUrl: origin, sessionToken: TOKEN, release: () => undefined }),
+    builtinMemoryFiles: { hermesRoot: memoryRoot, resolveProfileHome: () => memoryRoot },
   });
 
   const content = await adapter.getSkillContent("coder", "local");
@@ -298,7 +313,7 @@ test("profile compare-and-write mutations serialize by resource and reject one s
 });
 
 test("global settings are Office-owned, atomic, revisioned, and reject secret material", async (t) => {
-  const directory = await mkdtemp(join(tmpdir(), "hermes-office-settings-"));
+  const directory = await mkdtemp(join(tmpdir(), "hermes-studio-settings-"));
   t.after(() => rm(directory, { recursive: true, force: true }));
   const file = join(directory, "global.json");
   const store = new OfficeGlobalSettingsStore(file);
@@ -334,7 +349,7 @@ test("global settings are Office-owned, atomic, revisioned, and reject secret ma
 });
 
 test("global store serializes concurrent updates and admits only one matching revision", async (t) => {
-  const directory = await mkdtemp(join(tmpdir(), "hermes-office-settings-race-"));
+  const directory = await mkdtemp(join(tmpdir(), "hermes-studio-settings-race-"));
   t.after(() => rm(directory, { recursive: true, force: true }));
   const store = new OfficeGlobalSettingsStore(join(directory, "global.json"));
   const results = await Promise.allSettled([
@@ -344,6 +359,101 @@ test("global store serializes concurrent updates and admits only one matching re
   assert.equal(results.filter((item) => item.status === "fulfilled").length, 1);
   assert.equal(results.filter((item) => item.status === "rejected").length, 1);
   assert.equal((await store.read()).revision, 1);
+});
+
+test("profile Hermes config picks safe leaves, denies secrets, and conflicts on stale revision", async (t) => {
+  let config: Record<string, unknown> = {
+    model: "anthropic/claude-sonnet-4",
+    agent: { max_turns: 10 },
+    display: { compact: false },
+    memory: { memory_char_limit: 4_000, write_approval: true },
+    security: { allow_private_urls: true },
+    auxiliary: { vision: { api_key: "sk-should-not-leak" } }, // gitleaks:allow -- synthetic rejection fixture
+  };
+  const schemaPayload = {
+    category_order: ["general", "agent", "display", "memory", "security"],
+    fields: {
+      model: { type: "string", description: "Model", category: "general" },
+      "agent.max_turns": { type: "number", description: "Turns", category: "agent" },
+      "display.compact": { type: "boolean", description: "Compact", category: "display" },
+      "memory.memory_char_limit": { type: "number", description: "Chars", category: "memory" },
+      "memory.write_approval": { type: "boolean", description: "Approval", category: "memory" },
+      "security.allow_private_urls": { type: "boolean", description: "Danger", category: "security" },
+      "auxiliary.vision.api_key": { type: "string", description: "Secret", category: "auxiliary" },
+    },
+  };
+  const puts: unknown[] = [];
+  const server = createServer(async (request, response) => {
+    const url = request.url ?? "";
+    if (request.method === "GET" && url === "/api/config/schema") {
+      writeJson(response, schemaPayload);
+      return;
+    }
+    if (request.method === "GET" && url === "/api/config") {
+      writeJson(response, config);
+      return;
+    }
+    if (request.method === "PUT" && url === "/api/config") {
+      const body = await readJson(request) as { config: Record<string, unknown> };
+      puts.push(body.config);
+      // Deep-merge like Hermes.
+      config = {
+        ...config,
+        ...body.config,
+        agent: { ...(config.agent as object), ...((body.config.agent as object) ?? {}) },
+        display: { ...(config.display as object), ...((body.config.display as object) ?? {}) },
+      };
+      writeJson(response, { ok: true });
+      return;
+    }
+    response.writeHead(404).end();
+  });
+  const origin = await listen(server);
+  t.after(() => server.close());
+  const adapter = createHermesSettingsAdapter({
+    resolveProfileBackend: async () => ({ baseUrl: origin, sessionToken: TOKEN, release: () => undefined }),
+  });
+
+  const schema = await adapter.getProfileConfigSchema("coder");
+  assert.equal(schema.profile, "coder");
+  assert.ok(schema.fields.some((field) => field.id === "agent.max_turns"));
+  assert.ok(!schema.fields.some((field) => field.id === "model"));
+  assert.ok(!schema.fields.some((field) => field.id === "memory.write_approval"));
+  assert.ok(!schema.fields.some((field) => field.id === "security.allow_private_urls"));
+  assert.ok(!schema.fields.some((field) => field.id === "auxiliary.vision.api_key"));
+  assert.ok(schema.excludedCount >= 2);
+
+  const current = await adapter.getProfileConfig("coder");
+  assert.equal(Object.hasOwn(current.values, "model"), false);
+  assert.equal(current.values["agent.max_turns"], 10);
+  assert.equal(current.values["memory.memory_char_limit"], 4_000);
+  assert.equal(Object.hasOwn(current.values, "memory.write_approval"), false);
+  assert.equal(Object.hasOwn(current.values, "security.allow_private_urls"), false);
+  assert.equal(Object.hasOwn(current.values, "auxiliary.vision.api_key"), false);
+  assert.match(current.revision, /^[A-Za-z0-9_-]{43}$/);
+
+  const updated = await adapter.updateProfileConfig("coder", {
+    expectedRevision: current.revision,
+    changes: { "display.compact": true, "agent.max_turns": 20 },
+  });
+  assert.equal(updated.values["display.compact"], true);
+  assert.equal(updated.values["agent.max_turns"], 20);
+  assert.deepEqual(puts[0], { agent: { max_turns: 20 }, display: { compact: true } });
+
+  await assert.rejects(
+    adapter.updateProfileConfig("coder", {
+      expectedRevision: current.revision,
+      changes: { "display.compact": false },
+    }),
+    (error: unknown) => error instanceof HermesSettingsError && error.code === "conflict",
+  );
+  await assert.rejects(
+    adapter.updateProfileConfig("coder", {
+      expectedRevision: updated.revision,
+      changes: { "security.allow_private_urls": true },
+    }),
+    (error: unknown) => error instanceof HermesSettingsError && error.code === "invalid_request",
+  );
 });
 
 async function listen(server: ReturnType<typeof createServer>): Promise<string> {
@@ -375,7 +485,7 @@ function countWrite(writes: Map<string, number>, path: string): void {
   writes.set(path, (writes.get(path) ?? 0) + 1);
 }
 
-async function assertOneConflict(operations: [Promise<void>, Promise<void>]): Promise<void> {
+async function assertOneConflict<T>(operations: [Promise<T>, Promise<T>]): Promise<void> {
   const results = await Promise.allSettled(operations);
   assert.equal(results.filter((result) => result.status === "fulfilled").length, 1);
   const rejected = results.filter((result): result is PromiseRejectedResult => result.status === "rejected");

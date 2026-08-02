@@ -33,6 +33,27 @@ const baseSession: ChatSession = {
   historyState: "loaded"
 };
 
+test("connecting a lazy draft preserves its one pending first prompt", () => {
+  const connecting = reconcileChatSessionConnecting({
+    ...baseSession,
+    storedSessionId: undefined,
+    liveSessionId: undefined,
+    remoteKind: "draft",
+    status: "streaming",
+    operationEvidence: [{
+      id: "first-prompt",
+      kind: "prompt",
+      body: "start",
+      at: "00:00",
+      state: "pending",
+    }],
+  });
+
+  assert.equal(connecting.connectionState, "connecting");
+  assert.equal(connecting.status, "streaming");
+  assert.equal(canSubmitChatPrompt(connecting), false, "a second prompt must stay blocked while create is pending");
+});
+
 test("a new live generation terminalizes old rows while authoritative running resumes the new generation", () => {
   const stale: ChatSession = {
     ...baseSession,
@@ -54,10 +75,19 @@ test("a new live generation terminalizes old rows while authoritative running re
   assert.equal(connecting.pendingInteraction, undefined);
   assert.equal(connecting.messages[0]?.status, "cancelled");
 
-  const running = reconcileChatSessionReady(connecting, "live-new", "stored-1", { running: true, status: "idle" });
+  const running = reconcileChatSessionReady(connecting, "live-new", "stored-1", {
+    running: true,
+    status: "idle",
+    model: "model-a",
+    provider: "provider-a",
+    reasoningEffort: "medium",
+  });
   assert.equal(running.status, "streaming");
   assert.equal(isChatRunActive(running), true);
   assert.equal(canSubmitChatPrompt(running), false);
+  assert.equal(running.model, "model-a");
+  assert.equal(running.provider, "provider-a");
+  assert.equal(running.reasoningEffort, "medium");
 
   const cold = reconcileChatSessionReady(connecting, "live-new", "stored-1", { running: false, status: "running" });
   assert.equal(cold.status, "ready");
@@ -65,9 +95,12 @@ test("a new live generation terminalizes old rows while authoritative running re
   assert.equal(canSubmitChatPrompt(cold), true);
 
   const infoRunning = reduceChatGatewayEvent(baseSession, {
-    type: "session.info", liveSessionId: "live-new", payload: { running: true, status: "idle" }
+    type: "session.info", liveSessionId: "live-new", payload: { running: true, status: "idle", model: "model-b", provider: "provider-b", reasoningEffort: "high" }
   });
-  assert.equal(infoRunning, baseSession);
+  assert.equal(infoRunning.status, baseSession.status);
+  assert.equal(infoRunning.model, "model-b");
+  assert.equal(infoRunning.provider, "provider-b");
+  assert.equal(infoRunning.reasoningEffort, "high");
   const delayedIdle = reduceChatGatewayEvent(infoRunning, {
     type: "session.info", liveSessionId: "live-new", payload: { running: false, status: "idle" }
   });
@@ -95,7 +128,7 @@ test("a new live generation terminalizes old rows while authoritative running re
   assert.equal(isChatRunActive(oldIdle), true);
 });
 
-test("a malformed interrupt acknowledgement preserves the active store run and reports failure", async () => {
+test("a malformed interrupt acknowledgement enters the history barrier and reports failure", async () => {
   const socket = new FakeWebSocket();
   const api = connectChatApi({
     onSocketState() {}, onHistoryLoading: setChatHistoryLoading, onHistory: applyChatHistory,
@@ -126,9 +159,13 @@ test("a malformed interrupt acknowledgement preserves the active store run and r
   const interrupt = socket.frame("session.interrupt")!;
   socket.respond(interrupt.id, { status: "accepted" });
   assert.equal(await stopping, false);
-  assert.equal(sessions.value[0]?.status, "streaming");
-  assert.equal(sessions.value[0]?.streamingMessageId, "active-agent");
-  assert.equal(sessions.value[0]?.messages.find(({ id }) => id === "active-agent")?.status, "streaming");
+  // The malformed success is commit-unknown: Hermes may already have stopped
+  // the run. Fence the live generation instead of presenting it as safely
+  // active or allowing more control-plane operations against the stale id.
+  assert.equal(sessions.value[0]?.connectionState, "disconnected");
+  assert.equal(sessions.value[0]?.status, "ready");
+  assert.equal(sessions.value[0]?.streamingMessageId, undefined);
+  assert.equal(sessions.value[0]?.messages.find(({ id }) => id === "active-agent")?.status, "cancelled");
   assert.ok(sessions.value[0]?.errorMessage);
   api.stop();
 });
@@ -322,7 +359,7 @@ test("commit-unconfirmed on an open socket blocks the composer until an explicit
   assert.equal(recoverySocket.frame("session.resume"), undefined);
   recoverySocket.officeReady();
   await waitFor(() => sessions.value[0]?.historyState === "error");
-  assert.equal(sessions.value[0]?.connectionState, "disconnected", "the API enters the barrier before its result unlocks the store");
+  assert.equal(sessions.value[0]?.connectionState, "error", "an integrity-partial barrier requires explicit retry before the store can unlock");
   assert.equal(historyRequest, 2);
   assert.equal(canSubmitChatPrompt(sessions.value[0]!), false, "an integrity-partial snapshot cannot unlock the composer");
   assert.equal(sessions.value[0]?.messages.some(({ id }) => id === "lost-old-event"), false);
@@ -336,7 +373,7 @@ test("commit-unconfirmed on an open socket blocks the composer until an explicit
   assert.equal(recoverySocket.frames("clarify.respond").length, 0);
   assert.equal(recoverySocket.frames("approval.respond").length, 0);
 
-  api.ensureSession(target);
+  api.ensureSession(target, { retryFailed: true });
   await waitFor(() => historyRequest === 3 && recoverySocket.frame("session.resume") !== undefined);
   assert.notEqual(sessions.value[0]?.connectionState, "ready", "durable history alone cannot unlock before authoritative resume runtime");
   assert.equal(canSubmitChatPrompt(sessions.value[0]!), false);
@@ -448,7 +485,7 @@ test("a partial reconnect history cannot satisfy the resume barrier", async () =
   assert.equal(sockets[1]!.frame("session.resume"), undefined, "partial durable history must not unlock resume");
 
   retryAvailable = true;
-  api.ensureSession(target);
+  api.ensureSession(target, { retryFailed: true });
   await waitFor(() => sockets[1]!.frame("session.resume") !== undefined);
   assert.equal(partialHistories.at(-1), 1);
   api.stop();

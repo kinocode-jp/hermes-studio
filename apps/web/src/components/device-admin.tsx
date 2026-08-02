@@ -1,8 +1,10 @@
 import { useCallback, useEffect, useRef, useState } from "preact/hooks";
-import type { RemoteConfigStatus } from "@hermes-office/protocol";
-import { fetchRemoteConfigStatus, revokeRemoteDevice, DeviceRevokeError, OfficeRemoteConfigError, type DeviceRevokeFailureCode, type RemoteConfigFailureCode } from "../office-api";
+import type { RemoteConfigStatus } from "@hermes-studio/protocol";
+import { isLocalOfficeClient } from "../auth-state";
+import { fetchRemoteConfigStatus, logoutRemoteDevice, revokeRemoteDevice, DeviceRevokeError, OfficeRemoteConfigError, type DeviceRevokeFailureCode, type RemoteConfigFailureCode } from "../office-api";
 import { locale, t, type TranslationKey } from "../i18n";
 import { InfoTip } from "./info-tip";
+import { CloseIcon, LogOutIcon, RefreshIcon, TrashIcon } from "./icons";
 import "./access-audit.css";
 
 const REVOKE_ERROR_KEY: Readonly<Record<DeviceRevokeFailureCode, TranslationKey>> = {
@@ -12,17 +14,25 @@ const REVOKE_ERROR_KEY: Readonly<Record<DeviceRevokeFailureCode, TranslationKey>
   unknown: "hostAdmin.revokeFailed.unknown",
 };
 
+type LogoutPhase = "idle" | "confirm" | "busy";
+
 export function DeviceAdmin() {
+  const isRemote = !isLocalOfficeClient(location);
   const [status, setStatus] = useState<RemoteConfigStatus | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<RemoteConfigFailureCode | null>(null);
   const [revoking, setRevoking] = useState<ReadonlySet<string>>(() => new Set());
   const [confirmDevice, setConfirmDevice] = useState<RemoteConfigStatus["devices"][number] | null>(null);
   const [revokeError, setRevokeError] = useState<DeviceRevokeFailureCode | null>(null);
+  const [logoutPhase, setLogoutPhase] = useState<LogoutPhase>("idle");
+  const [logoutError, setLogoutError] = useState(false);
   const [, setLocaleRevision] = useState(0);
   const generation = useRef(0);
   const cancelButtonRef = useRef<HTMLButtonElement | null>(null);
   const revokeTriggerRef = useRef<HTMLButtonElement | null>(null);
+  const logoutTriggerRef = useRef<HTMLButtonElement | null>(null);
+  const logoutCancelRef = useRef<HTMLButtonElement | null>(null);
+  const logoutRestoreFocusRef = useRef(false);
 
   const reload = useCallback(async (showLoading = true) => {
     const currentGeneration = ++generation.current;
@@ -65,6 +75,18 @@ export function DeviceAdmin() {
     }
   }, [confirmDevice]);
 
+  useEffect(() => {
+    if (logoutPhase === "confirm") logoutCancelRef.current?.focus();
+  }, [logoutPhase]);
+
+  useEffect(() => {
+    if (logoutPhase === "idle" && logoutRestoreFocusRef.current && logoutTriggerRef.current) {
+      logoutRestoreFocusRef.current = false;
+      const trigger = logoutTriggerRef.current;
+      requestAnimationFrame(() => trigger.focus());
+    }
+  }, [logoutPhase]);
+
   const askRevoke = useCallback((device: RemoteConfigStatus["devices"][number], trigger: EventTarget | null) => {
     setRevokeError(null);
     revokeTriggerRef.current = trigger instanceof HTMLButtonElement ? trigger : null;
@@ -95,27 +117,128 @@ export function DeviceAdmin() {
     }
   }, [reload, revoking]);
 
+  const beginLogout = useCallback(() => {
+    setLogoutError(false);
+    logoutRestoreFocusRef.current = true;
+    setLogoutPhase("confirm");
+  }, []);
+
+  const cancelLogout = useCallback(() => {
+    if (logoutPhase === "busy") return;
+    setLogoutPhase("idle");
+    setLogoutError(false);
+  }, [logoutPhase]);
+
+  const confirmLogout = useCallback(async () => {
+    if (logoutPhase === "busy") return;
+    setLogoutError(false);
+    setLogoutPhase("busy");
+    try {
+      await logoutRemoteDevice();
+      location.reload();
+    } catch {
+      setLogoutError(true);
+      setLogoutPhase("confirm");
+    }
+  }, [logoutPhase]);
+
   const revokeErrorKey = revokeError ? REVOKE_ERROR_KEY[revokeError] : null;
+  // Remote clients only need logout; host config reload is for owners.
+  const showReload = !(isRemote && error === "not_allowed");
 
   return (
-    <section class="access-audit" aria-labelledby="device-admin-title" aria-busy={loading}>
+    <section class="access-audit device-admin" aria-labelledby="device-admin-title" aria-busy={loading}>
       <header class="access-audit__gate">
         <div class="access-audit__title">
-          <p>{t("hostAdmin.eyebrow")}</p>
           <div class="heading-info-group">
             <h2 id="device-admin-title">{t("hostAdmin.title")}</h2>
             <InfoTip text={t("hostAdmin.guide")} align="start" side="bottom" />
           </div>
         </div>
-        <button type="button" onClick={() => void reload()} disabled={loading}>
-          {loading ? t("audit.loading") : t("hostAdmin.reload")}
-        </button>
+        {showReload && (
+          <button
+            type="button"
+            onClick={() => void reload()}
+            disabled={loading}
+            aria-label={loading ? t("audit.loading") : t("hostAdmin.reload")}
+            title={loading ? t("audit.loading") : t("hostAdmin.reload")}
+          >
+            <RefreshIcon />
+          </button>
+        )}
       </header>
 
-      {error === "not_allowed" ? (
-        <div class="access-audit__message is-error" role="alert">
-          <b>{t("hostAdmin.notAllowed")}</b>
+      {isRemote && (
+        <div class="access-audit__logout" aria-labelledby="device-logout-title">
+          <div class="access-audit__logout-copy">
+            <b id="device-logout-title">{t("hostAdmin.logoutTitle")}</b>
+            <p>{t("hostAdmin.logoutNote")}</p>
+          </div>
+          {logoutPhase === "idle" ? (
+            <button
+              type="button"
+              class="access-audit__logout-action"
+              ref={logoutTriggerRef}
+              onClick={beginLogout}
+              aria-label={t("hostAdmin.logout")}
+              title={t("hostAdmin.logout")}
+            >
+              <LogOutIcon />
+            </button>
+          ) : (
+            <div
+              class="access-audit__logout-confirm"
+              role="group"
+              aria-labelledby="logout-confirm-title"
+              onKeyDown={(event) => {
+                if (event.key === "Escape" && logoutPhase !== "busy") {
+                  event.preventDefault();
+                  cancelLogout();
+                }
+              }}
+            >
+              <b id="logout-confirm-title">{t("hostAdmin.logoutConfirm")}</b>
+              <p>{t("hostAdmin.logoutPrompt")}</p>
+              <div class="access-audit__logout-actions">
+                <button
+                  type="button"
+                  ref={logoutCancelRef}
+                  class="access-audit__logout-action"
+                  onClick={cancelLogout}
+                  disabled={logoutPhase === "busy"}
+                  aria-label={t("hostAdmin.logoutCancel")}
+                  title={t("hostAdmin.logoutCancel")}
+                >
+                  <CloseIcon />
+                </button>
+                <button
+                  type="button"
+                  class="access-audit__logout-action is-danger"
+                  onClick={() => void confirmLogout()}
+                  disabled={logoutPhase === "busy"}
+                  aria-busy={logoutPhase === "busy"}
+                  aria-label={logoutPhase === "busy" ? t("hostAdmin.loggingOut") : t("hostAdmin.logoutConfirmAction")}
+                  title={logoutPhase === "busy" ? t("hostAdmin.loggingOut") : t("hostAdmin.logoutConfirmAction")}
+                >
+                  <LogOutIcon />
+                </button>
+              </div>
+            </div>
+          )}
+          {logoutError && (
+            <div class="access-audit__message is-error" role="alert">
+              <b>{t("hostAdmin.logoutFailed")}</b>
+            </div>
+          )}
         </div>
+      )}
+
+      {error === "not_allowed" ? (
+        !isRemote && (
+          <div class="access-audit__message is-error" role="alert">
+            <b>{t("hostAdmin.notAllowed")}</b>
+          </div>
+        )
       ) : error === "load_failed" ? (
         <div class="access-audit__message is-error" role="alert">
           <b>{t("hostAdmin.loadFailed")}</b>
@@ -165,8 +288,9 @@ export function DeviceAdmin() {
                     disabled={revoking.has(device.id) || device.revokedAt !== undefined}
                     onClick={(event) => askRevoke(device, event.currentTarget)}
                     aria-label={t("hostAdmin.revokeAria", { name: device.displayName })}
+                    title={t("hostAdmin.revokeAria", { name: device.displayName })}
                   >
-                    {revoking.has(device.id) ? t("hostAdmin.revoking") : device.revokedAt ? t("hostAdmin.revokeDone") : t("hostAdmin.revoke")}
+                    <TrashIcon />
                   </button>
                 </li>
               ))}
@@ -192,15 +316,19 @@ export function DeviceAdmin() {
                   type="button"
                   ref={cancelButtonRef}
                   onClick={cancelRevoke}
+                  aria-label={t("hostAdmin.revokeCancel")}
+                  title={t("hostAdmin.revokeCancel")}
                 >
-                  {t("hostAdmin.revokeCancel")}
+                  <CloseIcon />
                 </button>
                 <button
                   type="button"
                   onClick={() => void revoke(confirmDevice)}
                   disabled={revoking.has(confirmDevice.id)}
+                  aria-label={revoking.has(confirmDevice.id) ? t("hostAdmin.revoking") : t("hostAdmin.revoke")}
+                  title={revoking.has(confirmDevice.id) ? t("hostAdmin.revoking") : t("hostAdmin.revoke")}
                 >
-                  {revoking.has(confirmDevice.id) ? t("hostAdmin.revoking") : t("hostAdmin.revoke")}
+                  <TrashIcon />
                 </button>
               </div>
             </div>

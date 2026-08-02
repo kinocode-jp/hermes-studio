@@ -10,8 +10,25 @@ export function mergeServerSessionStatus(previous: ChatSession | undefined, acti
 }
 
 export function canSubmitChatPrompt(session: ChatSession): boolean {
-  const connected = session.remoteKind === "demo" || session.connectionState === "ready";
-  return connected && session.status === "ready" && session.steerPending !== true && session.interruptPending !== true && !isChatRunActive(session);
+  const connected = session.remoteKind === "demo"
+    || session.connectionState === "ready"
+    || session.connectionState === "queued";
+  return connected && session.status === "ready" && session.steerPending !== true
+    && session.interruptPending !== true && session.pendingModelChange?.applying !== true
+    && session.slashPending !== true
+    && !isChatRunActive(session);
+}
+
+export function composerBlockedReason(session: ChatSession): "pending-interaction" | "connecting" | "disconnected" | "running" | "stopping" | undefined {
+  if (session.pendingInteraction) return "pending-interaction";
+  if (session.interruptPending) return "stopping";
+  if (session.slashPending) return "running";
+  if (isChatRunActive(session) && !canSteerChatSession(session)) return "running";
+  if (session.remoteKind === "demo") return undefined;
+  if (session.connectionState === "connecting") return "connecting";
+  if (session.connectionState === "queued") return undefined;
+  if (session.connectionState !== "ready") return "disconnected";
+  return undefined;
 }
 
 export function canSteerChatSession(session: ChatSession): boolean {
@@ -28,7 +45,27 @@ export function isChatRunActive(session: ChatSession): boolean {
   return session.status === "streaming" || session.status === "waiting"
     || session.pendingInteraction !== undefined
     || session.streamingMessageId !== undefined
+    || hasPendingPromptOperation(session)
     || session.messages.some((message) => message.status === "streaming");
+}
+
+/** A prompt RPC that has not reached a commit outcome still owns this turn. */
+export function hasPendingPromptOperation(session: ChatSession): boolean {
+  return session.operationEvidence?.some((operation) => (
+    operation.kind === "prompt" && operation.state === "pending"
+  )) === true;
+}
+
+/**
+ * Hidden panes retain their Hermes lease while any conversation/control-plane
+ * operation can still settle into visible state.
+ */
+export function isChatSessionLeaseProtected(session: ChatSession): boolean {
+  return isChatRunActive(session)
+    || session.steerPending === true
+    || session.interruptPending === true
+    || session.slashPending === true
+    || session.pendingModelChange?.applying === true;
 }
 
 export function mergeGatewayStatusUpdate(session: ChatSession, payload: Record<string, unknown>): ChatSession {

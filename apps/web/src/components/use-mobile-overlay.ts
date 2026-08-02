@@ -1,7 +1,8 @@
 import { useCallback, useEffect, useRef, useState } from "preact/hooks";
 import { canRestoreModalFocus, hasOpenModal, isTopmostModal, lockBackgroundElements, registerModal } from "../modal-layer";
+import { PHONE_VIEWPORT_QUERY } from "../viewport";
 
-export const PHONE_OVERLAY_VIEWPORT = "(max-width: 767px)";
+export const PHONE_OVERLAY_VIEWPORT = PHONE_VIEWPORT_QUERY;
 export const COMPACT_OVERLAY_VIEWPORT = "(max-width: 1279px)";
 const FOCUSABLE = [
   "a[href]",
@@ -17,11 +18,13 @@ type MobileOverlayOptions = {
   open: boolean;
   onClose(): void;
   viewport?: string;
+  /** Keep the SP top/bottom chrome interactive while this overlay is open. */
+  preserveMobileRouteChrome?: boolean;
 };
 
 type MobileOverlayKind = MobileOverlayOptions["kind"];
 
-export function useMobileOverlay<T extends HTMLElement>({ kind, open, onClose, viewport = PHONE_OVERLAY_VIEWPORT }: MobileOverlayOptions) {
+export function useMobileOverlay<T extends HTMLElement>({ kind, open, onClose, viewport = PHONE_OVERLAY_VIEWPORT, preserveMobileRouteChrome = false }: MobileOverlayOptions) {
   const [overlayElement, setOverlayElement] = useState<T | null>(null);
   const ref = useCallback((element: T | null) => setOverlayElement(element), []);
   const closeRef = useRef(onClose);
@@ -43,9 +46,11 @@ export function useMobileOverlay<T extends HTMLElement>({ kind, open, onClose, v
     if (!active || !overlay) return;
     const previousFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null;
     const unregisterModal = kind === "modal" ? registerModal(overlay) : undefined;
-    const overlayRoot = overlay.closest<HTMLElement>(".profile-panel, .workspace-drawer") ?? overlay;
+    const overlayRoot = overlay.closest<HTMLElement>(".workspace-drawer") ?? overlay;
     const appShell = overlayRoot.closest<HTMLElement>(".app-shell");
-    const background = appShell ? mobileOverlayBackgroundElements(overlayRoot, appShell, kind) : [];
+    const background = appShell
+      ? mobileOverlayBackgroundElements(overlayRoot, appShell, kind, preserveMobileRouteChrome)
+      : [];
     const releaseBackground = lockBackgroundElements(background);
 
     let disposed = false;
@@ -95,7 +100,7 @@ export function useMobileOverlay<T extends HTMLElement>({ kind, open, onClose, v
       const shouldRestoreFocus = overlay.contains(document.activeElement);
       if (shouldRestoreFocus && canRestoreModalFocus(previousFocus)) previousFocus?.focus();
     };
-  }, [active, kind, overlayElement]);
+  }, [active, kind, overlayElement, preserveMobileRouteChrome]);
 
   return { ref, active };
 }
@@ -104,15 +109,17 @@ export function mobileOverlayBackgroundElements(
   overlayRoot: HTMLElement,
   appShell: HTMLElement,
   kind: MobileOverlayKind,
+  preserveMobileRouteChrome = false,
 ): HTMLElement[] {
   const background: HTMLElement[] = [];
   let overlayBranch = overlayRoot;
+  const keepRouteChrome = kind === "route" || preserveMobileRouteChrome;
   while (overlayBranch !== appShell) {
     const parent = overlayBranch.parentElement;
     if (!parent) return [];
     for (const sibling of parent.children) {
       if (!(sibling instanceof HTMLElement) || sibling === overlayBranch) continue;
-      if (parent === appShell && kind === "route" && sibling.hasAttribute("data-mobile-route-chrome")) continue;
+      if (parent === appShell && keepRouteChrome && sibling.hasAttribute("data-mobile-route-chrome")) continue;
       background.push(sibling);
     }
     overlayBranch = parent;

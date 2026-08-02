@@ -1,4 +1,4 @@
-# Hermes Office — product and interface direction
+# Hermes Studio — product and interface direction
 
 > **Document status:** This is a product and design direction document. It
 > intentionally includes proposed interactions and performance targets that may
@@ -7,7 +7,7 @@
 
 ## The subject
 
-Hermes Office is a lightweight control room for people who run several Hermes Agent profiles at once. Its single job is to make agents feel spatial and legible without hiding the serious controls needed to supervise their work.
+Hermes Studio is a lightweight control room for people who run several Hermes Agent profiles at once. Its single job is to make agents feel spatial and legible without hiding the serious controls needed to supervise their work.
 
 The office is not a decorative landing page. It is the application's live index: **one character is one Profile**, desks show current activity, and every session, task, skill, and memory item remains reachable from that character.
 
@@ -62,15 +62,15 @@ Color is never the sole status cue. Every state pairs color with a shape and a v
 
 ## Typography
 
-The type system mixes the workshop's Japanese character with highly legible operational text.
+The type system mixes the workshop's Japanese character with highly legible operational text. All sans-serif UI text uses a single family so windows read consistently across surfaces.
 
-- **Display / place names:** `Dela Gothic One`, fallback `"Arial Black", sans-serif`. Use only for the app wordmark, room names, and the active Profile name. Its wide kana/Latin forms become signage, not body copy.
-- **Body / controls:** `IBM Plex Sans JP`, fallback `system-ui, sans-serif`. Use weights 400, 500, and 600. It supports Japanese and remains clear in dense settings and chat.
+- **Unified sans (display + body):** `Noto Sans JP`, fallback `system-ui, sans-serif`, tokenized as `--font-sans` and `--font-display`. Body and controls use weights 400–600; page and window titles use 800–900.
+- **Titles:** page titles (`h1` on Office, Kanban, Teams, Settings) share `--title-page-size` / `--title-page-weight`; modal, panel, and popover titles share `--title-window-size` / `--title-weight` with `--title-leading` and `--title-tracking`. Do not add one-off title sizes per window.
 - **Utility / data:** `Martian Mono`, fallback `ui-monospace, monospace`. Use for timestamps, session IDs, tool names, keybindings, token counts, and compact status labels.
 
-The desktop base is 14px/1.5. Chat is 15px/1.65. Utility text is 11px/1.35 with 0.04em tracking. Display text is 24–32px/1.05 and should never appear as a paragraph.
+UI text sizes are tokenized as `--text-xs` (12px), `--text-sm` (13px), `--text-md` (14px), and `--text-lg` (16px), each defined as `calc(Npx * var(--font-scale, 1))` so the appearance font-scale setting applies everywhere. 12px is the minimum UI text size; hardcoded pixel sizes below that are not allowed. Chat body is 16px/1.65. Display text is 24–32px/1.05 and should never appear as a paragraph.
 
-Webfonts must use `font-display: swap`; the initial render must remain usable with fallbacks. Package fonts locally for the desktop application and cache them in the PWA.
+Webfonts must use `font-display: swap`; the initial render must remain usable with fallbacks. Noto Sans JP is packaged locally as unicode-range woff2 chunks (`apps/web/public/fonts/noto-sans-jp/`, declared in `apps/web/src/fonts.css`) so the desktop app works within its `default-src 'self'` CSP; the browser fetches only the ranges it renders, and the PWA caches them at runtime.
 
 ## Signature element: task cables
 
@@ -99,7 +99,7 @@ The office remains partially visible while workbenches are open. A user should n
 
 ```text
 ┌──────────────────────────────────────────────────────────────────────────┐
-│ HERMES OFFICE    Floor: Studio 1       ⌘K Jump      ● Local     08:42    │
+│ HERMES STUDIO    Floor: Studio 1       ⌘K Jump      ● Local     08:42    │
 ├───────────────┬─────────────────────────────────────────────┬────────────┤
 │ TASK RAIL     │                                             │ ACTIVITY   │
 │               │    ┌──────────┐         ┌──────────┐        │            │
@@ -123,7 +123,7 @@ The task rail is resizable from 240–360px. The activity strip is collapsible. 
 
 ```text
 ┌──────────────────────────────────────────────────────────────────────────┐
-│ HERMES OFFICE     [Floor] [Mika · 2] [Ren · 1]                  ● Local   │
+│ HERMES STUDIO     [Floor] [Mika · 2] [Ren · 1]                  ● Local   │
 ├───────────────────────────┬──────────────────────────────────────────────┤
 │ MIKA  Running             │ REN  Waiting for approval                    │
 │ [Chat A] [Chat B ●] [+]   │ [Release notes ●] [+]                       │
@@ -213,9 +213,12 @@ Memory is separated into `Shared context`, `Profile memory`, and `Identity / SOU
 
 The phone does not shrink the office. It changes navigation:
 
+The packaged desktop window may be resized down to 320px, so it enters this
+same phone navigation mode when its content width falls below 768px.
+
 ```text
 ┌──────────────────────────┐
-│ Hermes Office    ● Remote│
+│ Hermes Studio    ● Remote│
 │ 1 waiting · 3 running    │
 ├──────────────────────────┤
 │ PROFILES                 │
@@ -293,4 +296,4 @@ Empty states direct action:
 
 ## Final restraint check
 
-The task cable is the single expressive flourish. Panels stay flat, corners are small or clipped, typography is disciplined, and pixel art is restricted to the office layer. Remove ornamental scanlines, random particles, faux terminal chrome, excessive status glows, and rounded floating cards: none improves control of Hermes Profiles.
+The task cable is the single expressive flourish. Panels use consistent corner radii (`--radius-sm/md/lg`, 6–14px) and soft diffused shadows (`--shadow-sm/md/lg`); hard offset "retro" shadows and sharp-cornered inputs were removed in favor of a clean, modern control surface. Typography is disciplined, decorative eyebrow/kicker text is removed in favor of plain headings plus `InfoTip` affordances, and pixel art is restricted to the office layer. Remove ornamental scanlines, random particles, faux terminal chrome, and excessive status glows: none improves control of Hermes Profiles.

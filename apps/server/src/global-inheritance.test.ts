@@ -3,12 +3,13 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { GlobalInheritanceCoordinator } from "./global-inheritance.js";
+import { desiredSkillsForProfile, GlobalInheritanceCoordinator } from "./global-inheritance.js";
 import type { HermesSettingsAdapter, SkillSettingsDto } from "./hermes-settings.js";
 import { HermesSettingsError, OfficeGlobalSettingsStore } from "./hermes-settings.js";
+import type { OfficeTeamSkillLayer } from "./office-teams.js";
 
 test("global skills claim only Office-enabled pairs and persist provenance across restart", async (t) => {
-  const directory = await mkdtemp(join(tmpdir(), "hermes-office-global-inheritance-"));
+  const directory = await mkdtemp(join(tmpdir(), "hermes-studio-global-inheritance-"));
   t.after(() => rm(directory, { recursive: true, force: true }));
   const file = join(directory, "global.json");
   const skills = new Map([
@@ -44,7 +45,7 @@ test("global skills claim only Office-enabled pairs and persist provenance acros
 });
 
 test("profile override relinquishes ownership and global removal never overwrites it", async (t) => {
-  const directory = await mkdtemp(join(tmpdir(), "hermes-office-global-override-"));
+  const directory = await mkdtemp(join(tmpdir(), "hermes-studio-global-override-"));
   t.after(() => rm(directory, { recursive: true, force: true }));
   const store = new OfficeGlobalSettingsStore(join(directory, "global.json"));
   const skills = new Map([["coder", new Map([["browser", false]])]]);
@@ -62,7 +63,7 @@ test("profile override relinquishes ownership and global removal never overwrite
 });
 
 test("failed materialization is explicit pending state and the next revision retries safely", async (t) => {
-  const directory = await mkdtemp(join(tmpdir(), "hermes-office-global-pending-"));
+  const directory = await mkdtemp(join(tmpdir(), "hermes-studio-global-pending-"));
   t.after(() => rm(directory, { recursive: true, force: true }));
   const store = new OfficeGlobalSettingsStore(join(directory, "global.json"));
   const skills = new Map([
@@ -71,11 +72,12 @@ test("failed materialization is explicit pending state and the next revision ret
   ]);
   const coordinator = new GlobalInheritanceCoordinator({ store, settings: fakeSettings(skills, []), listProfiles: async () => ["coder", "reviewer"] });
 
-  await assert.rejects(
-    coordinator.update({ expectedRevision: 0, skills: ["research"], context: "Use verified sources.", sharedContextEnabled: true }),
-    (error: unknown) => error instanceof HermesSettingsError && error.code === "rejected",
-  );
-  const pending = await coordinator.read();
+  const pending = await coordinator.update({
+    expectedRevision: 0,
+    skills: ["research"],
+    context: "Use verified sources.",
+    sharedContextEnabled: true,
+  });
   assert.equal(pending.revision, 1);
   assert.equal(pending.skillSync.state, "pending");
   assert.deepEqual(pending.skillSync.failures, [{ profile: "reviewer", skill: "research", operation: "enable" }]);
@@ -93,8 +95,27 @@ test("failed materialization is explicit pending state and the next revision ret
   assert.equal(await coordinator.sessionCreateContext(), undefined);
 });
 
+test("committed global settings return pending when profile discovery is unavailable", async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), "hermes-studio-global-discovery-pending-"));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const store = new OfficeGlobalSettingsStore(join(directory, "global.json"));
+  const coordinator = new GlobalInheritanceCoordinator({
+    store,
+    settings: fakeSettings(new Map(), []),
+    listProfiles: async () => { throw new Error("profile discovery unavailable"); },
+  });
+
+  const result = await coordinator.update({ expectedRevision: 0, context: "Committed context" });
+  assert.equal(result.revision, 1);
+  assert.equal(result.context, "Committed context");
+  assert.deepEqual(result.skillSync, {
+    state: "pending",
+    failures: [{ profile: "default", skill: "profile-discovery", operation: "enable" }],
+  });
+});
+
 test("durable override intent survives commit I/O failure and restart", async (t) => {
-  const directory = await mkdtemp(join(tmpdir(), "hermes-office-override-outbox-"));
+  const directory = await mkdtemp(join(tmpdir(), "hermes-studio-override-outbox-"));
   t.after(() => rm(directory, { recursive: true, force: true }));
   const file = join(directory, "global.json");
   let failCommit = false;
@@ -144,7 +165,7 @@ test("durable override intent survives commit I/O failure and restart", async (t
 });
 
 test("Hermes failure remains recoverable and conflicting duplicates are rejected", async (t) => {
-  const directory = await mkdtemp(join(tmpdir(), "hermes-office-override-hermes-failure-"));
+  const directory = await mkdtemp(join(tmpdir(), "hermes-studio-override-hermes-failure-"));
   t.after(() => rm(directory, { recursive: true, force: true }));
   const file = join(directory, "global.json");
   const store = new OfficeGlobalSettingsStore(file);
@@ -188,7 +209,7 @@ test("Hermes failure remains recoverable and conflicting duplicates are rejected
 });
 
 test("intent write failure prevents Hermes mutation from starting", async (t) => {
-  const directory = await mkdtemp(join(tmpdir(), "hermes-office-override-prepare-failure-"));
+  const directory = await mkdtemp(join(tmpdir(), "hermes-studio-override-prepare-failure-"));
   t.after(() => rm(directory, { recursive: true, force: true }));
   const file = join(directory, "global.json");
   let failPrepare = false;
@@ -211,7 +232,7 @@ test("intent write failure prevents Hermes mutation from starting", async (t) =>
 });
 
 test("Hermes precondition failure plus abort I/O failure remains durable", async (t) => {
-  const directory = await mkdtemp(join(tmpdir(), "hermes-office-override-abort-failure-"));
+  const directory = await mkdtemp(join(tmpdir(), "hermes-studio-override-abort-failure-"));
   t.after(() => rm(directory, { recursive: true, force: true }));
   const file = join(directory, "global.json");
   let failAbort = false;
@@ -249,7 +270,7 @@ test("Hermes precondition failure plus abort I/O failure remains durable", async
 });
 
 test("global enable survives commit and finish I/O failure, restart, retry, and removal", async (t) => {
-  const directory = await mkdtemp(join(tmpdir(), "hermes-office-global-outbox-restart-"));
+  const directory = await mkdtemp(join(tmpdir(), "hermes-studio-global-outbox-restart-"));
   t.after(() => rm(directory, { recursive: true, force: true }));
   const file = join(directory, "global.json");
   let failWrites = false;
@@ -291,7 +312,7 @@ test("global enable survives commit and finish I/O failure, restart, retry, and 
 });
 
 test("global intent save failure prevents Hermes mutation and ambiguous success reconciles", async (t) => {
-  const directory = await mkdtemp(join(tmpdir(), "hermes-office-global-outbox-boundaries-"));
+  const directory = await mkdtemp(join(tmpdir(), "hermes-studio-global-outbox-boundaries-"));
   t.after(() => rm(directory, { recursive: true, force: true }));
   const prepareFile = join(directory, "prepare.json");
   let failPrepare = true;
@@ -321,7 +342,8 @@ test("global intent save failure prevents Hermes mutation and ambiguous success 
     throw new HermesSettingsError("timed_out", "applied before timeout");
   };
   const ambiguous = new GlobalInheritanceCoordinator({ store: ambiguousStore, settings: base, listProfiles: async () => ["coder"] });
-  await assert.rejects(ambiguous.update({ expectedRevision: 0, skills: ["browser"] }));
+  const ambiguousResult = await ambiguous.update({ expectedRevision: 0, skills: ["browser"] });
+  assert.equal(ambiguousResult.skillSync.state, "pending");
   assert.equal(ambiguousSkills.get("coder")?.get("browser"), true);
   assert.equal((await ambiguousStore.readMaterialization()).pendingGlobalSkillMutations.length, 1);
 
@@ -334,7 +356,7 @@ test("global intent save failure prevents Hermes mutation and ambiguous success 
 });
 
 test("partial multi-profile global application reconciles each durable pair", async (t) => {
-  const directory = await mkdtemp(join(tmpdir(), "hermes-office-global-outbox-partial-"));
+  const directory = await mkdtemp(join(tmpdir(), "hermes-studio-global-outbox-partial-"));
   t.after(() => rm(directory, { recursive: true, force: true }));
   const file = join(directory, "global.json");
   let failReviewerCommit = false;
@@ -357,7 +379,8 @@ test("partial multi-profile global application reconciles each durable pair", as
     if (profile === "reviewer") failReviewerCommit = true;
   };
   const coordinator = new GlobalInheritanceCoordinator({ store, settings, listProfiles: async () => ["coder", "reviewer"] });
-  await assert.rejects(coordinator.update({ expectedRevision: 0, skills: ["browser"] }));
+  const partialResult = await coordinator.update({ expectedRevision: 0, skills: ["browser"] });
+  assert.equal(partialResult.skillSync.state, "pending");
   const partial = await store.readMaterialization();
   assert.deepEqual(partial.managedSkills, [{ profile: "coder", skill: "browser" }]);
   assert.deepEqual(partial.pendingGlobalSkillMutations.map((item) => item.profile), ["reviewer"]);
@@ -374,7 +397,7 @@ test("partial multi-profile global application reconciles each durable pair", as
 });
 
 test("global pair intents deduplicate identical work and reject conflicting work", async (t) => {
-  const directory = await mkdtemp(join(tmpdir(), "hermes-office-global-outbox-deduplicate-"));
+  const directory = await mkdtemp(join(tmpdir(), "hermes-studio-global-outbox-deduplicate-"));
   t.after(() => rm(directory, { recursive: true, force: true }));
   const store = new OfficeGlobalSettingsStore(join(directory, "global.json"));
   const staged = await store.beginMaterialization({ expectedRevision: 0, skills: ["browser"] });
@@ -387,6 +410,138 @@ test("global pair intents deduplicate identical work and reject conflicting work
     (error: unknown) => error instanceof HermesSettingsError && error.code === "conflict",
   );
   assert.equal((await store.readMaterialization()).pendingGlobalSkillMutations.length, 1);
+});
+
+test("desiredSkillsForProfile unions global and membership team skills with toggles", () => {
+  const layers: OfficeTeamSkillLayer[] = [
+    {
+      teamId: "team-aaaaaaaaaaaaaaaaaaaaaaaa",
+      memberProfileIds: ["coder", "reviewer"],
+      skillsEnabled: true,
+      skills: ["browser", "research"],
+      contextEnabled: true,
+      context: "alpha",
+    },
+    {
+      teamId: "team-bbbbbbbbbbbbbbbbbbbbbbbb",
+      memberProfileIds: ["coder"],
+      skillsEnabled: false,
+      skills: ["deploy"],
+      contextEnabled: true,
+      context: "beta-off",
+    },
+    {
+      teamId: "team-cccccccccccccccccccccccc",
+      memberProfileIds: ["reviewer"],
+      skillsEnabled: true,
+      skills: ["lint"],
+      contextEnabled: true,
+      context: "gamma",
+    },
+  ];
+  const coder = desiredSkillsForProfile(
+    "coder",
+    { sharedSkillsEnabled: true, skills: ["browser", "global-only"] },
+    layers,
+  );
+  assert.deepEqual([...coder].sort(), ["browser", "global-only", "research"]);
+
+  const reviewerNoGlobal = desiredSkillsForProfile(
+    "reviewer",
+    { sharedSkillsEnabled: false, skills: ["browser", "global-only"] },
+    layers,
+  );
+  assert.deepEqual([...reviewerNoGlobal].sort(), ["browser", "lint", "research"]);
+});
+
+test("team layer skills materialize into member profiles and rematerialize on change", async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), "hermes-studio-team-inheritance-"));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const store = new OfficeGlobalSettingsStore(join(directory, "global.json"));
+  const skills = new Map([
+    ["coder", new Map([["browser", false], ["research", false]])],
+    ["reviewer", new Map([["browser", false], ["research", false]])],
+  ]);
+  const mutations: Array<[string, string, boolean, boolean | undefined]> = [];
+  let layers: OfficeTeamSkillLayer[] = [
+    {
+      teamId: "team-aaaaaaaaaaaaaaaaaaaaaaaa",
+      memberProfileIds: ["coder"],
+      skillsEnabled: true,
+      skills: ["research"],
+      contextEnabled: true,
+      context: "Team shared prompt",
+    },
+  ];
+  const coordinator = new GlobalInheritanceCoordinator({
+    store,
+    settings: fakeSettings(skills, mutations),
+    listProfiles: async () => ["coder", "reviewer"],
+    listTeamLayers: async () => layers,
+  });
+
+  // Global empty; team skill still enables for the member only.
+  await coordinator.rematerializeSkills();
+  assert.equal(skills.get("coder")?.get("research"), true);
+  assert.equal(skills.get("reviewer")?.get("research"), false);
+  assert.deepEqual(mutations, [["coder", "research", true, false]]);
+
+  // Global adds browser for everyone; team skill remains for coder.
+  await coordinator.update({ expectedRevision: 0, skills: ["browser"] });
+  assert.equal(skills.get("coder")?.get("browser"), true);
+  assert.equal(skills.get("reviewer")?.get("browser"), true);
+  assert.equal(skills.get("coder")?.get("research"), true);
+
+  // Profile override wins: later rematerialize must not re-enable research for coder.
+  await coordinator.noteProfileSkillOverride("coder", "research");
+  skills.get("coder")!.set("research", false);
+  layers = [{
+    ...layers[0]!,
+    skills: ["research", "browser"],
+  }];
+  await coordinator.rematerializeSkills();
+  assert.equal(skills.get("coder")?.get("research"), false, "profile override blocks team re-enable");
+
+  // Team context joins global context for the member profile.
+  await coordinator.update({
+    expectedRevision: 1,
+    context: "Global shared prompt",
+    sharedContextEnabled: true,
+  });
+  assert.equal(
+    await coordinator.sessionCreateContext("coder"),
+    "Global shared prompt\n\nTeam shared prompt",
+  );
+  assert.equal(await coordinator.sessionCreateContext("reviewer"), "Global shared prompt");
+  assert.equal(await coordinator.sessionCreateContext(), "Global shared prompt");
+});
+
+test("materialization shares one deadline and drops queued work that has already expired", async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), "hermes-studio-global-deadline-"));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const store = new OfficeGlobalSettingsStore(join(directory, "global.json"));
+  let listCalls = 0;
+  const settings = {
+    listSkills: async (_profile: string, options?: { deadlineMs?: number }) => {
+      listCalls += 1;
+      const remaining = Math.max(1, (options?.deadlineMs ?? Date.now()) - Date.now());
+      await new Promise((resolve) => setTimeout(resolve, remaining + 25));
+      throw new HermesSettingsError("timed_out", "simulated deadline");
+    },
+  } as unknown as HermesSettingsAdapter;
+  const coordinator = new GlobalInheritanceCoordinator({
+    store,
+    settings,
+    listProfiles: async () => ["coder"],
+    materializationTimeoutMs: 100,
+  });
+
+  const first = coordinator.update({ expectedRevision: 0, skills: ["browser"] });
+  const expiredBehindFirst = coordinator.rematerializeSkills();
+  assert.equal((await first).skillSync.state, "pending");
+  await assert.rejects(expiredBehindFirst, (error: unknown) => error instanceof HermesSettingsError && error.code === "rejected");
+  assert.equal(listCalls, 1);
+  assert.equal((await coordinator.read()).skillSync.state, "pending");
 });
 
 async function seedManagedSkill(store: OfficeGlobalSettingsStore, profile: string, skill: string): Promise<void> {

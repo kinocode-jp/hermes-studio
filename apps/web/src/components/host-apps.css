@@ -1,0 +1,205 @@
+.host-apps {
+  width: min(100%, 980px);
+  margin: 0 auto 16px;
+  padding: 16px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-lg);
+  color: var(--ink);
+  background: var(--surface);
+  box-shadow: var(--shadow-sm);
+}
+
+.host-apps__header {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 16px;
+  padding-bottom: 12px;
+  border-bottom: 1px solid var(--line);
+}
+
+.host-apps__header span {
+  color: var(--ink-muted);
+  font: 700 var(--text-xs)/1 var(--font-sans);
+  letter-spacing: .04em;
+}
+
+.host-apps__header h2 {
+  margin: 4px 0 0;
+  font: 700 var(--text-lg)/1.2 var(--font-sans);
+}
+
+.host-apps__header button,
+.host-apps__action button {
+  display: inline-grid;
+  width: 36px;
+  height: 36px;
+  padding: 0;
+  place-items: center;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  color: var(--ink);
+  background: transparent;
+  cursor: pointer;
+}
+
+.host-apps__header button:hover:not(:disabled),
+.host-apps__action button:hover:not(:disabled) {
+  color: var(--accent);
+  background: var(--surface-2);
+}
+
+.host-apps__header button:disabled,
+.host-apps__action button:disabled {
+  color: var(--ink-muted);
+  cursor: default;
+  opacity: .5;
+}
+
+.host-apps__card {
+  display: grid;
+  grid-template-columns: 56px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 16px;
+  min-height: 104px;
+  padding: 16px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-md);
+  background: var(--surface-2);
+}
+
+/* One restrained brand mark, drawn without external assets. */
+.host-apps__sigil {
+  position: relative;
+  width: 48px;
+  height: 56px;
+  filter: drop-shadow(var(--shadow-sm));
+}
+
+.host-apps__sigil i {
+  position: absolute;
+  inset: 0;
+  background: var(--accent);
+  clip-path: polygon(48% 0, 88% 22%, 100% 73%, 54% 100%, 8% 76%, 0 27%);
+}
+
+.host-apps__sigil i:nth-child(2) {
+  background: color-mix(in srgb, var(--accent) 68%, var(--ink));
+  clip-path: polygon(48% 0, 54% 100%, 8% 76%, 18% 30%);
+}
+
+.host-apps__sigil i:nth-child(3) {
+  background: color-mix(in srgb, var(--accent) 36%, var(--surface));
+  clip-path: polygon(48% 0, 88% 22%, 62% 44%, 18% 30%);
+}
+
+.host-apps__copy { min-width: 0; }
+.host-apps__name-row { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; }
+.host-apps__name-row h3 { margin: 0; font: 700 var(--text-lg)/1.2 var(--font-sans); }
+.host-apps__status { display: inline-flex; align-items: center; gap: 8px; }
+.host-apps__status-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--amber);
+}
+.host-apps__card.is-installed .host-apps__status-dot { background: var(--accent); }
+.host-apps__card.is-failed .host-apps__status-dot,
+.host-apps__card.is-blocked .host-apps__status-dot { background: var(--coral); }
+.host-apps__copy p { margin: 8px 0 4px; color: var(--ink-muted); font-size: var(--text-sm); line-height: 1.5; }
+.host-apps__copy small { color: var(--ink-muted); font: 600 var(--text-xs)/1.4 var(--font-sans); }
+.host-apps__action { display: flex; align-items: center; gap: 8px; }
+.host-apps__action strong {
+  display: grid;
+  width: 36px;
+  height: 36px;
+  place-items: center;
+  border: 1px solid var(--line);
+  border-radius: 50%;
+  color: var(--accent);
+}
+.host-apps__notice { margin: 12px 0 0; color: var(--ink-muted); font-size: var(--text-sm); }
+.host-apps__notice.is-error { color: var(--coral); }
+
+.host-update-dialog-layer {
+  position: fixed;
+  inset: 0;
+  z-index: 230;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+}
+
+.host-update-dialog-scrim {
+  position: absolute;
+  inset: 0;
+  border: 0;
+  background: var(--scrim);
+  cursor: pointer;
+}
+
+.host-update-dialog {
+  position: relative;
+  display: grid;
+  gap: 16px;
+  width: min(460px, 100%);
+  padding: 20px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-lg);
+  color: var(--ink);
+  background: var(--surface);
+  box-shadow: var(--shadow-lg);
+}
+
+.host-update-dialog > header {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  color: var(--accent);
+}
+
+.host-update-dialog > header svg { width: 20px; height: 20px; }
+.host-update-dialog h2 { margin: 0; color: var(--ink); font-size: var(--text-lg); }
+.host-update-dialog > p { margin: 0; color: var(--ink-muted); line-height: 1.5; }
+.host-update-dialog > footer { display: flex; justify-content: flex-end; gap: 8px; }
+.host-update-dialog > footer button {
+  display: inline-flex;
+  min-height: 38px;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  padding: 0 14px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-md);
+  font: 700 var(--text-sm)/1 var(--font-sans);
+  cursor: pointer;
+}
+
+.host-update-dialog-confirm {
+  border-color: var(--accent) !important;
+  color: var(--surface);
+  background: var(--accent);
+}
+
+.host-update-dialog-confirm:hover,
+.host-update-dialog-confirm:focus-visible {
+  background: color-mix(in srgb, var(--accent) 88%, var(--ink));
+}
+
+.host-update-dialog-confirm svg { width: 15px; height: 15px; }
+
+@media (max-width: 768px), (max-width: 1400px) and (any-pointer: coarse) {
+  .host-apps { padding: 12px; }
+  .host-apps__header button,
+  .host-apps__action button { width: 44px; height: 44px; }
+  .host-apps__card { grid-template-columns: 48px minmax(0, 1fr); padding: 12px; }
+  .host-apps__sigil { width: 40px; height: 48px; }
+  .host-apps__action { grid-column: 1 / -1; justify-self: end; }
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .host-apps__card.is-installing .host-apps__sigil { animation: host-app-breathe 1.8s ease-in-out infinite; }
+}
+
+@keyframes host-app-breathe { 50% { opacity: .68; transform: translateY(-2px); } }

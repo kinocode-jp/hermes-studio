@@ -1,17 +1,17 @@
 {
-  "name": "@hermes-office/desktop",
+  "name": "@hermes-studio/desktop",
   "version": "0.1.0",
   "private": true,
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/kinocode-jp/hermes-office.git",
+    "url": "git+https://github.com/kinocode-jp/hermes-studio.git",
     "directory": "apps/desktop"
   },
   "type": "module",
   "scripts": {
     "tauri:dev": "tauri dev",
-    "build": "tauri build"
+    "build": "node ../../scripts/guard-desktop-build.mjs && tauri build"
   },
   "devDependencies": {
     "@tauri-apps/cli": "^2.3.1"

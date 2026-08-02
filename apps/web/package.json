@@ -1,11 +1,11 @@
 {
-  "name": "@hermes-office/web",
+  "name": "@hermes-studio/web",
   "version": "0.1.0",
   "private": true,
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/kinocode-jp/hermes-office.git",
+    "url": "git+https://github.com/kinocode-jp/hermes-studio.git",
     "directory": "apps/web"
   },
   "type": "module",
@@ -16,12 +16,14 @@
     "test": "tsx --test tests/*.test.ts"
   },
   "dependencies": {
-    "@hermes-office/protocol": "0.0.0",
+    "@hermes-studio/protocol": "0.0.0",
     "@preact/signals": "^2.0.1",
-    "preact": "^10.26.4"
+    "preact": "^10.26.4",
+    "three": "^0.185.1"
   },
   "devDependencies": {
     "@preact/preset-vite": "^2.10.1",
+    "@types/three": "^0.185.1",
     "tsx": "^4.20.3",
     "typescript": "^5.8.2",
     "vite": "^6.2.0",

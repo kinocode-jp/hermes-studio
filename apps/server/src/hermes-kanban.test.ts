@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   HermesKanbanAdapter,
+  HermesKanbanCommitUnconfirmedError,
   KanbanValidationError,
   createHermesKanbanHttpRequester,
   type HermesKanbanRequest,
@@ -20,7 +21,7 @@ const CARD = {
   latest_summary: null,
   comment_count: 2,
   workspace_path: "/Users/private/project",
-  api_key: "must-not-leak",
+  api_key: "must-not-leak", // gitleaks:allow -- synthetic rejection fixture
 };
 
 function mockAdapter(handler: (request: HermesKanbanRequest) => unknown | Promise<unknown>) {
@@ -36,7 +37,7 @@ test("board reads are allowlisted and strip paths, secrets, and unknown fields",
     assignees: ["mina"],
     latest_event_id: 9,
     now: 200,
-    access_token: "must-not-leak",
+    access_token: "must-not-leak", // gitleaks:allow -- synthetic rejection fixture
   }));
   const board = await adapter.getBoard({ board: "Project_One", includeArchived: true });
 
@@ -105,7 +106,7 @@ test("create, assignment, status, and comments send only bounded allowlisted JSO
   });
   assert.deepEqual(requests[1]?.body, { assignee: "" });
   assert.deepEqual(requests[2]?.body, { status: "blocked" });
-  assert.deepEqual(requests[3]?.body, { body: "Need input", author: "hermes-office" });
+  assert.deepEqual(requests[3]?.body, { body: "Need input", author: "hermes-studio" });
 });
 
 test("profile identities preserve case across assignment, board reads, and updates", async () => {
@@ -202,5 +203,26 @@ test("HTTP requester is loopback-only, route-limited, and never returns upstream
   await assert.rejects(
     requester({ method: "GET", path: "/api/profiles" }),
     /Only Hermes Kanban routes/,
+  );
+});
+
+test("non-idempotent POST transport and response-shape failures are commit-unconfirmed", async () => {
+  const requester = createHermesKanbanHttpRequester({
+    baseUrl: "http://127.0.0.1:9119",
+    sessionToken: "x".repeat(32),
+    fetch: async () => { throw new Error("reply lost after dispatch"); },
+  });
+  await assert.rejects(
+    requester({ method: "POST", path: "/api/plugins/kanban/tasks", body: { title: "Maybe created" } }),
+    HermesKanbanCommitUnconfirmedError,
+  );
+
+  await assert.rejects(
+    mockAdapter(() => ({ accepted: true })).createCard({ title: "Malformed success" }),
+    HermesKanbanCommitUnconfirmedError,
+  );
+  await assert.rejects(
+    mockAdapter(() => ({ ok: false })).addComment("t_deadbeef", "Maybe added"),
+    HermesKanbanCommitUnconfirmedError,
   );
 });

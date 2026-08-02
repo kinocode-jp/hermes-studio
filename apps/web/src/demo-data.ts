@@ -1,9 +1,11 @@
+import type { OfficeTeam } from "@hermes-studio/protocol";
 import type { ChatSession, Profile, TaskComment, WorkTask } from "./domain";
 
 export const profiles: Profile[] = [
   {
     id: "researcher",
     name: "Mina",
+    displayName: "ミナ",
     role: "Research",
     status: "working",
     color: "#64b7a7",
@@ -17,6 +19,7 @@ export const profiles: Profile[] = [
   {
     id: "builder",
     name: "Theo",
+    displayName: "テオ",
     role: "Engineering",
     status: "waiting",
     color: "#e07a55",
@@ -30,6 +33,7 @@ export const profiles: Profile[] = [
   {
     id: "operator",
     name: "Iris",
+    displayName: "アイリス",
     role: "Operations",
     status: "blocked",
     color: "#d6a94f",
@@ -43,6 +47,7 @@ export const profiles: Profile[] = [
   {
     id: "editor",
     name: "Ren",
+    displayName: "レン",
     role: "Editorial",
     status: "idle",
     color: "#8499c8",
@@ -70,7 +75,7 @@ export const initialSessions: ChatSession[] = [
   {
     id: "s-build-1",
     profileId: "builder",
-    title: "Office UI",
+    title: "Studio UI",
     status: "waiting",
     messages: [
       { id: "m4", from: "user", body: "Profileをキャラクターとして扱って。", at: "10:08" },
@@ -92,7 +97,49 @@ export const initialTasks: WorkTask[] = [
   { id: "t-106", title: "Remote auth threat model", status: "blocked", assigneeId: "operator", priority: "high", comments: 4 },
   { id: "t-107", title: "Mobile chat navigation", status: "triage", priority: "normal", comments: 0 },
   { id: "t-108", title: "Skill provenance labels", status: "ready", assigneeId: "editor", priority: "normal", comments: 2 },
-  { id: "t-102", title: "Office state reducer", status: "done", assigneeId: "builder", priority: "normal", comments: 2 }
+  { id: "t-102", title: "Studio state reducer", status: "done", assigneeId: "builder", priority: "normal", comments: 2 }
+];
+
+/** Sample Studio teams for explicit demo mode (not persisted). */
+export const initialTeams: OfficeTeam[] = [
+  {
+    id: "team-000000000000000000000001",
+    name: "Core Product",
+    color: "#64b7a7",
+    description: "Research and engineering pairing for product work.",
+    leadProfileId: "researcher",
+    memberProfileIds: ["researcher", "builder"],
+    settings: {
+      revision: 0,
+      skillsEnabled: true,
+      contextEnabled: true,
+      skills: ["research", "browser"],
+      context: "Core product team: prefer verified sources and ship small diffs.",
+      updatedAt: "2025-01-01T00:00:00.000Z",
+    },
+    revision: 1,
+    createdAt: "2025-01-01T00:00:00.000Z",
+    updatedAt: "2025-01-01T00:00:00.000Z",
+  },
+  {
+    id: "team-000000000000000000000002",
+    name: "Ops & Editorial",
+    color: "#d6a94f",
+    description: "Incidents, release notes, and operator review.",
+    leadProfileId: "operator",
+    memberProfileIds: ["operator", "editor"],
+    settings: {
+      revision: 0,
+      skillsEnabled: true,
+      contextEnabled: true,
+      skills: [],
+      context: "",
+      updatedAt: "2025-01-01T00:00:00.000Z",
+    },
+    revision: 1,
+    createdAt: "2025-01-01T00:00:00.000Z",
+    updatedAt: "2025-01-01T00:00:00.000Z",
+  },
 ];
 
 export const initialTaskComments: TaskComment[] = [

@@ -3,14 +3,14 @@ import { EventEmitter } from "node:events";
 import test from "node:test";
 import { WebSocket } from "ws";
 import type { HermesRuntimeSource } from "./hermes-backend.js";
-import type { HermesChatEvent, HermesChatRequest } from "./hermes-chat.js";
+import { HermesChatTransportError, type HermesChatEvent, type HermesChatRequest } from "./hermes-chat.js";
 import {
   ChatDeviceRateLimiter,
   handleOfficeChatConnection as handleOfficeChatConnectionWithCoordinator,
   serializeOfficeChatEvent,
   type ChatGatewayDependencies,
 } from "./chat-gateway.js";
-import { ChatSessionCoordinator } from "./chat-session-coordinator.js";
+import { ChatSessionCoordinator, MAX_CHAT_SESSION_LEASES_PER_OWNER } from "./chat-session-coordinator.js";
 import { ChatUpstreamHub } from "./chat-upstream-hub.js";
 import { OfficeAuth, type OfficeAuthSession } from "./office-auth.js";
 
@@ -148,9 +148,11 @@ test("gateway fails closed when its shared session coordinator is not injected",
   assert.deepEqual(client.closed, { code: 1011, reason: "Chat session hub unavailable" });
 });
 
-test("one Office connection cannot retain more than four session leases", async () => {
+test("one Office connection cannot retain more than the configured owner session leases", async () => {
   const runtime = runtimeWithConnections(() => connection());
-  const coordinator = new ChatSessionCoordinator();
+  // Raise the profile bound to the owner bound so this fixture exercises the
+  // owner boundary rather than stopping first at the independent profile cap.
+  const coordinator = new ChatSessionCoordinator({ maxLeasesPerProfile: MAX_CHAT_SESSION_LEASES_PER_OWNER });
   const client = new FakeWebSocket();
   handleOfficeChatConnection(client as unknown as WebSocket, {
     auth: new OfficeAuth(), officeSession: REMOTE_SESSION, runtimeSource: runtime,
@@ -159,18 +161,19 @@ test("one Office connection cannot retain more than four session leases", async 
     limits: { socketRateCapacity: 100 }, sessionCoordinator: coordinator,
   });
   await flush();
-  for (let index = 1; index <= 5; index += 1) {
+  for (let index = 1; index <= MAX_CHAT_SESSION_LEASES_PER_OWNER + 1; index += 1) {
     client.rpc(120 + index, "session.resume", { session_id: `lease-${index}`, profile: "test-bind" });
     await flush();
   }
 
-  assert.equal(client.errorCode(125), -32007);
-  assert.equal(client.errorCode(124), undefined);
-  const error = client.frames().find((frame) => frame.id === 125)?.error as { data?: { reason?: string } } | undefined;
+  const rejectedId = 120 + MAX_CHAT_SESSION_LEASES_PER_OWNER + 1;
+  assert.equal(client.errorCode(rejectedId), -32007);
+  assert.equal(client.errorCode(rejectedId - 1), undefined);
+  const error = client.frames().find((frame) => frame.id === rejectedId)?.error as { data?: { reason?: string } } | undefined;
   assert.equal(error?.data?.reason, "session_limit");
-  client.rpc(126, "session.resume", { session_id: "lease-1", profile: "test-bind" });
+  client.rpc(rejectedId + 1, "session.resume", { session_id: "lease-1", profile: "test-bind" });
   await flush();
-  assert.equal(client.errorCode(126), undefined, "the bound does not reject an existing lease owned by this socket");
+  assert.equal(client.errorCode(rejectedId + 1), undefined, "the bound does not reject an existing lease owned by this socket");
 });
 
 test("slow or failed chat clients are closed with a resynchronization policy", async () => {
@@ -251,20 +254,31 @@ test("approval and clarification remain exact-socket, one-shot, expiring, and di
   now += 51;
   a.rpc(6, "approval.respond", { session_id: "s-expired", choice: "once" });
   callbacks[0]!({ type: "clarify.request", sessionId: "s-1", payload: { requestId: "q-1", question: "Proceed?" } });
-  b.rpc(7, "clarify.respond", { request_id: "q-1", answer: "yes" });
-  a.rpc(8, "clarify.respond", { request_id: "q-1", answer: "yes" });
-  a.rpc(9, "clarify.respond", { request_id: "q-1", answer: "again" });
+  b.rpc(7, "clarify.respond", { session_id: "s-1", request_id: "q-1", answer: "yes" });
+  a.rpc(8, "clarify.respond", { session_id: "s-1", request_id: "q-1", answer: "yes" });
+  a.rpc(9, "clarify.respond", { session_id: "s-1", request_id: "q-1", answer: "again" });
   callbacks[0]!({ type: "clarify.request", sessionId: "s-1", payload: { requestId: "q-expired", question: "Late?" } });
   now += 51;
-  a.rpc(10, "clarify.respond", { request_id: "q-expired", answer: "late" });
+  a.rpc(10, "clarify.respond", { session_id: "s-1", request_id: "q-expired", answer: "late" });
   await flush();
   for (const id of [3, 4, 5, 6, 7, 9, 10]) assert.ok(a.hasError(id) || b.hasError(id));
-  assert.equal(requests[0]!.filter((item) => item.method === "clarify.respond").length, 1);
+  assert.equal(requests[0]!.filter((item) => item.method === "clarify.respond").length, 2);
+  assert.equal(requests[0]!.some((item) => item.method === "approval.respond" && item.params?.choice === "deny"), true);
+  assert.equal(requests[0]!.some((item) => item.method === "clarify.respond" && item.params?.answer === ""), true);
+  await bindSessions(a, "s-2");
+  callbacks[0]!({ type: "clarify.request", sessionId: "s-1", payload: { requestId: "same-id", question: "First pane?" } });
+  callbacks[0]!({ type: "clarify.request", sessionId: "s-2", payload: { requestId: "same-id", question: "Second pane?" } });
+  a.rpc(11, "clarify.respond", { session_id: "s-1", request_id: "same-id", answer: "one" });
+  a.rpc(12, "clarify.respond", { session_id: "s-2", request_id: "same-id", answer: "two" });
+  await flush();
+  assert.equal(a.errorCode(11), undefined);
+  assert.equal(a.errorCode(12), undefined);
+  assert.equal(requests[0]!.filter((item) => item.method === "clarify.respond" && item.params?.request_id === "same-id").length, 2);
   a.emit("close");
   await flush();
   assert.equal(closes[0], 0, "one Browser disconnect must keep the shared Hermes connection open");
   const requestsAfterDisconnect = requests[0]!.length;
-  a.rpc(12, "session.interrupt", { session_id: "s-1" });
+  a.rpc(13, "session.interrupt", { session_id: "s-1" });
   await flush();
   assert.equal(requests[0]!.length, requestsAfterDisconnect);
 
@@ -309,9 +323,9 @@ test("approval and clarification claims are exclusive and recover only after tim
       return connection(async (request) => {
         requests.push(request);
         attempt += 1;
-        if (attempt === 1) return await approvalFailure.promise;
-        if (attempt === 3) return await clarificationFailure.promise;
-        if (attempt === 5) return await expiredFailure.promise;
+      if (attempt === 1) return await approvalFailure.promise;
+      if (attempt === 3) return await clarificationFailure.promise;
+      if (attempt === 5) return await expiredFailure.promise;
         return { method: request.method, value: { status: "ok" } };
       });
     }),
@@ -329,7 +343,7 @@ test("approval and clarification claims are exclusive and recover only after tim
   await flush();
   assert.equal(requests.length, 1);
   assert.equal(client.errorCode(21), -32004);
-  approvalFailure.reject(new Error("temporary approval failure"));
+  approvalFailure.reject(new HermesChatTransportError("backend_rejected", "temporary approval failure", 4090));
   await flush();
   assert.equal(client.errorCode(20), -32000);
   client.rpc(22, "approval.respond", { session_id: "s-retry", choice: "once" });
@@ -340,18 +354,18 @@ test("approval and clarification claims are exclusive and recover only after tim
   assert.equal(client.errorCode(23), -32004);
 
   publish({ type: "clarify.request", sessionId: "s-retry", payload: { requestId: "q-retry", question: "Retry?" } });
-  client.rpc(24, "clarify.respond", { request_id: "q-retry", answer: "yes" });
-  client.rpc(25, "clarify.respond", { request_id: "q-retry", answer: "competing" });
+  client.rpc(24, "clarify.respond", { session_id: "s-retry", request_id: "q-retry", answer: "yes" });
+  client.rpc(25, "clarify.respond", { session_id: "s-retry", request_id: "q-retry", answer: "competing" });
   await flush();
   assert.equal(requests.length, 3);
   assert.equal(client.errorCode(25), -32004);
-  clarificationFailure.reject(new Error("temporary clarification failure"));
+  clarificationFailure.reject(new HermesChatTransportError("backend_rejected", "temporary clarification failure", 4090));
   await flush();
   assert.equal(client.errorCode(24), -32000);
-  client.rpc(26, "clarify.respond", { request_id: "q-retry", answer: "retry" });
+  client.rpc(26, "clarify.respond", { session_id: "s-retry", request_id: "q-retry", answer: "retry" });
   await flush();
   assert.equal(requests.length, 4);
-  client.rpc(27, "clarify.respond", { request_id: "q-retry", answer: "again" });
+  client.rpc(27, "clarify.respond", { session_id: "s-retry", request_id: "q-retry", answer: "again" });
   await flush();
   assert.equal(client.errorCode(27), -32004);
 
@@ -360,15 +374,15 @@ test("approval and clarification claims are exclusive and recover only after tim
   await flush();
   assert.equal(requests.length, 5);
   now += 51;
-  expiredFailure.reject(new Error("late failure"));
+  expiredFailure.reject(new HermesChatTransportError("backend_rejected", "late failure", 4090));
   await flush();
   client.rpc(29, "approval.respond", { session_id: "s-failure-expired", choice: "once" });
   await flush();
-  assert.equal(requests.length, 5);
+  assert.equal(requests.length, 6);
   assert.equal(client.errorCode(29), -32004);
 });
 
-test("malformed interaction acknowledgements restore the pending claim", async () => {
+test("malformed interaction acknowledgements are commit-unconfirmed and consume the pending claim", async () => {
   let publish!: (event: HermesChatEvent) => void;
   let approvalAttempts = 0;
   let clarifyAttempts = 0;
@@ -399,18 +413,20 @@ test("malformed interaction acknowledgements restore the pending claim", async (
   publish({ type: "approval.request", sessionId: "s-malformed", payload: { choices: ["once"], allowPermanent: false } });
   client.rpc(110, "approval.respond", { session_id: "s-malformed", choice: "once" });
   await flush();
-  assert.equal(client.errorCode(110), -32000);
+  assert.equal(client.errorCode(110), -32008);
   client.rpc(111, "approval.respond", { session_id: "s-malformed", choice: "once" });
   await flush();
-  assert.equal(client.errorCode(111), undefined);
+  assert.equal(client.errorCode(111), -32004);
+  assert.equal(approvalAttempts, 1);
 
   publish({ type: "clarify.request", sessionId: "s-malformed", payload: { requestId: "q-malformed", question: "Retry?" } });
-  client.rpc(112, "clarify.respond", { request_id: "q-malformed", answer: "first" });
+  client.rpc(112, "clarify.respond", { session_id: "s-malformed", request_id: "q-malformed", answer: "first" });
   await flush();
-  assert.equal(client.errorCode(112), -32000);
-  client.rpc(113, "clarify.respond", { request_id: "q-malformed", answer: "second" });
+  assert.equal(client.errorCode(112), -32008);
+  client.rpc(113, "clarify.respond", { session_id: "s-malformed", request_id: "q-malformed", answer: "second" });
   await flush();
-  assert.equal(client.errorCode(113), undefined);
+  assert.equal(client.errorCode(113), -32004);
+  assert.equal(clarifyAttempts, 1);
 });
 
 test("a same-session approval arriving during a claim survives both success and failure of its predecessor", async () => {
@@ -460,14 +476,15 @@ test("a same-session approval arriving during a claim survives both success and 
   publish({ type: "approval.request", sessionId: "s-successor", payload: { choices: ["later"], allowPermanent: false } });
   firstFailure.reject(new Error("predecessor failed"));
   await flush();
-  assert.equal(client.errorCode(42), -32000);
+  assert.equal(client.errorCode(42), -32008);
   client.rpc(45, "approval.respond", { session_id: "s-successor", choice: "once" });
   await flush();
+  assert.equal(client.errorCode(45), -32004, "an ambiguous predecessor is consumed and cannot be replayed");
   client.rpc(46, "approval.respond", { session_id: "s-successor", choice: "deny" });
   await flush();
   client.rpc(47, "approval.respond", { session_id: "s-successor", choice: "later" });
   await flush();
-  assert.equal(requests.filter((request) => request.method === "approval.respond").length, 7);
+  assert.equal(requests.filter((request) => request.method === "approval.respond").length, 6);
   assert.equal(requests.some((request) => "approval_id" in (request.params ?? {})), false);
   assert.equal(client.hasError(47), false);
 });
@@ -551,7 +568,43 @@ test("active expiry promotes the next approval with a full TTL and rejects the o
   await flush();
   assert.equal(client.errorCode(80), -32004);
   assert.equal(client.errorCode(81), -32004);
-  assert.equal(requests.length, 1);
+  assert.equal(requests.length, 2);
+  assert.equal(requests[0]?.params?.choice, "deny");
+  assert.equal(requests[1]?.params?.choice, "deny");
+});
+
+test("interaction deadlines settle Hermes before clearing UI state or promoting approvals", async () => {
+  let publish!: (event: HermesChatEvent) => void;
+  const requests: HermesChatRequest[] = [];
+  const client = new FakeWebSocket();
+  handleOfficeChatConnection(client as unknown as WebSocket, {
+    auth: new OfficeAuth(), officeSession: REMOTE_SESSION,
+    runtimeSource: runtimeWithConnections((onEvent) => {
+      publish = onEvent;
+      return connection(async (request) => {
+        requests.push(request);
+        return { method: request.method, value: { status: "ok" } };
+      });
+    }),
+    maxJsonBytes: 64 * 1024,
+    deviceLimiter: new ChatDeviceRateLimiter({ capacity: 100, ratePerSecond: 0 }),
+    limits: { approvalTtlMs: 40, socketRateCapacity: 100 },
+  });
+  await flush();
+  await bindSessions(client, "s-auto-expire");
+  publish({ type: "approval.request", sessionId: "s-auto-expire", payload: { choices: ["once"], allowPermanent: false } });
+  publish({ type: "approval.request", sessionId: "s-auto-expire", payload: { choices: ["deny"], allowPermanent: false } });
+  publish({ type: "clarify.request", sessionId: "s-auto-expire", payload: { requestId: "q-auto-expire", question: "Still there?" } });
+
+  await new Promise((resolve) => setTimeout(resolve, 60));
+  await flush();
+  const events = client.events();
+  assert.equal(events.filter((event) => event.type === "approval.expired").length, 1);
+  assert.equal(events.filter((event) => event.type === "approval.request").length, 2);
+  assert.equal(events.some((event) => event.type === "clarify.expired" && event.payload?.requestId === "q-auto-expire"), true);
+  assert.equal(requests.some((request) => request.method === "approval.respond" && request.params?.choice === "deny"), true);
+  assert.equal(requests.some((request) => request.method === "clarify.respond" && request.params?.answer === ""), true);
+  client.emit("close");
 });
 
 test("approval queue overflow is explicit and closes the socket", async () => {
@@ -687,10 +740,10 @@ class FakeWebSocket extends EventEmitter {
   errorCode(id: number): number | undefined { return (this.frames().find((frame) => frame.id === id)?.error as { code?: number } | undefined)?.code; }
   hasError(id: number): boolean { return this.errorCode(id) !== undefined; }
   frames(): Array<Record<string, unknown>> { return this.sent.map((body) => JSON.parse(body) as Record<string, unknown>); }
-  events(): Array<{ sessionId?: string; type?: string; payload?: { approvalId?: string; choices?: string[]; allowPermanent?: boolean } }> {
+  events(): Array<{ sessionId?: string; type?: string; payload?: { approvalId?: string; requestId?: string; choices?: string[]; allowPermanent?: boolean } }> {
     return this.frames().flatMap((frame) => {
       if (frame.method !== "event" || typeof frame.params !== "object" || frame.params === null || Array.isArray(frame.params)) return [];
-      return [frame.params as { sessionId?: string; type?: string; payload?: { approvalId?: string; choices?: string[]; allowPermanent?: boolean } }];
+      return [frame.params as { sessionId?: string; type?: string; payload?: { approvalId?: string; requestId?: string; choices?: string[]; allowPermanent?: boolean } }];
     });
   }
 }

@@ -1,6 +1,11 @@
 import type { ChatMessage } from "./domain";
 
-export function normalizeHistoryPage(value: unknown, storedSessionId: string): {
+// Hermes indexes occupy reserved anchors. Live messages and operation evidence
+// use the space between anchors, so a later history reload cannot collide with
+// locally captured chronological events.
+const HISTORY_TIMELINE_STRIDE = 1_000_000;
+
+export function normalizeHistoryPage(value: unknown, storedSessionId: string, pageNumber = 0): {
   messages: ChatMessage[];
   direction: "older";
   resolvedStoredSessionId?: string;
@@ -18,11 +23,21 @@ export function normalizeHistoryPage(value: unknown, storedSessionId: string): {
     const role = typeof message.role === "string" ? message.role : typeof message.from === "string" ? message.from : "assistant";
     const body = messageText(message);
     if (!body) return [];
+    const historyIndex = typeof message.index === "number"
+      && Number.isSafeInteger(message.index)
+      && message.index >= 0
+      && Number.isSafeInteger(message.index * HISTORY_TIMELINE_STRIDE)
+      ? message.index
+      : undefined;
+    const timelineSequence = historyIndex === undefined ? undefined : historyIndex * HISTORY_TIMELINE_STRIDE;
     return [{
       id: typeof message.id === "string"
         ? message.id
-        : `history-${storedSessionId}-${typeof message.index === "number" && Number.isSafeInteger(message.index) ? message.index : index}`,
+        : historyIndex === undefined
+          ? `history-${storedSessionId}-page-${pageNumber}-row-${index}`
+          : `history-${storedSessionId}-${historyIndex}`,
       from: role === "user" ? "user" as const : role === "tool" || role === "system" ? "tool" as const : "agent" as const,
+      ...(timelineSequence === undefined ? {} : { timelineSequence }),
       body,
       at: messageTime(message),
       status: "complete" as const,
@@ -38,7 +53,7 @@ export function normalizeHistoryPage(value: unknown, storedSessionId: string): {
     ? pagination.nextCursor
     : undefined;
   if ((hasMore && nextCursor === undefined) || (hasMore && truncated) || pagination?.direction !== "older") {
-    throw new Error("Office Serverの履歴ページ情報に互換性がありません。");
+    throw new Error("Studio Serverの履歴ページ情報に互換性がありません。");
   }
   const truncationReason = typeof pagination?.truncationReason === "string" ? pagination.truncationReason : undefined;
   return {

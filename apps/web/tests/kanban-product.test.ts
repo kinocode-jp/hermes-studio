@@ -13,7 +13,7 @@ import {
   type KanbanApi,
   type KanbanCardDetailResult
 } from "../src/kanban-api.ts";
-import { requestTaskMove } from "../src/components/kanban-board.tsx";
+import { requestTaskMove } from "../src/kanban-board-logic.ts";
 import {
   allowUnconfirmedCommentResend,
   allowUnconfirmedTaskResend,
@@ -94,9 +94,19 @@ test("comment detail ignores stale pane loads and supports retry", async () => {
 });
 
 test("status select and drag/drop share the validated move path", async () => {
-  const source = await readFile(new URL("../src/components/kanban-board.tsx", import.meta.url), "utf8");
+  const [source, mainSource] = await Promise.all([
+    readFile(new URL("../src/components/kanban-board.tsx", import.meta.url), "utf8"),
+    readFile(new URL("../src/main.tsx", import.meta.url), "utf8"),
+  ]);
   assert.match(source, /onChange=.*requestTaskMove/s);
-  assert.match(source, /onDrop=.*requestTaskMove/s);
+  assert.match(source, /onDrop=.*acceptDrop/s);
+  assert.match(source, /requestTaskMove/);
+  assert.match(source, /is-drop-target/);
+  assert.match(source, /kanban-column-toggle/);
+  assert.match(source, /isKanbanColumnCollapsed/);
+  assert.match(mainSource, /KANBAN_BACKGROUND_REFRESH_MS = 10_000/);
+  assert.match(mainSource, /refreshKanbanBoard\(\{ background: true \}\)/);
+  assert.match(mainSource, /visibilitychange/);
 
   let boardCard = { ...CARD };
   const updates: Array<Record<string, unknown>> = [];
@@ -509,8 +519,8 @@ test("commit-unknown card creation is blocked until an authoritative board check
   assert.match(source, /Boolean\(unconfirmedTaskCreation\.value\)/);
   assert.match(source, /confirmUnconfirmedTaskCreation/);
   assert.match(source, /allowUnconfirmedTaskResend/);
-  assert.match(source, /<input[^>]+disabled=\{taskCreationBusy\.value \|\| Boolean\(unconfirmedTaskCreation\.value\)\}/);
-  assert.match(source, /type="submit"[^>]+taskCreationBusy\.value/);
+  assert.match(source, /<input[\s\S]*?disabled=\{boardState\.state === "loading" \|\| taskCreationBusy\.value \|\| Boolean\(unconfirmedTaskCreation\.value\)\}/);
+  assert.match(source, /type="submit" disabled=\{busy \|\| !title\.trim\(\)\}/);
 
   resetKanbanRuntimeState();
   let cards = [{ ...CARD }];
@@ -573,6 +583,7 @@ test("deterministic mutation rejection remains distinct from commit-unknown", as
   const rejected = new KanbanMutationFailure("rejected", new Error("invalid card"));
   assert.equal(classifyKanbanMutationFailure(rejected), "rejected");
   assert.equal(classifyKanbanMutationFailure(new OfficeHttpError(422)), "rejected");
+  assert.equal(classifyKanbanMutationFailure(new OfficeHttpError(409, "commit_unconfirmed")), "commit-unknown");
   assert.equal(classifyKanbanMutationFailure(new OfficeHttpError(408)), "commit-unknown");
   assert.equal(classifyKanbanMutationFailure(new DOMException("timeout", "AbortError")), "commit-unknown");
 
@@ -614,7 +625,7 @@ function detail(cardId: string, comments: TaskComment[]): KanbanCardDetailResult
 }
 
 function comment(id: number, cardId: string, body: string): TaskComment {
-  return { id, cardId, author: "hermes-office", body, createdAt: 100 + id };
+  return { id, cardId, author: "hermes-studio", body, createdAt: 100 + id };
 }
 
 function rawCard(commentCount: number) {
@@ -634,7 +645,7 @@ function rawCard(commentCount: number) {
 }
 
 function rawComment(id: number) {
-  return { id, cardId: CARD.id, author: "hermes-office", body: `note ${id}`, createdAt: 100 + id };
+  return { id, cardId: CARD.id, author: "hermes-studio", body: `note ${id}`, createdAt: 100 + id };
 }
 
 function deferred<T>() {

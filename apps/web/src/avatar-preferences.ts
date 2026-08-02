@@ -1,9 +1,11 @@
 import { signal, type Signal } from "@preact/signals";
 
-const STORAGE_KEY = "hermes-office.profile-avatars.v1";
-const ORDINAL_STORAGE_KEY = "hermes-office.profile-avatar-ordinals.v1";
+const STORAGE_KEY = "hermes-studio.profile-avatars.v1";
+const ORDINAL_STORAGE_KEY = "hermes-studio.profile-avatar-ordinals.v1";
 const CUSTOM_IMAGE_LIMIT = 1_500_000;
-const DATABASE_NAME = "hermes-office-assets";
+const DATABASE_NAME = "hermes-studio-assets";
+/** @deprecated Pre-rebrand IndexedDB name; dual-opened for custom avatar migration. */
+const LEGACY_DATABASE_NAME = "hermes-office-assets";
 const DATABASE_STORE = "profile-avatars";
 export const DEFAULT_CHARACTER_COUNT = 6;
 
@@ -41,7 +43,7 @@ export class AvatarOrdinalPreferences {
     if (changed) this.#persist(this.#snapshot());
   }
 
-  /** Reconciles only after Office has observed one complete authoritative roster. */
+  /** Reconciles only after Studio has observed one complete authoritative roster. */
   reconcile(profileIds: readonly string[]): void {
     const current = uniqueProfileIds(profileIds);
     const currentSet = new Set(current);
@@ -239,7 +241,7 @@ export function isSafeImageDataUrl(value: string): boolean {
 
 function readStoredAvatars(): AvatarMap {
   try {
-    const raw = globalThis.localStorage?.getItem(STORAGE_KEY);
+    const raw = globalThis.localStorage?.getItem(STORAGE_KEY) ?? globalThis.localStorage?.getItem("hermes-office.profile-avatars.v1");
     if (!raw) return {};
     const parsed: unknown = JSON.parse(raw);
     if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return {};
@@ -270,7 +272,7 @@ function persist(avatars: AvatarMap): void {
 
 function readStoredOrdinals(): AvatarOrdinalMap {
   try {
-    const raw = globalThis.localStorage?.getItem(ORDINAL_STORAGE_KEY);
+    const raw = globalThis.localStorage?.getItem(ORDINAL_STORAGE_KEY) ?? globalThis.localStorage?.getItem("hermes-office.profile-avatar-ordinals.v1");
     if (!raw) return {};
     const parsed: unknown = JSON.parse(raw);
     const ordinals = normalizeAvatarOrdinals(parsed);
@@ -288,12 +290,23 @@ function persistOrdinals(ordinals: AvatarOrdinalMap): void {
 
 class IndexedDbAvatarStore implements AvatarAssetStore {
   async load(legacy: Readonly<AvatarMap>): Promise<unknown[]> {
-    return await withAvatarStore("readwrite", async (store) => {
+    const primary = await withAvatarStore("readwrite", async (store) => {
       for (const [profileId, avatar] of Object.entries(legacy)) {
         if (avatar.kind === "custom") await requestResult(store.put({ profileId, dataUrl: avatar.dataUrl }));
       }
       return await requestResult<unknown[]>(store.getAll());
     }) ?? [];
+    if (primary.length > 0) return primary;
+    // Dual-read pre-rebrand IndexedDB (hermes-office-assets) and copy forward once.
+    const fromLegacy = await readLegacyAvatarDatabase();
+    if (fromLegacy.length === 0) return primary;
+    await withAvatarStore("readwrite", async (store) => {
+      for (const row of fromLegacy) {
+        if (isStoredCustomAvatar(row)) await requestResult(store.put(row));
+      }
+      return true;
+    });
+    return fromLegacy;
   }
 
   async put(profileId: string, dataUrl: string): Promise<void> {
@@ -346,6 +359,10 @@ async function withAvatarStore<T>(mode: IDBTransactionMode, operation: (store: I
 }
 
 function openAvatarDatabase(): Promise<IDBDatabase | undefined> {
+  return openNamedAvatarDatabase(DATABASE_NAME);
+}
+
+function openNamedAvatarDatabase(name: string): Promise<IDBDatabase | undefined> {
   if (typeof indexedDB === "undefined") return Promise.resolve(undefined);
   return new Promise((resolve) => {
     let settled = false;
@@ -354,14 +371,34 @@ function openAvatarDatabase(): Promise<IDBDatabase | undefined> {
       settled = true;
       resolve(database);
     };
-    const request = indexedDB.open(DATABASE_NAME, 1);
+    const request = indexedDB.open(name, 1);
     request.onupgradeneeded = () => {
-      if (!request.result.objectStoreNames.contains(DATABASE_STORE)) request.result.createObjectStore(DATABASE_STORE, { keyPath: "profileId" });
+      if (!request.result.objectStoreNames.contains(DATABASE_STORE)) {
+        request.result.createObjectStore(DATABASE_STORE, { keyPath: "profileId" });
+      }
     };
     request.onsuccess = () => finish(request.result);
     request.onerror = () => finish();
     request.onblocked = () => finish();
   });
+}
+
+/** Best-effort dual-read of pre-rebrand custom avatar rows. */
+async function readLegacyAvatarDatabase(): Promise<unknown[]> {
+  const database = await openNamedAvatarDatabase(LEGACY_DATABASE_NAME);
+  if (!database) return [];
+  try {
+    if (!database.objectStoreNames.contains(DATABASE_STORE)) return [];
+    const transaction = database.transaction(DATABASE_STORE, "readonly");
+    const completed = transactionCompletion(transaction);
+    const rows = await requestResult<unknown[]>(transaction.objectStore(DATABASE_STORE).getAll());
+    await completed;
+    return rows;
+  } catch {
+    return [];
+  } finally {
+    database.close();
+  }
 }
 
 function requestResult<T = IDBValidKey>(request: IDBRequest<T>): Promise<T> {

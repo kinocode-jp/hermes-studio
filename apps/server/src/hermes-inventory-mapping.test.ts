@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { UNKNOWN_INVENTORY_TIMESTAMP } from "@hermes-office/protocol";
+import { UNKNOWN_INVENTORY_TIMESTAMP } from "@hermes-studio/protocol";
 import { collectHermesInventory, HermesInventoryCache, type HermesJsonResult } from "./hermes-inventory.js";
 
 const MAX_EPOCH_SECONDS = 8_640_000_000_000;
@@ -147,16 +147,19 @@ test("contradictory totals combine safely with invalid and duplicate rows within
 test("missing timestamps use a stable unknown sentinel and preserve cursor generations", async () => {
   const fields = [
     { id: "missing", profile: "profile-0" },
+    { id: "null-optional", profile: "profile-0", started_at: null, last_active: null, ended_at: null },
     { id: "epoch", profile: "profile-0", started_at: 0, last_active: 0 },
     { id: "mixed", profile: "profile-0", last_active: 0 },
   ];
   const mapped = await collectHermesInventory(requester([profile()], fields));
   assert.equal(mapped.sessions[0]?.createdAt, UNKNOWN_INVENTORY_TIMESTAMP);
   assert.equal(mapped.sessions[0]?.updatedAt, UNKNOWN_INVENTORY_TIMESTAMP);
-  assert.equal(mapped.sessions[1]?.createdAt, "1970-01-01T00:00:00.000Z");
-  assert.equal(mapped.sessions[1]?.updatedAt, "1970-01-01T00:00:00.000Z");
-  assert.equal(mapped.sessions[2]?.createdAt, UNKNOWN_INVENTORY_TIMESTAMP);
+  assert.equal(mapped.sessions[1]?.createdAt, UNKNOWN_INVENTORY_TIMESTAMP);
+  assert.equal(mapped.sessions[1]?.updatedAt, UNKNOWN_INVENTORY_TIMESTAMP);
+  assert.equal(mapped.sessions[2]?.createdAt, "1970-01-01T00:00:00.000Z");
   assert.equal(mapped.sessions[2]?.updatedAt, "1970-01-01T00:00:00.000Z");
+  assert.equal(mapped.sessions[3]?.createdAt, UNKNOWN_INVENTORY_TIMESTAMP);
+  assert.equal(mapped.sessions[3]?.updatedAt, "1970-01-01T00:00:00.000Z");
 
   const rows = Array.from({ length: 101 }, (_, index) => ({ id: `missing-${index}`, profile: "profile-0" }));
   const firstInventory = await collectHermesInventory(requester([profile()], rows));
@@ -169,11 +172,43 @@ test("missing timestamps use a stable unknown sentinel and preserve cursor gener
   assert.deepEqual(cache.page("sessions", first.metadata.sessions.nextCursor!, 100).sessions.map((item) => item.id), ["missing-100"]);
 });
 
+test("delegated profile conversations expose only bounded public provenance", async () => {
+  const delegated = {
+    ...session("delegated-session", 1),
+    conversation_kind: "delegated",
+    delegation_task_id: "t_profile_work_1",
+    delegated_by_profile: "default",
+  };
+  const direct = { ...session("direct-session", 2), conversation_kind: "direct" };
+  const inventory = await collectHermesInventory(requester([profile()], [delegated, direct]));
+
+  assert.equal(inventory.sessions[0]?.conversationKind, "delegated");
+  assert.equal(inventory.sessions[0]?.delegationTaskId, "t_profile_work_1");
+  assert.equal(inventory.sessions[0]?.delegatedByProfileId, "default");
+  assert.equal(inventory.sessions[1]?.conversationKind, undefined);
+  assert.equal(inventory.sessions[1]?.delegationTaskId, undefined);
+});
+
+test("session workspaces become opaque project groups without exposing host paths", async () => {
+  const root = "/Volumes/Private/Client/kinocode-hp";
+  const sameProject = [
+    { ...session("workspace-a", 2), profile: "profile-0", cwd: `${root}/apps/web`, git_repo_root: root },
+    { ...session("workspace-b", 1), profile: "profile-1", cwd: root },
+    { ...session("no-workspace", 0), profile: "profile-0" },
+  ];
+  const inventory = await collectHermesInventory(requester([profile(), profile("profile-1")], sameProject));
+
+  assert.equal(inventory.sessions[0]?.projectGroupName, "kinocode-hp");
+  assert.equal(inventory.sessions[0]?.projectGroupId, inventory.sessions[1]?.projectGroupId);
+  assert.equal(inventory.sessions[2]?.projectGroupId, undefined);
+  assert.equal(JSON.stringify(inventory.sessions).includes(root), false);
+});
+
 test("session inventory redacts Hermes secrets before bounding browser display text", async () => {
-  const secret = "dashboard-example-value-123456";
+  const secret = "dashboard-example-value-123456"; // gitleaks:allow -- synthetic redaction fixture
   const standalone = "sk_" + "live_ABCDEFGHIJKLMNOPQRSTUVWXYZ";
   const authorization = "opaque-inventory-credential";
-  const databaseSecret = "database-password-example-value";
+  const databaseSecret = "database-password-example-value"; // gitleaks:allow -- synthetic redaction fixture
   const googleKey = ["AIza", "SyA12345678901234567890123456789012"].join("");
   const row = {
     ...session("secret-safe", 1),
@@ -191,7 +226,7 @@ test("session inventory redacts Hermes secrets before bounding browser display t
 });
 
 test("secret-shaped profile and session identities are dropped instead of exposed", async () => {
-  const secret = "dashboard-example-value-123456";
+  const secret = "dashboard-example-value-123456"; // gitleaks:allow -- synthetic redaction fixture
   const inventory = await collectHermesInventory(requester(
     [profile(), profile(`TOKEN=${secret}`)],
     [session("safe-session", 1), { ...session("unsafe", 1), id: `TOKEN=${secret}` }],

@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import type { HermesRuntimeSource } from "./hermes-backend.js";
 import { createDemoRuntimeStatus, createDemoSnapshot } from "./demo-state.js";
-import { createOfficeServer } from "./server.js";
+import { createStudioServer } from "./server.js";
 
 const ORIGIN = "http://localhost:4173";
 
@@ -40,7 +40,7 @@ test("Office history endpoint serves large histories as bounded cursor pages", a
     }),
     kanban: () => { throw new Error("unused"); },
   };
-  const server = createOfficeServer({ port: 0, runtimeSource: runtime, maxJsonBytes: 4 * 1024, allowedOrigins: [ORIGIN] });
+  const server = createStudioServer({ port: 0, runtimeSource: runtime, maxJsonBytes: 4 * 1024, allowedOrigins: [ORIGIN] });
   const address = await server.listen();
   t.after(() => server.close());
   const base = `http://127.0.0.1:${address.port}`;

@@ -65,9 +65,9 @@ export interface HermesRpcConnection extends HermesSubscription {
 }
 
 /**
- * Runtime boundary for Hermes Office.
+ * Runtime boundary for Hermes Studio.
  *
- * A browser implementation should call the Hermes Office server, not expose a
+ * A browser implementation should call the Studio Server, not expose a
  * remote Hermes admin credential directly to JavaScript. Tauri may implement
  * this boundary in Rust while the PWA uses the authenticated Office proxy.
  */

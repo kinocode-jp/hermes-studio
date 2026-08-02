@@ -1,6 +1,6 @@
-# Contributing to Hermes Office
+# Contributing to Hermes Studio
 
-Thanks for considering a contribution. Hermes Office is pre-1.0 software, so
+Thanks for considering a contribution. Hermes Studio is pre-1.0 software, so
 please discuss large product, protocol, security-boundary, or storage changes in
 an issue before investing in an implementation.
 
@@ -17,7 +17,7 @@ Useful checks are:
 
 ```bash
 npm run typecheck
-npm test --workspace @hermes-office/web
+npm test --workspace @hermes-studio/web
 npm run test:server
 npm run build:production
 ```

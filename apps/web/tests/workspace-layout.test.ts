@@ -133,117 +133,44 @@ test("workspace preferences persist, reset, and fail safely when storage is bloc
   assert.equal(resetWorkspaceLayout(blocked), false);
 });
 
-test("workspace interaction contract keeps mobile fixed and exposes pointer plus keyboard controls", async () => {
-  const [component, styles, settings, officeStyles, liveSettingsStyles, auditStyles] = await Promise.all([
-    readFile(new URL("../src/components/workspace-layout.tsx", import.meta.url), "utf8"),
+test("dashboard interaction contract exposes pointer, keyboard, drag, and mobile controls", async () => {
+  const [component, styles, kanban] = await Promise.all([
+    readFile(new URL("../src/components/dashboard-view.tsx", import.meta.url), "utf8"),
     readFile(new URL("../src/styles.css", import.meta.url), "utf8"),
-    readFile(new URL("../src/components/appearance-settings.tsx", import.meta.url), "utf8"),
-    readFile(new URL("../src/components/office-scene.css", import.meta.url), "utf8"),
-    readFile(new URL("../src/components/live-settings.css", import.meta.url), "utf8"),
-    readFile(new URL("../src/components/access-audit.css", import.meta.url), "utf8"),
+    readFile(new URL("../src/components/kanban-board.tsx", import.meta.url), "utf8"),
   ]);
-  assert.match(component, /role="separator"/);
-  assert.match(component, /const chatFirst = workspaceChatPrecedesSurface\(placement, mobile, hasChats\)/);
-  assert.match(component, /const desktopDivider = hasChats && !mobile \? \(/);
-  assert.match(component, /key="surface-pane"/);
-  assert.match(component, /key="chat-pane"/);
-  assert.match(component, /<Fragment key="desktop-divider">/);
-  assert.match(component, /\{chatFirst && chatPane\}\s*\{!chatFirst && surfacePane\}\s*\{desktopDivider\}\s*\{chatFirst && surfacePane\}\s*\{!chatFirst && chatPane\}/);
-  const separatorStart = component.indexOf('class="workspace-separator"');
-  const separatorEnd = component.indexOf("/>", separatorStart);
-  const dockControlsStart = component.indexOf('class="workspace-dock-controls"');
-  assert.ok(separatorStart >= 0 && separatorEnd > separatorStart, "separator is a standalone element");
-  assert.ok(dockControlsStart > separatorEnd, "dock controls are siblings after the separator");
-  assert.doesNotMatch(component.slice(separatorStart, separatorEnd), /<button/, "separator has no interactive descendants");
-  assert.match(component, /class="workspace-dock-controls" role="group"/);
-  assert.match(component, /aria-orientation=/);
-  assert.match(component, /aria-keyshortcuts=\{workspaceSeparatorKeyShortcuts\(placement\)\}/);
-  assert.match(component, /aria-valuemin=/);
-  assert.match(component, /onPointerMove=/);
+  assert.match(component, /role: "separator" as const/);
+  assert.match(component, /tabIndex: 0/);
+  assert.match(component, /"aria-valuemin": Math\.round\(MIN_FRACTION \* 100\)/);
+  assert.match(component, /"aria-valuemax": Math\.round\(\(1 - MIN_FRACTION\) \* 100\)/);
+  assert.match(component, /"aria-valuenow": valueNow/);
+  assert.match(component, /onPointerDown: beginResize\(axis, row, index\)/);
+  assert.match(component, /onPointerMove: moveResize/);
+  assert.match(component, /onKeyDown: resizeWithKeyboard\(axis, row, index\)/);
   assert.match(component, /event\.key === "Home"/);
   assert.match(component, /event\.key === "End"/);
-  assert.match(component, /event\.key === "Home"\) next = effectiveBounds\.min/);
-  assert.match(component, /event\.key === "End"\) next = effectiveBounds\.max/);
-  assert.match(component, /aria-valuemin=\{Math\.round\(effectiveBounds\.min \* 100\)\}/);
-  assert.match(component, /aria-valuemax=\{Math\.round\(effectiveBounds\.max \* 100\)\}/);
-  assert.match(component, /setEffectiveBounds\(workspaceRatioBounds\(placement, rect\.width, rect\.height\)\)/);
-  assert.match(component, /event\.altKey.*event\.ctrlKey/);
-  assert.match(component, /locale\.value === "ja"/);
-  assert.match(component, /Chat placed on the/);
-  assert.match(component, /チャットを\$\{position\}へ配置しました/);
-  assert.match(component, /aria-live="polite"/);
-  assert.match(component, /workspace-drop-zones/);
-  assert.match(component, /source === "chat" \? edge : oppositePlacement\(edge\)/);
-  assert.match(component, /dropZone: \(source: DragSource, edge: string\).*オフィス.*チャット/);
-  assert.match(component, /copy\.dropZone\(drag\.source, labelForPlacement\(edge, isJapanese\)\)/);
-  assert.equal(component.match(/hasPointerCapture\(event\.pointerId\)/g)?.length, 2, "capture ownership is checked by resize and the shared release helper");
-  assert.equal(component.match(/releasePointerCapture\(event\.pointerId\)/g)?.length, 1, "pointer release is centralized");
-  assert.match(component, /const resizeGestureRef = useRef<ResizeGesture \| null>\(null\)/);
-  assert.match(component, /const effectiveRatioRef = useRef/);
-  assert.match(component, /const finishResize = \(event\?: PointerEvent\) =>/);
-  assert.match(component, /resizeGestureRef\.current = null;\s*resizingRef\.current = false;\s*if \(event\) releaseOwnedPointer\(event\)/);
-  assert.match(component, /const cancelDockDrag = \(event\?: PointerEvent\) =>/);
-  assert.match(component, /const dragRef = useRef<DockDrag \| null>\(null\)/);
-  assert.match(component, /dragRef\.current = next;\s*setDrag\(next\);\s*event\.currentTarget\.setPointerCapture\(event\.pointerId\)/);
-  assert.match(component, /event\.button !== 0 \|\| dragRef\.current \|\| resizeGestureRef\.current\) return/, "dock cannot start during either active layout pointer gesture");
-  assert.match(component, /workspacePointerIsOwner\(current\.pointerId, event\.pointerId\)/);
-  assert.match(component, /onPointerDown=\{beginResize\}/);
-  assert.match(component, /startCoordinate: resizeAxisCoordinate\(placement, event\.clientX, event\.clientY\)/);
-  assert.match(component, /startRatio: effectiveRatioRef\.current/);
-  assert.match(component, /pointerId: event\.pointerId/);
-  assert.match(component, /axisSize: placement === "left" \|\| placement === "right" \? rect\.width : rect\.height/);
-  assert.match(component, /!host\.current \|\| resizeGestureRef\.current \|\| dragRef\.current\) return/, "resize cannot start twice or during a dock drag");
-  assert.match(component, /event\.pointerId !== gesture\.pointerId/);
-  assert.match(component, /if \(gesture\.placement !== placement\) \{\s*finishResize\(event\);\s*return;/, "a resize started on an obsolete placement is safely ended before applying another delta");
-  const resizeKeyboardStart = component.indexOf("const resizeWithKeyboard");
-  const resizeKeyboardEnd = component.indexOf("const dockWithKeyboard", resizeKeyboardStart);
-  assert.match(component.slice(resizeKeyboardStart, resizeKeyboardEnd), /dragRef\.current \|\| resizeGestureRef\.current/, "keyboard resize is ignored during any pointer layout gesture");
-  const dockKeyboardStart = component.indexOf("const dockWithKeyboard");
-  const dockKeyboardEnd = component.indexOf("useEffect", dockKeyboardStart);
-  assert.match(component.slice(dockKeyboardStart, dockKeyboardEnd), /dragRef\.current \|\| resizeGestureRef\.current/, "keyboard docking is ignored during any pointer layout gesture");
-  assert.match(component, /workspaceResizeRatioFromDelta\(/);
-  assert.match(component, /onLostPointerCapture=\{\(event\) => finishResize\(event\)\}/);
-  assert.match(component, /onPointerUp=\{finishResize\}/);
-  assert.match(component, /onPointerCancel=\{finishResize\}/);
-  assert.equal(component.match(/onLostPointerCapture=\{\(event\) => cancelDockDrag\(event\)\}/g)?.length, 2);
-  assert.match(component, /if \(hasChats && !mobile\) return;\s*finishResize\(\);\s*cancelDockDrag\(\);/);
-  assert.match(component, /useEffect\(\(\) => \(\) => \{\s*const shouldPersist = resizingRef\.current \|\| resizeGestureRef\.current !== null;\s*resizeGestureRef\.current = null;[\s\S]*?persistWorkspaceLayout\(\);/);
-  assert.match(component, /\{drag && hasChats && !mobile && \(/);
-  const cancelStart = component.indexOf("const cancelDockDrag");
-  const cancelEnd = component.indexOf("const beginDockDrag", cancelStart);
-  assert.doesNotMatch(component.slice(cancelStart, cancelEnd), /commitDock/, "lost or cancelled dock capture never commits placement");
-  assert.match(component.slice(cancelStart, cancelEnd), /dragRef\.current = null;\s*setDrag\(null\);\s*if \(event\) releaseOwnedPointer\(event\)/);
-  const finishDockStart = component.indexOf("const finishDockDrag");
-  const finishDockEnd = component.indexOf("const beginResize", finishDockStart);
-  assert.match(component.slice(finishDockStart, finishDockEnd), /dragRef\.current = null;\s*setDrag\(null\);\s*releaseOwnedPointer\(event\);\s*commitDock\(current\.candidate\)/);
-  assert.match(component, /resizeGestureRef\.current = null;\s*dragRef\.current = null;\s*resizingRef\.current = false;/);
-  assert.match(component, /const ratioRef = useRef/);
-  assert.match(component, /new ResizeObserver\(update\)[\s\S]*?\}, \[placement\]\);/);
-  assert.doesNotMatch(component, /new ResizeObserver\(update\)[\s\S]*?\}, \[placement, workspaceRatio\.value\]\);/);
-  assert.match(styles, /\.workspace-dock-controls \{[^}]*grid-area: separator[^}]*pointer-events: none/);
-  assert.match(styles, /\.workspace-dock-controls > button \{ pointer-events: auto; \}/);
-  assert.match(styles, /"separator" 30px/);
-  assert.match(styles, /\.workspace-dock-handle \{[^}]*width: 28px[^}]*height: 28px/);
-  assert.match(styles, /\.workspace-layout-surface \{[^}]*container-type: inline-size[^}]*container-name: workspace-surface/);
-  assert.match(styles, /@container workspace-surface \(max-width: 620px\)[\s\S]*\.control-grid \{ grid-template-columns: minmax\(0, 1fr\)/);
-  assert.match(officeStyles, /@container workspace-surface \(max-width: 520px\)[\s\S]*\.office-heading \{[^}]*flex-wrap: wrap/);
-  assert.match(officeStyles, /@container workspace-surface \(max-width: 400px\)[\s\S]*\.office-toolbar \{[^}]*grid-template-columns/);
-  assert.match(officeStyles, /@media \(max-width: 767px\)[\s\S]*\.office-wrap\[data-view="scene"\] \.office-list \{ display: grid; \}/);
-  assert.match(liveSettingsStyles, /@container workspace-surface \(max-width: 620px\)[\s\S]*\.live-settings__grid \{ grid-template-columns: minmax\(0, 1fr\)/);
-  assert.match(liveSettingsStyles, /@container workspace-surface \(max-width: 440px\)[\s\S]*\.provider-fields \{ grid-template-columns: minmax\(0, 1fr\)/);
-  assert.match(auditStyles, /@container workspace-surface \(max-width: 620px\)[\s\S]*\.access-audit__rail li \{ grid-template-columns/);
-  assert.match(styles, /@media \(max-width: 767px\)[\s\S]*\.workspace-layout-host\[data-workspace-placement\][^{]*\{ display: block/);
-  assert.match(styles, /\.workspace-drawer \{ position: fixed; inset: calc\(52px/);
-  const emptyDrawerRule = styles.match(/\.workspace-layout-host\.is-empty \.workspace-drawer \{([^}]*)\}/)?.[1] ?? "";
-  assert.match(emptyDrawerRule, /border-top: 1px solid var\(--line\)/);
-  assert.match(emptyDrawerRule, /border-right: 0/);
-  assert.match(emptyDrawerRule, /border-left: 0/);
-  const emptyDrawerRuleIndex = styles.indexOf(".workspace-layout-host.is-empty .workspace-drawer");
-  for (const placement of ["top", "right", "bottom", "left"] as const) {
-    assert.match(styles, new RegExp(`data-workspace-placement="${placement}"`), `${placement} placement remains supported`);
-    const placementDrawerIndex = styles.lastIndexOf(`[data-workspace-placement="${placement}"] .workspace-drawer`, emptyDrawerRuleIndex);
-    if (placementDrawerIndex >= 0) assert.ok(emptyDrawerRuleIndex > placementDrawerIndex, `${placement} empty drawer normalization follows placement borders`);
-  }
-  assert.match(settings, /aria-live="polite"/);
-  assert.match(settings, /resetWorkspaceLayout\(\)/);
+  assert.match(component, /event\.key === \(axis === "row" \? "ArrowUp" : "ArrowLeft"\)/);
+  assert.match(component, /event\.key === \(axis === "row" \? "ArrowDown" : "ArrowRight"\)/);
+  assert.match(component, /setPointerCapture\(event\.pointerId\)/);
+  assert.match(component, /hasPointerCapture\(event\.pointerId\)/);
+  assert.match(component, /releasePointerCapture\(event\.pointerId\)/);
+  assert.match(component, /setActiveDashboardSizes\(next\)/);
+  assert.match(component, /resetActiveDashboardSizes\(\)/);
+  assert.match(component, /draggable/);
+  assert.match(component, /movePanel\(panelId, index\)/);
+  assert.match(component, /addDashboardPanel\("chat", \{ sessionId, index: target\.index \}\)/);
+  assert.match(component, /replaceDashboardPanel\(target\.panelId, kind\)/);
+  assert.match(component, /replaceDashboardPanel\(target\.panelId, "chat", \{ sessionId \}\)/);
+  assert.match(component, /showDropReplace/);
+  assert.match(component, /SIDEBAR_DRAG_THRESHOLD_PX/);
+  assert.match(component, /activateSidebarPanelPointerDrag\(event\.pointerId\)/);
+  assert.match(component, /paneDropTargetAt\(/);
+  assert.match(styles, /\.dashboard-replace-drop \{/);
+  assert.match(component, /dashboard\.dropInsertBetween/);
+  assert.match(component, /dashboard\.dropReplaceHint/);
+  assert.match(kanban, /if \(!taskId\) return;\s*event\.preventDefault\(\);\s*event\.stopPropagation\(\);/);
+  assert.match(component, /minmax\(\$\{MIN_ROW_PX\}px, \$\{round\(fr\)\}fr\)/);
+  assert.match(styles, /\.dashboard-view \{[^}]*overflow: hidden auto/);
+  assert.match(styles, /\.dashboard-resize \{[^}]*touch-action: none/);
+  assert.match(styles, /@media \(max-width: 768px\)[\s\S]*\.dashboard-resize \{ display: none; \}/);
 });

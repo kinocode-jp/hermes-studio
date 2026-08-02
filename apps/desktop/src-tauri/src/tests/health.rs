@@ -1,0 +1,60 @@
+use crate::health::{classify_health_body, health_body_is_compatible, HealthCompatibility};
+
+#[test]
+fn health_body_compatibility_requires_the_office_health_contract() {
+    assert!(health_body_is_compatible(
+        r#"{"ok":true,"protocolVersion":1,"runtime":"ready"}"#
+    ));
+    assert!(health_body_is_compatible(
+        r#"{"ok":true,"protocolVersion":1,"runtime":"unconfigured","details":{}}"#
+    ));
+    assert!(!health_body_is_compatible(
+        r#"{"ok":true,"protocolVersion":2,"runtime":"ready"}"#
+    ));
+    assert!(!health_body_is_compatible(r#"{"protocolVersion":1}"#));
+    assert!(!health_body_is_compatible("not-json"));
+}
+
+#[test]
+fn health_body_classifies_malformed_contract_and_nonnumeric_version() {
+    assert_eq!(
+        classify_health_body("not-json"),
+        HealthCompatibility::Malformed
+    );
+    assert_eq!(
+        classify_health_body(r#"{"protocolVersion":1}"#),
+        HealthCompatibility::Malformed
+    );
+    assert_eq!(
+        classify_health_body(r#"{"ok":false,"protocolVersion":1,"runtime":"ready"}"#),
+        HealthCompatibility::Malformed
+    );
+    assert_eq!(
+        classify_health_body(r#"{"ok":true,"protocolVersion":1}"#),
+        HealthCompatibility::Malformed
+    );
+    assert_eq!(
+        classify_health_body(r#"{"ok":true,"protocolVersion":1,"runtime":"other"}"#),
+        HealthCompatibility::Malformed
+    );
+    assert_eq!(
+        classify_health_body(r#"{"ok":true,"protocolVersion":"1","runtime":"ready"}"#),
+        HealthCompatibility::Malformed
+    );
+    assert_eq!(
+        classify_health_body(r#"{"ok":true,"protocolVersion":null,"runtime":"ready"}"#),
+        HealthCompatibility::Malformed
+    );
+    assert_eq!(
+        classify_health_body(r#"{"ok":true,"protocolVersion":1.1,"runtime":"ready"}"#),
+        HealthCompatibility::Malformed
+    );
+    assert_eq!(
+        classify_health_body(r#"{"ok":true,"protocolVersion":1,"runtime":"ready"}"#),
+        HealthCompatibility::Compatible
+    );
+    assert_eq!(
+        classify_health_body(r#"{"ok":true,"protocolVersion":2,"runtime":"ready"}"#),
+        HealthCompatibility::Incompatible
+    );
+}

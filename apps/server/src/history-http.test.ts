@@ -38,6 +38,23 @@ test("history query rejects unbounded limits, forged cursors, and cross-session 
   await assert.rejects(fetchOfficeHistoryPage(chat, new URL(`http://office.local/messages?limit=1&cursor=${cursor}`), "other-session", 1024 * 1024), HistoryHttpInputError);
 });
 
+test("history pages reject an upstream session identity change after cursor resolution", async () => {
+  const chat: HermesChatTransport = {
+    connect: async () => { throw new Error("unused"); },
+    inspectHistory: async () => ({ sessionId: "resolved-a", total: 1 }),
+    fetchHistory: async (request) => ({
+      sessionId: "resolved-b",
+      profile: request.profile,
+      messages: [shortMessage(0)],
+      pagination: { limit: 1, offset: 0, returned: 1, normalizedReturned: 1, dropped: 0 },
+    }),
+  };
+  await assert.rejects(
+    fetchOfficeHistoryPage(chat, new URL("http://office.local/messages?profile=default&limit=1"), "stored-a", 1024 * 1024),
+    /history changed/,
+  );
+});
+
 test("history cursors reject non-canonical outer, session, and signature encodings", async () => {
   const chat = historyFixture([shortMessage(0), shortMessage(1)]);
   const cursor = await continuationCursor(chat);

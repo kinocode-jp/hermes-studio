@@ -4,9 +4,41 @@ import { dirname } from "node:path";
 import {
   GLOBAL_SETTINGS_MAX_SKILLS,
   isGlobalContextWithinBudget,
-} from "@hermes-office/protocol";
+  SECRET_ENV_KEY_PATTERN,
+} from "@hermes-studio/protocol";
+import {
+  BuiltinMemoryFilesError,
+  BuiltinMemoryFilesStore,
+  type BuiltinMemoryFileDto,
+  type BuiltinMemoryFileKey,
+  type BuiltinMemoryFilesDto,
+  type BuiltinMemoryFilesStoreOptions,
+} from "./builtin-memory-files.js";
+import {
+  buildHermesConfigPutBody,
+  HermesConfigError,
+  normalizeHermesConfigSchema,
+  projectSafeHermesConfig,
+  validateConfigPatchChanges,
+  type HermesConfigDto,
+  type HermesConfigPatch,
+  type HermesConfigSchemaDto,
+} from "./hermes-config.js";
+import {
+  buildPrivilegedHermesConfigPutBody,
+  HermesPrivilegedConfigError,
+  projectConfigSecretFieldMeta,
+  projectPrivilegedHermesConfig,
+  validatePrivilegedConfigPatchChanges,
+  type HermesPrivilegedConfigDto,
+  type HermesPrivilegedConfigPatch,
+} from "./hermes-privileged-config.js";
 import { KeyedOperationQueue } from "./keyed-operation-queue.js";
 import { containsLikelySecret, isLikelySecretIdentifier, redactSecrets } from "./secret-scrubber.js";
+
+export type { BuiltinMemoryFileDto, BuiltinMemoryFileKey, BuiltinMemoryFilesDto };
+export type { HermesConfigDto, HermesConfigPatch, HermesConfigSchemaDto };
+export type { HermesPrivilegedConfigDto, HermesPrivilegedConfigPatch };
 
 const DEFAULT_TIMEOUT_MS = 10_000;
 const DEFAULT_MAX_RESPONSE_BYTES = 2 * 1024 * 1024;
@@ -22,16 +54,27 @@ export interface HermesProfileBackendAccess {
   release(): void;
 }
 
+export interface HermesProfileBackendResolveOptions {
+  /** Absolute wall-clock deadline shared by the whole public operation. */
+  deadlineMs?: number;
+  signal?: AbortSignal;
+}
+
 export interface HermesSettingsAdapterOptions {
   /**
    * Must resolve a process whose HERMES_HOME is the requested profile.
    * Hermes memory routes are process-scoped and cannot safely use ?profile=.
    * The adapter holds the returned lease until the whole public operation settles.
    */
-  resolveProfileBackend(profile: string): Promise<HermesProfileBackendAccess>;
+  resolveProfileBackend(profile: string, options?: HermesProfileBackendResolveOptions): Promise<HermesProfileBackendAccess>;
   timeoutMs?: number;
   maxResponseBytes?: number;
   maxSkillContentBytes?: number;
+  /**
+   * Optional filesystem store for raw MEMORY.md / USER.md editing.
+   * Defaults to the platform Hermes root (including HERMES_HOME resolution).
+   */
+  builtinMemoryFiles?: BuiltinMemoryFilesStore | BuiltinMemoryFilesStoreOptions;
 }
 
 export interface SkillSettingsDto {
@@ -105,21 +148,89 @@ export interface ProfileAgentSettingsDto {
 
 export interface HermesSettingsAdapter {
   getProfileSettings(profile: string): Promise<ProfileAgentSettingsDto>;
-  listSkills(profile: string): Promise<SkillSettingsDto[]>;
-  setSkillEnabled(profile: string, name: string, enabled: boolean, expectedEnabled?: boolean): Promise<void>;
+  listSkills(profile: string, options?: Pick<HermesProfileBackendResolveOptions, "deadlineMs">): Promise<SkillSettingsDto[]>;
+  setSkillEnabled(
+    profile: string,
+    name: string,
+    enabled: boolean,
+    expectedEnabled?: boolean,
+    options?: Pick<HermesProfileBackendResolveOptions, "deadlineMs">,
+  ): Promise<void>;
   getSkillContent(profile: string, name: string): Promise<SkillContentDto>;
-  updateSkillContent(profile: string, name: string, content: string, expectedRevision?: string): Promise<void>;
+  updateSkillContent(profile: string, name: string, content: string, expectedRevision?: string): Promise<SkillContentDto>;
   getMemoryStatus(profile: string): Promise<MemoryStatusDto>;
-  setMemoryProvider(profile: string, provider: string, expectedProvider?: string): Promise<void>;
+  setMemoryProvider(profile: string, provider: string, expectedProvider?: string): Promise<MemoryStatusDto>;
   getMemoryProviderConfig(profile: string, provider: string): Promise<MemoryProviderConfigDto>;
-  updateMemoryProviderConfig(profile: string, provider: string, values: Record<string, boolean | string>, expectedRevision?: string): Promise<void>;
-  resetBuiltinMemory(profile: string, target: "all" | "memory" | "user"): Promise<void>;
+  updateMemoryProviderConfig(profile: string, provider: string, values: Record<string, boolean | string>, expectedRevision?: string): Promise<MemoryProviderConfigDto>;
+  /** Office-owned raw built-in memory documents (not a Hermes dashboard API). */
+  getBuiltinMemoryFiles(profile: string): Promise<BuiltinMemoryFilesDto>;
+  updateBuiltinMemoryFile(
+    profile: string,
+    key: BuiltinMemoryFileKey,
+    content: string,
+    expectedRevision: string,
+  ): Promise<BuiltinMemoryFileDto>;
+  resetBuiltinMemory(profile: string, target: "all" | "memory" | "user"): Promise<{ files: BuiltinMemoryFilesDto; status: MemoryStatusDto }>;
   getProfileSoul(profile: string): Promise<ProfileSoulDto>;
-  updateProfileSoul(profile: string, content: string, expectedRevision?: string): Promise<void>;
+  updateProfileSoul(profile: string, content: string, expectedRevision?: string): Promise<ProfileSoulDto>;
+  /** Schema-driven safe Hermes config leaves (official dashboard /api/config*). */
+  getProfileConfigSchema(profile: string): Promise<HermesConfigSchemaDto>;
+  getProfileConfig(profile: string): Promise<HermesConfigDto>;
+  updateProfileConfig(profile: string, patch: HermesConfigPatch): Promise<HermesConfigDto>;
+  /** Privileged non-secret leaves (owner + desktop-capability only). */
+  getPrivilegedProfileConfig(profile: string): Promise<HermesPrivilegedConfigDto>;
+  updatePrivilegedProfileConfig(profile: string, patch: HermesPrivilegedConfigPatch): Promise<HermesPrivilegedConfigDto>;
+  /** Secret metadata only (env, config leaves, memory-provider declared secrets). Never returns values. */
+  listProfileSecrets(profile: string): Promise<HermesSecretsDto>;
+  /** Write a secret via official Hermes env/config/provider endpoints after transfer consume. */
+  writeProfileSecret(profile: string, request: HermesSecretWriteRequest): Promise<HermesSecretsDto>;
 }
 
+export type HermesSecretSource = "env" | "config" | "memory-provider";
+
+export interface HermesSecretFieldMetaDto {
+  key: string;
+  source: HermesSecretSource;
+  label: string;
+  description: string;
+  category: string;
+  isSet: boolean;
+  isPassword: boolean;
+  /**
+   * Whether Clear is provably safe from live metadata alone.
+   * For memory-provider: true only when isSet and a unique env key has
+   * explicit provider === this field's provider. Never exposes env key names.
+   * Server recomputes on clear regardless of this hint.
+   */
+  canClear: boolean;
+  /** Present only for memory-provider secrets; validated Hermes provider id. */
+  provider?: string;
+  /** Provider display label when source is memory-provider. */
+  providerLabel?: string;
+}
+
+export interface HermesSecretsDto {
+  profile: string;
+  revision: string;
+  fields: HermesSecretFieldMetaDto[];
+}
+
+export interface HermesSecretWriteRequest {
+  key: string;
+  source: HermesSecretSource;
+  value: string;
+  /** Required when source is memory-provider. */
+  provider?: string;
+  expectedRevision?: string;
+}
+
+/** Bound discovery of declared memory-provider secret surfaces. */
+const MEMORY_PROVIDER_SECRET_MAX_PROVIDERS = 20;
+const MEMORY_PROVIDER_SECRET_MAX_FIELDS_PER = 32;
+const SECRETS_MAX_FIELDS = 400;
+
 export class HermesSettingsError extends Error {
-  readonly code: "conflict" | "invalid_request" | "not_found" | "rejected" | "response_too_large" | "timed_out";
+  readonly code: "commit_unconfirmed" | "conflict" | "invalid_request" | "not_found" | "rejected" | "response_too_large" | "timed_out";
   constructor(code: HermesSettingsError["code"], message: string) {
     super(message);
     this.name = "HermesSettingsError";
@@ -127,20 +238,87 @@ export class HermesSettingsError extends Error {
   }
 }
 
+function asSettingsError(error: unknown): never {
+  if (error instanceof HermesSettingsError) throw error;
+  if (error instanceof HermesConfigError) {
+    throw new HermesSettingsError(error.code, error.message);
+  }
+  if (error instanceof HermesPrivilegedConfigError) {
+    throw new HermesSettingsError(error.code, error.message);
+  }
+  throw error;
+}
+
 export function createHermesSettingsAdapter(options: HermesSettingsAdapterOptions): HermesSettingsAdapter {
   const timeoutMs = bounded(options.timeoutMs, DEFAULT_TIMEOUT_MS, 250, 60_000);
   const maxResponseBytes = bounded(options.maxResponseBytes, DEFAULT_MAX_RESPONSE_BYTES, 4_096, 8 * 1024 * 1024);
   const maxSkillContentBytes = bounded(options.maxSkillContentBytes, 256 * 1024, 1_024, 512 * 1024);
   const mutationQueue = new KeyedOperationQueue();
+  const builtinMemoryFiles = options.builtinMemoryFiles instanceof BuiltinMemoryFilesStore
+    ? options.builtinMemoryFiles
+    : new BuiltinMemoryFilesStore(options.builtinMemoryFiles ?? {});
 
-  const withClient = async <T>(profile: string, operation: (client: ProfileClient) => Promise<T>): Promise<T> => {
+  const deadline = (): number => Date.now() + timeoutMs;
+  const withClient = async <T>(
+    profile: string,
+    operation: (client: ProfileClient) => Promise<T>,
+    deadlineMs = deadline(),
+  ): Promise<T> => {
     const validProfile = requiredProfile(profile);
-    const lease = await options.resolveProfileBackend(validProfile);
+    const lease = await resolveProfileBackendBeforeDeadline(validProfile, options.resolveProfileBackend, deadlineMs);
+    const client = new ProfileClient(validProfile, normalizeBackend(lease), deadlineMs, maxResponseBytes);
     try {
-      const client = new ProfileClient(validProfile, normalizeBackend(lease), timeoutMs, maxResponseBytes);
       return await operation(client);
+    } catch (error) {
+      if (client.mutationCommitted && !(error instanceof HermesSettingsError && error.code === "commit_unconfirmed")) {
+        throw commitUnconfirmed();
+      }
+      throw error;
     } finally {
       lease.release();
+    }
+  };
+
+  const runMutation = async <T>(
+    key: string,
+    operation: (deadlineMs: number) => Promise<T>,
+    requestedDeadlineMs?: number,
+  ): Promise<T> => {
+    const deadlineMs = operationDeadline(deadline(), requestedDeadlineMs);
+    let markStarted!: () => void;
+    const started = new Promise<void>((resolve) => { markStarted = resolve; });
+    const queued = mutationQueue.run(key, async () => {
+      assertBeforeDeadline(deadlineMs);
+      markStarted();
+      return await operation(deadlineMs);
+    });
+    // Bound queue capacity waits without cancelling the queued tail. Once the
+    // operation starts, its profile client owns the same absolute deadline.
+    await settleBeforeDeadline(Promise.race([started, queued.then(() => undefined)]), deadlineMs, timedOut);
+    return await queued;
+  };
+
+  const runBuiltinMemoryMutation = async <T>(key: string, operation: () => Promise<T>): Promise<T> => {
+    const deadlineMs = deadline();
+    let started = false;
+    const queued = mutationQueue.run(key, async () => {
+      assertBeforeDeadline(deadlineMs);
+      started = true;
+      return await operation();
+    });
+    // Filesystem writes cannot be cancelled safely. Return on deadline while
+    // leaving the real write as the queue tail; a retry therefore cannot race it.
+    return await settleBeforeDeadline(queued, deadlineMs, () => started ? commitUnconfirmed() : timedOut());
+  };
+
+  const withBuiltinMemory = async <T>(operation: () => Promise<T>): Promise<T> => {
+    try {
+      return await operation();
+    } catch (error) {
+      if (error instanceof BuiltinMemoryFilesError) {
+        throw new HermesSettingsError(error.code, error.message);
+      }
+      throw error;
     }
   };
 
@@ -153,18 +331,22 @@ export function createHermesSettingsAdapter(options: HermesSettingsAdapterOption
       ]);
       return { profile: client.profile, skills, memory, soul };
     }),
-    listSkills: async (profile) => await withClient(profile, listSkillsWith),
-    setSkillEnabled: async (profile, name, enabled, expectedEnabled) => {
+    listSkills: async (profile, operationOptions) => await withClient(
+      profile,
+      listSkillsWith,
+      operationDeadline(deadline(), operationOptions?.deadlineMs),
+    ),
+    setSkillEnabled: async (profile, name, enabled, expectedEnabled, operationOptions) => {
       const validProfile = requiredProfile(profile);
       const skill = requiredName(name, "skill");
-      await mutationQueue.run(resourceKey(validProfile, "skill-toggle", skill), async () => await withClient(validProfile, async (client) => {
+      await runMutation(resourceKey(validProfile, "skill-toggle", skill), async (deadlineMs) => await withClient(validProfile, async (client) => {
         if (expectedEnabled !== undefined) {
           const current = (await listSkillsWith(client)).find((item) => item.name === skill);
           if (current === undefined) throw new HermesSettingsError("not_found", "Hermes skill was not found.");
           if (current.enabled !== expectedEnabled) throw conflict();
         }
         await client.request("/api/skills/toggle", "PUT", { name: skill, enabled });
-      }));
+      }, deadlineMs), operationOptions?.deadlineMs);
     },
     getSkillContent: async (profile, name) => await withClient(profile, async (client) =>
       await skillContentWith(client, requiredName(name, "skill"), maxSkillContentBytes)),
@@ -173,30 +355,32 @@ export function createHermesSettingsAdapter(options: HermesSettingsAdapterOption
       if (containsLikelySecret(content)) throw invalid("Skill content appears to contain a secret. Store credentials through the dedicated secret channel.");
       const validProfile = requiredProfile(profile);
       const skill = requiredName(name, "skill");
-      await mutationQueue.run(resourceKey(validProfile, "skill-content", skill), async () => await withClient(validProfile, async (client) => {
+      return await runMutation(resourceKey(validProfile, "skill-content", skill), async (deadlineMs) => await withClient(validProfile, async (client) => {
         if (expectedRevision !== undefined) {
           const current = await skillContentWith(client, skill, maxSkillContentBytes);
           if (current.redacted || current.revision !== requiredRevision(expectedRevision)) throw conflict();
         }
         await client.request("/api/skills/content", "PUT", { name: skill, content });
-      }));
+        return await skillContentWith(client, skill, maxSkillContentBytes);
+      }, deadlineMs));
     },
     getMemoryStatus: async (profile) => await withClient(profile, memoryStatusWith),
     setMemoryProvider: async (profile, provider, expectedProvider) => {
       const validProfile = requiredProfile(profile);
       const selected = requiredProvider(provider, true);
       const expected = expectedProvider === undefined ? undefined : requiredProvider(expectedProvider, true);
-      await mutationQueue.run(resourceKey(validProfile, "memory-provider"), async () => await withClient(validProfile, async (client) => {
+      return await runMutation(resourceKey(validProfile, "memory-provider"), async (deadlineMs) => await withClient(validProfile, async (client) => {
         if (expected !== undefined && (await memoryStatusWith(client)).activeProvider !== expected) throw conflict();
         await client.request("/api/memory/provider", "PUT", { provider: selected });
-      }));
+        return await memoryStatusWith(client);
+      }, deadlineMs));
     },
     getMemoryProviderConfig: async (profile, provider) => await withClient(profile, async (client) =>
       await providerConfigWith(client, requiredProvider(provider, false))),
     updateMemoryProviderConfig: async (profile, provider, values, expectedRevision) => {
       const validProfile = requiredProfile(profile);
       const validProvider = requiredProvider(provider, false);
-      await mutationQueue.run(resourceKey(validProfile, "memory-config", validProvider), async () => await withClient(validProfile, async (client) => {
+      return await runMutation(resourceKey(validProfile, "memory-config", validProvider), async (deadlineMs) => await withClient(validProfile, async (client) => {
         const schema = await providerConfigWith(client, validProvider);
         if (expectedRevision !== undefined && schema.revision !== requiredRevision(expectedRevision)) throw conflict();
         const fields = new Map(schema.fields.map((field) => [field.key, field]));
@@ -210,24 +394,184 @@ export function createHermesSettingsAdapter(options: HermesSettingsAdapterOption
           clean[key] = value;
         }
         await client.request(`/api/memory/providers/${encodeURIComponent(validProvider)}/config?surface=declared`, "PUT", { values: clean });
-      }));
+        return await providerConfigWith(client, validProvider);
+      }, deadlineMs));
+    },
+    getBuiltinMemoryFiles: async (profile) => await withBuiltinMemory(async () => await builtinMemoryFiles.readAll(profile)),
+    updateBuiltinMemoryFile: async (profile, key, content, expectedRevision) => {
+      // Deliberately do not reject likely-secret prose: practical MEMORY/USER notes
+      // false-positive under credential heuristics. Content is only returned on the
+      // authorized memory.update surface and never embedded in audit or events.
+      const validProfile = requiredProfile(profile);
+      // Share one queue with reset so filesystem writes and Hermes deletes cannot race.
+      return await runBuiltinMemoryMutation(resourceKey(validProfile, "builtin-memory"), async () =>
+        await withBuiltinMemory(async () => await builtinMemoryFiles.write(validProfile, key, content, expectedRevision)));
     },
     resetBuiltinMemory: async (profile, target) => {
       if (target !== "all" && target !== "memory" && target !== "user") throw invalid("Memory reset target is invalid.");
-      await withClient(profile, async (client) => await client.request("/api/memory/reset", "POST", { target }));
+      const validProfile = requiredProfile(profile);
+      return await runMutation(resourceKey(validProfile, "builtin-memory"), async (deadlineMs) =>
+        await withClient(validProfile, async (client) => {
+          await client.request("/api/memory/reset", "POST", { target });
+          const [files, status] = await Promise.all([
+            settleBeforeDeadline(
+              withBuiltinMemory(async () => await builtinMemoryFiles.readAll(validProfile)),
+              deadlineMs,
+              commitUnconfirmed,
+            ),
+            memoryStatusWith(client),
+          ]);
+          return { files, status };
+        }, deadlineMs));
     },
     getProfileSoul: async (profile) => await withClient(profile, soulWith),
     updateProfileSoul: async (profile, content, expectedRevision) => {
       if (Buffer.byteLength(content) > 256 * 1024 || content.includes("\0")) throw invalid("Profile identity is invalid or too large.");
       if (containsLikelySecret(content)) throw invalid("Profile identity appears to contain a secret.");
       const validProfile = requiredProfile(profile);
-      await mutationQueue.run(resourceKey(validProfile, "soul"), async () => await withClient(validProfile, async (client) => {
+      return await runMutation(resourceKey(validProfile, "soul"), async (deadlineMs) => await withClient(validProfile, async (client) => {
         if (expectedRevision !== undefined) {
           const current = await soulWith(client);
           if (current.redacted || current.revision !== requiredRevision(expectedRevision)) throw conflict();
         }
         await client.request(`/api/profiles/${encodeURIComponent(client.profile)}/soul`, "PUT", { content });
-      }));
+        return await soulWith(client);
+      }, deadlineMs));
+    },
+    getProfileConfigSchema: async (profile) => {
+      try {
+        return await withClient(profile, async (client) => {
+          const schema = await profileConfigSchemaWith(client);
+          return { profile: client.profile, ...schema };
+        });
+      } catch (error) {
+        return asSettingsError(error);
+      }
+    },
+    getProfileConfig: async (profile) => {
+      try {
+        return await withClient(profile, profileConfigWith);
+      } catch (error) {
+        return asSettingsError(error);
+      }
+    },
+    updateProfileConfig: async (profile, patch) => {
+      const validProfile = requiredProfile(profile);
+      const expectedRevision = requiredRevision(patch.expectedRevision);
+      try {
+        return await runMutation(resourceKey(validProfile, "config"), async (deadlineMs) => await withClient(validProfile, async (client) => {
+          // Re-read under the profile config queue so concurrent Office writers
+          // serialize. Hermes PUT is not conditional; expectedRevision is an
+          // in-process Office concurrency token over the safe-leaf projection.
+          const current = await profileConfigWith(client);
+          if (current.revision !== expectedRevision) throw conflict();
+          const changes = validateConfigPatchChanges(patch.changes, current.fields);
+          const putBody = buildHermesConfigPutBody(changes);
+          await client.request("/api/config", "PUT", { config: putBody });
+          return await profileConfigWith(client);
+        }, deadlineMs));
+      } catch (error) {
+        return asSettingsError(error);
+      }
+    },
+    getPrivilegedProfileConfig: async (profile) => {
+      try {
+        return await withClient(profile, privilegedProfileConfigWith);
+      } catch (error) {
+        return asSettingsError(error);
+      }
+    },
+    updatePrivilegedProfileConfig: async (profile, patch) => {
+      const validProfile = requiredProfile(profile);
+      const expectedRevision = requiredRevision(patch.expectedRevision);
+      try {
+        // Share the profile config queue with safe Advanced so both surfaces
+        // cannot race the same Hermes PUT /api/config deep-merge.
+        return await runMutation(resourceKey(validProfile, "config"), async (deadlineMs) => await withClient(validProfile, async (client) => {
+          const current = await privilegedProfileConfigWith(client);
+          if (current.revision !== expectedRevision) throw conflict();
+          const changes = validatePrivilegedConfigPatchChanges(patch.changes, current.fields);
+          const needsConfirmation = Object.keys(changes).some((key) => {
+            const field = current.fields.find((item) => item.id === key);
+            return field?.requiresConfirmation === true;
+          });
+          if (needsConfirmation && patch.confirmed !== true) {
+            throw invalid("Confirmation is required for destructive or restart-impact privileged fields.");
+          }
+          const putBody = buildPrivilegedHermesConfigPutBody(changes);
+          await client.request("/api/config", "PUT", { config: putBody });
+          return await privilegedProfileConfigWith(client);
+        }, deadlineMs));
+      } catch (error) {
+        return asSettingsError(error);
+      }
+    },
+    listProfileSecrets: async (profile) => {
+      try {
+        return await withClient(profile, profileSecretsWith);
+      } catch (error) {
+        return asSettingsError(error);
+      }
+    },
+    writeProfileSecret: async (profile, request) => {
+      const validProfile = requiredProfile(profile);
+      const source = request.source;
+      if (source !== "env" && source !== "config" && source !== "memory-provider") {
+        throw invalid("Secret source is invalid.");
+      }
+      const key = requiredSecretKey(request.key, source);
+      const provider = source === "memory-provider"
+        ? requiredProvider(request.provider, false)
+        : undefined;
+      if (typeof request.value !== "string" || request.value.includes("\0")) {
+        throw invalid("Secret value is invalid.");
+      }
+      if (Buffer.byteLength(request.value) > 8 * 1024) throw invalid("Secret value is too large.");
+      const clear = request.value === "";
+      const expectedRevision = request.expectedRevision === undefined
+        ? undefined
+        : requiredRevision(request.expectedRevision);
+      try {
+        return await runMutation(resourceKey(validProfile, "secrets"), async (deadlineMs) => await withClient(validProfile, async (client) => {
+          const current = await profileSecretsWith(client);
+          if (expectedRevision !== undefined && current.revision !== expectedRevision) throw conflict();
+          const field = current.fields.find((item) =>
+            item.key === key
+            && item.source === source
+            && (source !== "memory-provider" || item.provider === provider));
+          if (field === undefined) throw invalid("Secret field is not declared by Hermes.");
+          if (clear && !field.isSet) throw invalid("Secret field is not set.");
+          if (source === "env") {
+            if (clear) {
+              // Official clear path — empty transfer maps to DELETE, not a secret value body.
+              await client.request("/api/env", "DELETE", { key });
+            } else {
+              await client.request("/api/env", "PUT", { key, value: request.value });
+            }
+          } else if (source === "config") {
+            const putBody = buildPrivilegedHermesConfigPutBody({ [key]: request.value });
+            await client.request("/api/config", "PUT", { config: putBody });
+          } else {
+            // Re-read declared provider schema; only write a live secret field.
+            const memoryProvider = provider!;
+            const schema = await providerConfigWith(client, memoryProvider);
+            const live = schema.fields.find((item) => item.key === key && item.kind === "secret");
+            if (live === undefined) throw invalid("Secret field is not declared by Hermes.");
+            if (clear) {
+              await clearMemoryProviderSecret(client, memoryProvider, key, schema);
+            } else {
+              await client.request(
+                `/api/memory/providers/${encodeURIComponent(memoryProvider)}/config?surface=declared`,
+                "PUT",
+                { values: { [key]: request.value } },
+              );
+            }
+          }
+          return await profileSecretsWith(client);
+        }, deadlineMs));
+      } catch (error) {
+        return asSettingsError(error);
+      }
     },
   };
   return adapter;
@@ -240,18 +584,25 @@ function resourceKey(profile: string, resource: string, id = ""): string {
 interface NormalizedBackend { baseUrl: URL; sessionToken: string }
 
 class ProfileClient {
+  #mutationCommitted = false;
+
   constructor(
     readonly profile: string,
     private readonly backend: NormalizedBackend,
-    private readonly timeoutMs: number,
+    private readonly deadlineMs: number,
     private readonly maxResponseBytes: number,
   ) {}
 
-  async request(path: string, method: "GET" | "POST" | "PUT", body?: Record<string, unknown>): Promise<unknown> {
+  get mutationCommitted(): boolean { return this.#mutationCommitted; }
+
+  async request(path: string, method: "GET" | "POST" | "PUT" | "DELETE", body?: Record<string, unknown>): Promise<unknown> {
     const target = new URL(path, this.backend.baseUrl);
     if (target.origin !== this.backend.baseUrl.origin || !target.pathname.startsWith("/api/")) throw invalid("Hermes settings path is invalid.");
+    const remainingMs = this.deadlineMs - Date.now();
+    if (remainingMs <= 0) throw timedOut();
+    const mutation = method !== "GET";
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), this.timeoutMs);
+    const timer = setTimeout(() => controller.abort(), remainingMs);
     timer.unref();
     try {
       const response = await fetch(target, {
@@ -269,16 +620,50 @@ class ProfileClient {
         if (response.status === 404) throw new HermesSettingsError("not_found", "Hermes setting was not found.");
         throw new HermesSettingsError("rejected", "Hermes rejected the settings request.");
       }
+      if (mutation) this.#mutationCommitted = true;
       const text = await readBoundedText(response, this.maxResponseBytes);
       if (text === "") return {};
       try { return JSON.parse(text) as unknown; } catch { throw invalidBackend(); }
     } catch (error) {
-      if (error instanceof HermesSettingsError) throw error;
-      if (isAbortError(error)) throw new HermesSettingsError("timed_out", "Hermes settings request timed out.");
+      if (error instanceof HermesSettingsError) {
+        if (mutation && this.#mutationCommitted && error.code !== "commit_unconfirmed") throw commitUnconfirmed();
+        throw error;
+      }
+      if (mutation) throw commitUnconfirmed();
+      if (isAbortError(error)) throw timedOut();
       throw new HermesSettingsError("rejected", "Unable to reach Hermes settings.");
     } finally {
       clearTimeout(timer);
     }
+  }
+}
+
+async function resolveProfileBackendBeforeDeadline(
+  profile: string,
+  resolveProfileBackend: HermesSettingsAdapterOptions["resolveProfileBackend"],
+  deadlineMs: number,
+): Promise<HermesProfileBackendAccess> {
+  const remainingMs = deadlineMs - Date.now();
+  if (remainingMs <= 0) throw timedOut();
+  const timeoutError = timedOut();
+  let expired = false;
+  const acquisition = resolveProfileBackend(profile, { deadlineMs }).then((lease) => {
+    if (!expired) return lease;
+    lease.release();
+    throw timeoutError;
+  });
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(() => {
+      expired = true;
+      reject(timeoutError);
+    }, remainingMs);
+    timer.unref();
+  });
+  try {
+    return await Promise.race([acquisition, timeout]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
   }
 }
 
@@ -344,6 +729,253 @@ async function soulWith(client: ProfileClient): Promise<ProfileSoulDto> {
   if (!isRecord(raw) || typeof raw.content !== "string") throw invalidBackend();
   const safe = redactSecrets(raw.content);
   return { profile: client.profile, content: truncateUtf8(safe.value, 256 * 1024), exists: raw.exists === true, redacted: safe.redacted, revision: revisionOf(raw.content) };
+}
+
+async function profileConfigSchemaWith(client: ProfileClient): Promise<Omit<HermesConfigSchemaDto, "profile">> {
+  const raw = await client.request("/api/config/schema", "GET");
+  return normalizeHermesConfigSchema(raw);
+}
+
+async function profileConfigWith(client: ProfileClient): Promise<HermesConfigDto> {
+  const [schemaRaw, configRaw] = await Promise.all([
+    client.request("/api/config/schema", "GET"),
+    client.request("/api/config", "GET"),
+  ]);
+  // Value-aware projection: deny Hermes null→string mislabels and non-string lists.
+  return { profile: client.profile, ...projectSafeHermesConfig(schemaRaw, configRaw) };
+}
+
+async function privilegedProfileConfigWith(client: ProfileClient): Promise<HermesPrivilegedConfigDto> {
+  const [schemaRaw, configRaw] = await Promise.all([
+    client.request("/api/config/schema", "GET"),
+    client.request("/api/config", "GET"),
+  ]);
+  return { profile: client.profile, ...projectPrivilegedHermesConfig(schemaRaw, configRaw) };
+}
+
+async function profileSecretsWith(client: ProfileClient): Promise<HermesSecretsDto> {
+  const [schemaRaw, configRaw, envRaw, memory] = await Promise.all([
+    client.request("/api/config/schema", "GET"),
+    client.request("/api/config", "GET"),
+    client.request("/api/env", "GET"),
+    memoryStatusWith(client),
+  ]);
+  // Normalize each source to HermesSecretFieldMetaDto so optional provider/
+  // providerLabel (memory-provider only) and canClear are one static shape.
+  const configSecrets: HermesSecretFieldMetaDto[] = projectConfigSecretFieldMeta(schemaRaw, configRaw).map((field) => ({
+    key: field.key,
+    source: field.source,
+    label: field.label,
+    description: field.description,
+    category: field.category,
+    isSet: field.isSet,
+    isPassword: field.isPassword,
+    // Config secrets clear via empty PUT; always clearable when set. No provider.
+    canClear: field.isSet,
+  }));
+  const envSecrets: HermesSecretFieldMetaDto[] = projectEnvSecretMeta(envRaw);
+  const memorySecrets: HermesSecretFieldMetaDto[] = await discoverMemoryProviderSecrets(client, memory, envRaw);
+  // Env keys, then config secret leaves, then declared memory-provider secrets.
+  const fields: HermesSecretFieldMetaDto[] = [...envSecrets, ...configSecrets, ...memorySecrets].slice(0, SECRETS_MAX_FIELDS);
+  const revision = revisionOf(JSON.stringify(fields.map((field) => [
+    field.source,
+    field.provider ?? "",
+    field.key,
+    field.isSet,
+    field.canClear,
+    field.category,
+  ])));
+  return { profile: client.profile, revision, fields };
+}
+
+/**
+ * Sequential discovery of secret fields declared by Hermes memory providers.
+ * Only providers reported by GET /api/memory are considered; only
+ * surface=declared secret fields are exposed (isSet only, never values).
+ */
+async function discoverMemoryProviderSecrets(
+  client: ProfileClient,
+  memory: MemoryStatusDto,
+  envRaw: unknown,
+): Promise<HermesSecretFieldMetaDto[]> {
+  const names: string[] = [];
+  for (const provider of memory.providers) {
+    if (names.length >= MEMORY_PROVIDER_SECRET_MAX_PROVIDERS) break;
+    // builtin has no declared secret surface.
+    if (provider.name === "builtin" || provider.name === "") continue;
+    if (!PROVIDER_PATTERN.test(provider.name)) continue;
+    if (names.includes(provider.name)) continue;
+    names.push(provider.name);
+  }
+  // Also include the active provider if it is declared and not already listed.
+  if (
+    names.length < MEMORY_PROVIDER_SECRET_MAX_PROVIDERS
+    && memory.activeProvider
+    && memory.activeProvider !== "builtin"
+    && PROVIDER_PATTERN.test(memory.activeProvider)
+    && !names.includes(memory.activeProvider)
+  ) {
+    names.push(memory.activeProvider);
+  }
+
+  const fields: HermesSecretFieldMetaDto[] = [];
+  for (const name of names) {
+    if (fields.length >= SECRETS_MAX_FIELDS) break;
+    let schema: MemoryProviderConfigDto;
+    try {
+      schema = await providerConfigWith(client, name);
+    } catch (error) {
+      // Unknown/undeclared providers return empty fields; hard failures skip.
+      if (error instanceof HermesSettingsError && error.code === "not_found") continue;
+      if (error instanceof HermesSettingsError && error.code === "rejected") continue;
+      throw error;
+    }
+    // canClear requires: this field isSet, exactly one isSet secret on the
+    // provider schema, and exactly one env key with explicit provider match.
+    // Never expose the mapped env key name.
+    const setSecretCount = schema.fields.filter((item) => item.kind === "secret" && item.isSet).length;
+    const clearCandidate = findUniqueEnvKeyForMemoryProvider(envRaw, name);
+    let taken = 0;
+    for (const field of schema.fields) {
+      if (taken >= MEMORY_PROVIDER_SECRET_MAX_FIELDS_PER) break;
+      if (field.kind !== "secret") continue;
+      if (!NAME_PATTERN.test(field.key)) continue;
+      fields.push({
+        key: field.key,
+        source: "memory-provider",
+        label: field.label || field.key,
+        description: field.description,
+        category: "memory-provider",
+        isSet: field.isSet,
+        isPassword: true,
+        canClear: field.isSet && setSecretCount === 1 && clearCandidate !== undefined,
+        provider: name,
+        providerLabel: schema.label || name,
+      });
+      taken += 1;
+      if (fields.length >= SECRETS_MAX_FIELDS) break;
+    }
+  }
+  return fields;
+}
+
+/**
+ * Env keys eligible for memory-provider clear: must carry an explicit
+ * non-empty provider slug. Missing provider metadata never matches.
+ */
+export function listExactProviderEnvClearCandidates(
+  envRaw: unknown,
+  provider: string,
+): string[] {
+  if (!isRecord(envRaw) || typeof provider !== "string" || provider === "" || !PROVIDER_PATTERN.test(provider)) {
+    return [];
+  }
+  const candidates: string[] = [];
+  for (const [envKey, meta] of Object.entries(envRaw).slice(0, 400)) {
+    if (!SECRET_ENV_KEY_PATTERN.test(envKey) || !isRecord(meta)) continue;
+    if (meta.custom === true || meta.channel_managed === true) continue;
+    if (meta.is_set !== true) continue;
+    // Fail closed: missing/empty provider is never a match.
+    if (typeof meta.provider !== "string" || meta.provider === "") continue;
+    if (meta.provider !== provider) continue;
+    candidates.push(envKey);
+  }
+  return candidates;
+}
+
+/**
+ * Unique env key for a memory provider clear, or undefined when zero or
+ * multiple exact-provider candidates exist (ambiguous — do not delete).
+ * Does not use field-key / suffix heuristics.
+ */
+export function findUniqueEnvKeyForMemoryProvider(
+  envRaw: unknown,
+  provider: string,
+): string | undefined {
+  const candidates = listExactProviderEnvClearCandidates(envRaw, provider);
+  return candidates.length === 1 ? candidates[0] : undefined;
+}
+
+/**
+ * Clear a declared memory-provider secret via DELETE of a single env key
+ * that is unambiguously associated with the validated provider.
+ *
+ * Hermes 0.18.2 declared PUT ignores empty secret values and omits env_key
+ * from the declared schema response. Office therefore never issues a no-op
+ * provider PUT, never guesses env keys by suffix, and never treats missing
+ * provider metadata as a match. Zero or multiple exact candidates reject.
+ * Clear is only allowed when exactly one secret field is set on the provider
+ * (the field being cleared) and exactly one env key has provider === slug.
+ */
+async function clearMemoryProviderSecret(
+  client: ProfileClient,
+  provider: string,
+  fieldKey: string,
+  schema: MemoryProviderConfigDto,
+): Promise<void> {
+  const setSecrets = schema.fields.filter((item) => item.kind === "secret" && item.isSet);
+  if (setSecrets.length !== 1 || setSecrets[0]!.key !== fieldKey) {
+    throw invalid("Secret clear is unavailable for this field.");
+  }
+  const envRaw = await client.request("/api/env", "GET");
+  const envKey = findUniqueEnvKeyForMemoryProvider(envRaw, provider);
+  if (envKey === undefined) {
+    // Generic message — no field names, env keys, or candidate counts.
+    throw invalid("Secret clear is unavailable for this field.");
+  }
+  await client.request("/api/env", "DELETE", { key: envKey });
+}
+
+/**
+ * Hermes GET /api/env → metadata only. Never forward redacted_value or raw
+ * values; isSet is the only presence signal.
+ */
+function projectEnvSecretMeta(raw: unknown): HermesSecretFieldMetaDto[] {
+  if (!isRecord(raw)) throw invalidBackend();
+  const fields: HermesSecretFieldMetaDto[] = [];
+  for (const [key, meta] of Object.entries(raw).slice(0, 400)) {
+    if (!SECRET_ENV_KEY_PATTERN.test(key) || !isRecord(meta)) continue;
+    // Refuse custom/arbitrary env rows and channel-managed credentials — those
+    // are free-form or owned by messaging surfaces; only declared catalog keys.
+    if (meta.custom === true) continue;
+    if (meta.channel_managed === true) continue;
+    const description = safePublicText(meta.description, 2_000) ?? key;
+    const category = typeof meta.category === "string" && meta.category.length > 0 && meta.category.length <= 64
+      ? meta.category
+      : (typeof meta.provider === "string" && meta.provider.length > 0 ? meta.provider : "provider");
+    const label = typeof meta.provider_label === "string" && meta.provider_label.length > 0
+      ? safePublicText(meta.provider_label, 200) ?? key
+      : key;
+    const isSet = meta.is_set === true;
+    fields.push({
+      key,
+      source: "env",
+      label,
+      description,
+      category,
+      isSet,
+      isPassword: meta.is_password !== false,
+      canClear: isSet,
+    });
+  }
+  return fields;
+}
+
+function requiredSecretKey(value: string, source: HermesSecretSource): string {
+  if (source === "env") {
+    if (!SECRET_ENV_KEY_PATTERN.test(value)) throw invalid("Secret key is invalid.");
+    return value;
+  }
+  if (source === "memory-provider") {
+    // Declared provider field keys (e.g. api_key), not dotted paths.
+    if (!NAME_PATTERN.test(value)) throw invalid("Secret key is invalid.");
+    return value;
+  }
+  // Config secret fields use dotted Hermes field ids.
+  if (!/^[A-Za-z][A-Za-z0-9_]{0,63}(?:\.[A-Za-z][A-Za-z0-9_]{0,63}){0,7}$/.test(value) || value.length > 200) {
+    throw invalid("Secret key is invalid.");
+  }
+  return value;
 }
 
 export interface OfficeGlobalSettingsDto {
@@ -750,6 +1382,32 @@ async function readBoundedText(response: Response, limit: number): Promise<strin
 function revisionOf(value: string): string { return createHash("sha256").update(value).digest("base64url"); }
 function requiredRevision(value: unknown): string { if (typeof value !== "string" || !/^[A-Za-z0-9_-]{43}$/.test(value)) throw invalid("Settings revision is invalid."); return value; }
 function conflict(): HermesSettingsError { return new HermesSettingsError("conflict", "Hermes setting changed; refresh before saving."); }
+function commitUnconfirmed(): HermesSettingsError { return new HermesSettingsError("commit_unconfirmed", "Hermes may have committed this setting; refresh before retrying."); }
+function timedOut(): HermesSettingsError { return new HermesSettingsError("timed_out", "Hermes settings request timed out."); }
+function assertBeforeDeadline(deadlineMs: number): void { if (deadlineMs <= Date.now()) throw timedOut(); }
+function operationDeadline(adapterDeadlineMs: number, requestedDeadlineMs: number | undefined): number {
+  return requestedDeadlineMs === undefined || !Number.isFinite(requestedDeadlineMs)
+    ? adapterDeadlineMs
+    : Math.min(adapterDeadlineMs, Math.trunc(requestedDeadlineMs));
+}
+async function settleBeforeDeadline<T>(
+  operation: Promise<T>,
+  deadlineMs: number,
+  timeoutError: () => HermesSettingsError,
+): Promise<T> {
+  const remainingMs = deadlineMs - Date.now();
+  if (remainingMs <= 0) throw timeoutError();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(() => reject(timeoutError()), remainingMs);
+    timer.unref();
+  });
+  try {
+    return await Promise.race([operation, timeout]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}
 function requiredProfile(value: unknown): string { if (typeof value !== "string" || !PROFILE_PATTERN.test(value)) throw invalid("Profile name is invalid."); return value; }
 function requiredName(value: unknown, label: string): string { if (typeof value !== "string" || !NAME_PATTERN.test(value)) throw invalid(`${label} name is invalid.`); return value; }
 function requiredProvider(value: unknown, allowBuiltin: boolean): string { if (allowBuiltin && value === "") return ""; if (typeof value !== "string" || !PROVIDER_PATTERN.test(value)) throw invalid("Memory provider is invalid."); return value; }

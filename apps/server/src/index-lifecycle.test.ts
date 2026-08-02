@@ -6,7 +6,7 @@ import { join } from "node:path";
 import test from "node:test";
 
 test("SIGTERM during initial managed startup cleans the partially-created Hermes child", async () => {
-  const directory = await mkdtemp(join(tmpdir(), "hermes-office-initial-signal-"));
+  const directory = await mkdtemp(join(tmpdir(), "hermes-studio-initial-signal-"));
   const executable = join(directory, "fake-hermes.mjs");
   const childPath = join(directory, "child-pid");
   const stoppedPath = join(directory, "child-stopped");
@@ -16,16 +16,18 @@ import { createServer } from "node:http";
 if (process.argv.includes("--version")) {
   process.stdout.write("Hermes Agent v0.18.2\\n");
 } else {
-  writeFileSync(${JSON.stringify(childPath)}, String(process.pid));
   const server = createServer((request, response) => {
     if (request.url !== "/api/status") { response.statusCode = 404; response.end(); }
-  });
-  server.listen(0, "127.0.0.1", () => {
-    process.stdout.write("HERMES_DASHBOARD_READY port=" + server.address().port + "\\n");
   });
   process.on("SIGTERM", () => {
     writeFileSync(${JSON.stringify(stoppedPath)}, "stopped");
     process.exit(0);
+  });
+  // Publish the PID only after the shutdown handler is installed so the test
+  // cannot signal the parent during the fixture's own initialization window.
+  writeFileSync(${JSON.stringify(childPath)}, String(process.pid));
+  server.listen(0, "127.0.0.1", () => {
+    process.stdout.write("HERMES_DASHBOARD_READY port=" + server.address().port + "\\n");
   });
 }
 `, "utf8");
@@ -34,10 +36,10 @@ if (process.argv.includes("--version")) {
   const office = spawn(process.execPath, [join(import.meta.dirname, "index.js")], {
     env: {
       ...process.env,
-      HERMES_OFFICE_HERMES_MODE: "managed",
-      HERMES_OFFICE_HERMES_EXECUTABLE: executable,
-      HERMES_OFFICE_PORT: "0",
-      HERMES_OFFICE_DEVICE_REGISTRY_PATH: join(directory, "devices.json"),
+      HERMES_STUDIO_HERMES_MODE: "managed",
+      HERMES_STUDIO_HERMES_EXECUTABLE: executable,
+      HERMES_STUDIO_PORT: "0",
+      HERMES_STUDIO_DEVICE_REGISTRY_PATH: join(directory, "devices.json"),
     },
     stdio: "ignore",
   });
@@ -58,6 +60,31 @@ if (process.argv.includes("--version")) {
         if (Number.isSafeInteger(pid)) process.kill(pid, "SIGKILL");
       } catch { /* The managed child was never created or is already gone. */ }
     }
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("desktop parent pipe EOF shuts down the owned server", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "hermes-studio-parent-pipe-"));
+  const office = spawn(process.execPath, [join(import.meta.dirname, "index.js")], {
+    env: {
+      ...process.env,
+      HERMES_STUDIO_HERMES_MODE: "demo",
+      HERMES_STUDIO_PORT: "0",
+      HERMES_STUDIO_DESKTOP_PARENT_PIPE: "true",
+      HERMES_STUDIO_DEVICE_REGISTRY_PATH: join(directory, "devices.json"),
+      HERMES_STUDIO_TEAMS_PATH: join(directory, "teams.json"),
+    },
+    stdio: ["pipe", "ignore", "ignore"],
+  });
+  try {
+    assert.ok(office.stdin);
+    office.stdin.end();
+    const result = await waitForExit(office, 3_000);
+    assert.equal(result.signal, null);
+    assert.equal(result.code, 0);
+  } finally {
+    if (office.exitCode === null && office.signalCode === null) office.kill("SIGKILL");
     await rm(directory, { recursive: true, force: true });
   }
 });

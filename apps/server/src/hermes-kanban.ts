@@ -126,6 +126,14 @@ export class HermesKanbanUpstreamError extends Error {
   }
 }
 
+/** A non-idempotent Kanban POST may have committed before its reply was lost. */
+export class HermesKanbanCommitUnconfirmedError extends Error {
+  constructor() {
+    super("Hermes may have committed this Kanban change; refresh before retrying.");
+    this.name = "HermesKanbanCommitUnconfirmedError";
+  }
+}
+
 export class HermesKanbanAdapter {
   readonly #request: HermesKanbanRequester;
   readonly #listAllowedProfiles: HermesKanbanAdapterOptions["listAllowedProfiles"];
@@ -176,12 +184,18 @@ export class HermesKanbanAdapter {
     assertRequestSize(body);
 
     const board = optionalBoard(options.board);
-    const raw = record(await this.#request({
+    const response = await this.#request({
       method: "POST",
       path: withQuery(`${KANBAN_PREFIX}/tasks`, { board }),
       body,
-    }), "create result");
-    return parseCard(raw.task);
+    });
+    try {
+      const raw = record(response, "create result");
+      return parseCard(raw.task);
+    } catch (error) {
+      if (error instanceof HermesKanbanCommitUnconfirmedError) throw error;
+      throw commitUnconfirmed();
+    }
   }
 
   async updateCard(
@@ -232,15 +246,21 @@ export class HermesKanbanAdapter {
     options: { board?: string } = {},
   ): Promise<void> {
     const id = validCardId(cardId);
-    const body = { body: boundedText(comment, "comment", 1, 16_000), author: "hermes-office" };
+    const body = { body: boundedText(comment, "comment", 1, 16_000), author: "hermes-studio" };
     assertRequestSize(body);
     const board = optionalBoard(options.board);
-    const raw = record(await this.#request({
+    const response = await this.#request({
       method: "POST",
       path: withQuery(`${KANBAN_PREFIX}/tasks/${encodeURIComponent(id)}/comments`, { board }),
       body,
-    }), "comment result");
-    if (raw.ok !== true) throw new HermesKanbanUpstreamError("Hermes did not confirm the comment.");
+    });
+    try {
+      const raw = record(response, "comment result");
+      if (raw.ok !== true) throw new HermesKanbanUpstreamError("Hermes did not confirm the comment.");
+    } catch (error) {
+      if (error instanceof HermesKanbanCommitUnconfirmedError) throw error;
+      throw commitUnconfirmed();
+    }
   }
 
   async #allowedProfile(value: string): Promise<string> {
@@ -286,6 +306,9 @@ export function createHermesKanbanHttpRequester(options: HermesKanbanHttpOptions
         signal: controller.signal,
       });
       if (!response.ok) {
+        if (request.method === "POST" && ambiguousMutationStatus(response.status)) {
+          throw commitUnconfirmed();
+        }
         throw new HermesKanbanUpstreamError(`Hermes Kanban request failed (${response.status}).`, response.status);
       }
       const text = await readBoundedText(response, MAX_RESPONSE_BYTES);
@@ -295,12 +318,25 @@ export function createHermesKanbanHttpRequester(options: HermesKanbanHttpOptions
         throw new HermesKanbanUpstreamError("Hermes Kanban returned invalid JSON.");
       }
     } catch (error) {
-      if (error instanceof KanbanValidationError || error instanceof HermesKanbanUpstreamError) throw error;
+      if (error instanceof KanbanValidationError || error instanceof HermesKanbanCommitUnconfirmedError) throw error;
+      if (error instanceof HermesKanbanUpstreamError) {
+        if (request.method === "POST" && error.status === undefined) throw commitUnconfirmed();
+        throw error;
+      }
+      if (request.method === "POST") throw commitUnconfirmed();
       throw new HermesKanbanUpstreamError("Hermes Kanban is unavailable.");
     } finally {
       clearTimeout(timer);
     }
   };
+}
+
+function ambiguousMutationStatus(status: number): boolean {
+  return status === 408 || status === 425 || status === 429 || status >= 500;
+}
+
+function commitUnconfirmed(): HermesKanbanCommitUnconfirmedError {
+  return new HermesKanbanCommitUnconfirmedError();
 }
 
 function parseBoard(value: unknown, board: string | undefined): SafeKanbanBoard {
@@ -401,7 +437,7 @@ function writableStatus(value: unknown): HermesKanbanWritableStatus {
   if (typeof value !== "string" || !(WRITE_STATUSES as readonly string[]).includes(value)) {
     throw new KanbanValidationError(
       "UNSUPPORTED_STATUS",
-      "That status cannot be set directly by Hermes Office.",
+      "That status cannot be set directly by Hermes Studio.",
     );
   }
   return value as HermesKanbanWritableStatus;

@@ -1,11 +1,11 @@
 {
-  "name": "@hermes-office/server",
+  "name": "@hermes-studio/server",
   "version": "0.1.0",
   "private": true,
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/kinocode-jp/hermes-office.git",
+    "url": "git+https://github.com/kinocode-jp/hermes-studio.git",
     "directory": "apps/server"
   },
   "type": "module",
@@ -21,7 +21,7 @@
     "test": "npm run build && node --test --test-concurrency=1 dist/*.test.js"
   },
   "dependencies": {
-    "@hermes-office/protocol": "0.0.0",
+    "@hermes-studio/protocol": "0.0.0",
     "ws": "^8.18.3"
   },
   "devDependencies": {

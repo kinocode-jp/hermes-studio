@@ -11,10 +11,10 @@ try {
     access(serverEntry, constants.R_OK),
   ]);
 } catch {
-  process.stderr.write("Hermes Office is not built. Run `npm run build:production` first.\n");
+  process.stderr.write("Hermes Studio is not built. Run `npm run build:production` first.\n");
   process.exitCode = 1;
   throw new Error("Production assets are missing.");
 }
 
-process.env.HERMES_OFFICE_WEB_ROOT ||= webRoot;
+process.env.HERMES_STUDIO_WEB_ROOT ||= webRoot;
 await import(serverEntry);

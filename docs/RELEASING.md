@@ -1,7 +1,25 @@
 # Release policy
 
-Hermes Office currently publishes source only. Building locally is supported
+Hermes Studio currently publishes source only. Building locally is supported
 for development, but a local `.app` or DMG is not an official project release.
+
+## Desktop package contents (local / future binary release)
+
+A Tauri production package includes:
+
+- packaged Web UI (`frontendDist`);
+- bundled Studio Server module (`resources/server/hermes-studio-server.mjs`);
+- optional static web copy (`resources/web`) produced by
+  `npm run build:desktop-assets` for operators who open `http://127.0.0.1:4317/`
+  in a normal browser while the desktop-owned server is running.
+
+It does **not** currently ship Node.js or Hermes Agent. Local builds and any
+future official binary must document the managed runtime requirements (Node
+22.x and a separately installed Hermes Agent). Studio does not pin a Hermes
+Agent release; it validates the API response contracts it consumes.
+Desktop diagnostic logs for launcher failures live under
+`~/Library/Logs/HermesStudio/` on macOS (or `~/.hermes-studio/logs/` elsewhere)
+and must never contain remote enrollment tokens or desktop capabilities.
 
 ## Binary release gate
 
@@ -26,10 +44,14 @@ scripts from unreviewed commits, or a `pull_request_target` checkout.
 
 ## Repository settings after creation
 
-For `main`, enable a ruleset requiring review and the CI checks in
-`.github/workflows/ci.yml`; prohibit force pushes and deletion. Enable private
-vulnerability reporting, Dependabot alerts/security updates, secret scanning,
-and push protection where the organization plan supports them.
+For `main`, require the CI checks in `.github/workflows/ci.yml`; prohibit force
+pushes and deletion. While the repository has only one trusted reviewer, do not
+set a required approval count that makes the maintainer unable to merge their
+own PR. As soon as a second trusted reviewer has write access, require at least
+one approval, dismiss stale approvals, and require approval of the latest
+reviewable push. Enable private vulnerability reporting, Dependabot
+alerts/security updates, secret scanning, non-provider pattern scanning,
+validity checks, and push protection where the organization plan supports them.
 
 Do not advertise or upload an official binary until the binary release gate is
 implemented. `THIRD_PARTY_NOTICES.md` describes the notice requirements.

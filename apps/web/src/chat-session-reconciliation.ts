@@ -1,19 +1,36 @@
 import type { ChatSession } from "./domain";
 import { invalidatePendingInterrupt, invalidatePendingSteer } from "./chat-run-actions";
 import type { RuntimeMessage } from "./i18n";
+import { advanceSequence } from "./chat-event-ledger";
+import { hasPendingPromptOperation } from "./session-runtime";
 
 export type ChatSessionReadyRuntime = {
   running?: boolean;
   status?: string;
+  model?: string;
+  provider?: string;
+  reasoningEffort?: string;
 };
 
 export function reconcileChatSessionConnecting(session: ChatSession): ChatSession {
+  const pendingFirstPrompt = hasPendingPromptOperation(session);
   return {
     ...terminateChatRun(session, "cancelled"),
+    ...(pendingFirstPrompt ? { status: "streaming" as const } : {}),
     connectionState: "connecting",
     liveSessionId: undefined,
     readOnly: true,
     errorMessage: undefined
+  };
+}
+
+export function reconcileChatSessionQueued(session: ChatSession): ChatSession {
+  return {
+    ...session,
+    connectionState: "queued",
+    liveSessionId: undefined,
+    readOnly: false,
+    errorMessage: undefined,
   };
 }
 
@@ -24,12 +41,19 @@ export function reconcileChatSessionReady(
   runtime?: ChatSessionReadyRuntime
 ): ChatSession {
   const runtimeStatus = sessionStatusFromRuntime(runtime);
+  // session.ready for a newly-created draft arrives before its queued first
+  // prompt is submitted. It must not reopen the composer or make the lease
+  // look idle during that hand-off.
+  const effectiveStatus = hasPendingPromptOperation(session) ? "streaming" : runtimeStatus;
   const targetChanged = session.liveSessionId !== liveSessionId;
   const reconciled = runtimeStatus === "ready" || targetChanged ? terminateChatRun(session, "cancelled") : session;
   return {
     ...reconciled,
     ...(storedSessionId ? { storedSessionId } : {}),
-    ...(runtimeStatus ? { status: runtimeStatus } : {}),
+    ...(effectiveStatus ? { status: effectiveStatus } : {}),
+    ...(runtime?.model ? { model: runtime.model } : {}),
+    ...(runtime?.provider ? { provider: runtime.provider } : {}),
+    ...(runtime?.reasoningEffort ? { reasoningEffort: runtime.reasoningEffort } : {}),
     liveSessionId,
     connectionState: "ready",
     remoteKind: storedSessionId ? "stored" : session.remoteKind,
@@ -61,6 +85,18 @@ function terminateChatRun(session: ChatSession, terminalStatus: "cancelled" | "f
     ...invalidatePendingInterrupt(invalidatePendingSteer(session)),
     status: "ready",
     streamingMessageId: undefined,
+    streamingSourceMessageId: undefined,
+    interimMessageIds: undefined,
+    chatRunStarted: undefined,
+    chatRunId: undefined,
+    chatRunServerSequence: undefined,
+    completedChatRunServerSequence: advanceSequence(
+      session.completedChatRunServerSequence,
+      session.chatRunServerSequence,
+    ),
+    chatRunSourceMessageId: undefined,
+    chatRunSequence: undefined,
+    toolMessageBindings: undefined,
     pendingInteraction: undefined,
     messages: session.messages.map((message) => message.status === "streaming" ? { ...message, status: terminalStatus } : message)
   };

@@ -14,11 +14,21 @@ import {
   type SimCharacter
 } from "../office/sim";
 import { assignTask, selectProfile, selectedProfileId, sessions, tasks } from "../store";
+import { isScheduledSessionHidden } from "../scheduled-sessions";
 import { loadMoreProfiles, profileInventoryState } from "../inventory";
 import { CharacterPortrait } from "./character-portrait";
+import { CardsIcon, CloseIcon, ListIcon } from "./icons";
 import { InfoTip } from "./info-tip";
 import { StatusPill } from "./status-pill";
 import { TaskCables, type TaskCable } from "./task-cables";
+import { TeamBadges } from "./team-badges";
+import { profileDisplayName } from "../profile-names";
+import { setOfficeWindowOpen } from "../office-window";
+import { teams } from "../teams-store";
+import { groupProfilesByTeams, profileGroupItemKey, type ProfileTeamGroup } from "../profile-team-groups";
+import { officeGroupMode, setOfficeGroupMode } from "../group-display-prefs";
+import { ProfileContextMenu, useProfileContextMenu } from "./profile-context-menu";
+import { Office3D } from "./office-3d";
 import "./office-scene.css";
 
 const statusTranslation: Record<Profile["status"], TranslationKey> = {
@@ -31,26 +41,33 @@ const statusTranslation: Record<Profile["status"], TranslationKey> = {
 type OfficeView = "scene" | "list";
 
 function storedPreference<T extends string>(key: string, fallback: T, valid: readonly T[]): T {
-  if (typeof window === "undefined") return fallback;
   try {
-    const value = window.localStorage.getItem(key);
-    return valid.includes(value as T) ? (value as T) : fallback;
-  } catch {
-    return fallback;
-  }
+    const candidates = [key];
+    if (key.startsWith("hermes-studio")) candidates.push(`hermes-office${key.slice("hermes-studio".length)}`);
+    for (const candidate of candidates) {
+      const value = window.localStorage.getItem(candidate);
+      if (value && (valid as readonly string[]).includes(value)) {
+        if (candidate !== key) {
+          try { window.localStorage.setItem(key, value); } catch { /* migrate best-effort */ }
+        }
+        return value as T;
+      }
+    }
+  } catch { /* Preferences may be blocked. */ }
+  return fallback;
 }
 
 function persistPreference(key: string, value: string): void {
   try { window.localStorage.setItem(key, value); } catch { /* Preferences may be blocked. */ }
 }
 
-const officeView = signal<OfficeView>(storedPreference("hermes-office.office-view", "scene", ["scene", "list"]));
-const officeLayout = signal<OfficeLayoutId>(storedPreference("hermes-office.office-layout", "studio", ["studio", "lounge"]));
-const officeSize = signal<OfficeSizeId>(storedPreference("hermes-office.office-size", "m", ["s", "m", "l"]));
+const officeView = signal<OfficeView>(storedPreference("hermes-studio.office-view", "scene", ["scene", "list"]));
+const officeLayout = signal<OfficeLayoutId>(storedPreference("hermes-studio.office-layout", "studio", ["studio", "lounge"]));
+const officeSize = signal<OfficeSizeId>(storedPreference("hermes-studio.office-size", "m", ["s", "m", "l"]));
 
-function setView(view: OfficeView): void { officeView.value = view; persistPreference("hermes-office.office-view", view); }
-function setLayout(layout: OfficeLayoutId): void { officeLayout.value = layout; persistPreference("hermes-office.office-layout", layout); }
-function setSize(size: OfficeSizeId): void { officeSize.value = size; persistPreference("hermes-office.office-size", size); }
+function setView(view: OfficeView): void { officeView.value = view; persistPreference("hermes-studio.office-view", view); }
+function setLayout(layout: OfficeLayoutId): void { officeLayout.value = layout; persistPreference("hermes-studio.office-layout", layout); }
+function setSize(size: OfficeSizeId): void { officeSize.value = size; persistPreference("hermes-studio.office-size", size); }
 
 const CHAR_W = 84;
 const CHAR_H = 84;
@@ -58,7 +75,7 @@ const DENSE_OFFICE_PROFILE_COUNT = 12;
 const MIN_INTERACTIVE_SCENE_SCALE = 0.55;
 
 function profileActivity(profileId: string): string | undefined {
-  const profileSessions = sessions.value.filter((session) => session.profileId === profileId);
+  const profileSessions = sessions.value.filter((session) => session.profileId === profileId && !isScheduledSessionHidden(session));
   const current = profileSessions.find((session) => session.status === "streaming" || session.status === "waiting") ?? profileSessions[0];
   return current?.title;
 }
@@ -81,6 +98,15 @@ function stableProfileIds(profileIds: string[]): string[] {
   return [...profileIds].sort((left, right) => left === right ? 0 : left < right ? -1 : 1);
 }
 
+/** Default / reception profile is always seat 0 (entrance desk). */
+function orderProfilesForOffice(profileIds: readonly string[]): string[] {
+  const ids = [...profileIds];
+  const defaultIndex = ids.findIndex((id) => id === "default");
+  if (defaultIndex <= 0) return ids;
+  const [defaultId] = ids.splice(defaultIndex, 1);
+  return [defaultId!, ...ids];
+}
+
 function placeCharactersAtAssignedDesks(world: OfficeWorld, characters: SimCharacter[]): void {
   for (const character of characters) {
     const desk = world.desks[character.deskIndex];
@@ -95,7 +121,15 @@ function placeCharactersAtAssignedDesks(world: OfficeWorld, characters: SimChara
   }
 }
 
-function OfficeStage({ profiles, world }: { profiles: Profile[]; world: OfficeWorld }) {
+function OfficeStage({
+  profiles,
+  world,
+  onProfileActivate,
+}: {
+  profiles: Profile[];
+  world: OfficeWorld;
+  onProfileActivate: (event: MouseEvent, profileId: string) => void;
+}) {
   const stageRef = useRef<HTMLDivElement>(null);
   const charEls = useRef(new Map<string, HTMLButtonElement>());
   const simRef = useRef<SimCharacter[]>([]);
@@ -106,7 +140,11 @@ function OfficeStage({ profiles, world }: { profiles: Profile[]; world: OfficeWo
   const profileKey = profiles.map((profile) => profile.id).join("|");
   const denseLayout = profiles.length >= DENSE_OFFICE_PROFILE_COUNT;
   const assignedProfileIds = useMemo(
-    () => denseLayout ? stableProfileIds(profiles.map((profile) => profile.id)) : profiles.map((profile) => profile.id),
+    () => orderProfilesForOffice(
+      denseLayout
+        ? stableProfileIds(profiles.map((profile) => profile.id))
+        : profiles.map((profile) => profile.id),
+    ),
     [denseLayout, profileKey]
   );
   const assignedDeskByProfile = useMemo(
@@ -159,13 +197,10 @@ function OfficeStage({ profiles, world }: { profiles: Profile[]; world: OfficeWo
     };
     paint();
     if (denseLayout || window.matchMedia("(prefers-reduced-motion: reduce)").matches) {
-      // Dense rosters use exclusive desk seats; reduced motion uses the same stable layout.
       placeCharactersAtAssignedDesks(world, simRef.current);
       paint();
       return;
     }
-    // Interval-driven so the sim keeps running where rAF is throttled;
-    // the CSS transform transition smooths between the coarse updates.
     let last = performance.now();
     const timer = window.setInterval(() => {
       const now = performance.now();
@@ -190,7 +225,7 @@ function OfficeStage({ profiles, world }: { profiles: Profile[]; world: OfficeWo
       taskId: task.id,
       taskLabel: task.title,
       profileId: profile.id,
-      profileName: profile.name,
+      profileName: profileDisplayName(profile),
       source: { x: (world.board.x + world.board.w / 2) * CELL, y: CELL * 0.9 },
       target: { x: (desk.x + 1) * CELL, y: (desk.y + 0.4) * CELL },
       state: task.status === "running" ? "active" : task.status === "blocked" ? "blocked" : "queued",
@@ -225,11 +260,18 @@ function OfficeStage({ profiles, world }: { profiles: Profile[]; world: OfficeWo
             </div>
           ))}
           {cables.length > 0 && (
-            <TaskCables cables={cables} width={worldW} height={worldH} maxCables={24} onSelect={(cable) => selectProfile(cable.profileId)} />
+            <TaskCables
+              cables={cables}
+              width={worldW}
+              height={worldH}
+              maxCables={24}
+              onSelect={(cable) => selectProfile(cable.profileId, { openWorkspace: true })}
+            />
           )}
           {profiles.map((profile) => {
             const stateLabel = t(statusTranslation[profile.status]);
             const activity = profileActivity(profile.id);
+            const displayName = profileDisplayName(profile);
             return (
               <button
                 key={profile.id}
@@ -239,12 +281,16 @@ function OfficeStage({ profiles, world }: { profiles: Profile[]; world: OfficeWo
                 data-status={profile.status}
                 title={activity ?? stateLabel}
                 aria-current={selectedProfileId.value === profile.id ? "true" : undefined}
-                onClick={() => selectProfile(profile.id)}
+                onClick={(event) => onProfileActivate(event, profile.id)}
+                onContextMenu={(event) => {
+                  event.preventDefault();
+                  onProfileActivate(event, profile.id);
+                }}
                 {...profileDropHandlers(profile.id)}
-                aria-label={t("office.profileLabel", { name: profile.name, state: stateLabel, activity: activity ?? stateLabel, count: profile.sessions })}
+                aria-label={t("office.profileLabel", { name: displayName, state: stateLabel, activity: activity ?? stateLabel, count: profile.sessions })}
               >
-                <CharacterPortrait profileId={profile.id} profileName={profile.name} class="character-portrait--sim" decorative />
-                <span class="ow-char-name" title={profile.name}>{profile.name}</span>
+                <CharacterPortrait profileId={profile.id} profileName={displayName} class="character-portrait--sim" decorative />
+                <span class="ow-char-name" title={displayName}>{displayName}</span>
               </button>
             );
           })}
@@ -254,39 +300,100 @@ function OfficeStage({ profiles, world }: { profiles: Profile[]; world: OfficeWo
   );
 }
 
-function OfficeList({ profiles }: { profiles: Profile[] }) {
+function OfficeProfileRow({
+  profile,
+  onActivate,
+}: {
+  profile: Profile;
+  onActivate: (event: MouseEvent, profileId: string) => void;
+}) {
+  const stateLabel = t(statusTranslation[profile.status]);
+  const activity = profileActivity(profile.id);
+  const displayName = profileDisplayName(profile);
+  return (
+    <button
+      class={`office-row ${selectedProfileId.value === profile.id ? "is-selected" : ""}`}
+      style={{ "--agent-color": profile.color }}
+      aria-current={selectedProfileId.value === profile.id ? "true" : undefined}
+      onClick={(event) => onActivate(event, profile.id)}
+      onContextMenu={(event) => {
+        event.preventDefault();
+        onActivate(event, profile.id);
+      }}
+      {...profileDropHandlers(profile.id)}
+      aria-label={t("office.profileLabel", { name: displayName, state: stateLabel, activity: activity ?? stateLabel, count: profile.sessions })}
+    >
+      <CharacterPortrait profileId={profile.id} profileName={displayName} class="character-portrait--row" decorative />
+      <span class="office-row-main">
+        <b>{displayName}</b>
+        {activity && <small title={activity}>{activity}</small>}
+        <TeamBadges profileId={profile.id} />
+      </span>
+      <span class="office-row-meta">
+        <StatusPill status={profile.status} />
+        {profile.sessions > 0 && <span class="chat-chip" title={`${profile.sessions} ${t("office.chats")}`}>{profile.sessions}</span>}
+      </span>
+    </button>
+  );
+}
+
+function OfficeList({
+  profiles,
+  onActivate,
+}: {
+  profiles: Profile[];
+  onActivate: (event: MouseEvent, profileId: string) => void;
+}) {
   return (
     <div class="office-list">
-      {profiles.map((profile) => {
-        const stateLabel = t(statusTranslation[profile.status]);
-        const activity = profileActivity(profile.id);
-        return (
-          <button
-            key={profile.id}
-            class={`office-row ${selectedProfileId.value === profile.id ? "is-selected" : ""}`}
-            style={{ "--agent-color": profile.color }}
-            aria-current={selectedProfileId.value === profile.id ? "true" : undefined}
-            onClick={() => selectProfile(profile.id)}
-            {...profileDropHandlers(profile.id)}
-            aria-label={t("office.profileLabel", { name: profile.name, state: stateLabel, activity: activity ?? stateLabel, count: profile.sessions })}
-          >
-            <CharacterPortrait profileId={profile.id} profileName={profile.name} class="character-portrait--row" decorative />
-            <span class="office-row-main">
-              <b>{profile.name}</b>
-              {activity && <small title={activity}>{activity}</small>}
-            </span>
-            <span class="office-row-meta">
-              <StatusPill status={profile.status} />
-              {profile.sessions > 0 && <span class="chat-chip" title={`${profile.sessions} ${t("office.chats")}`}>{profile.sessions}</span>}
-            </span>
-          </button>
-        );
-      })}
+      {profiles.map((profile) => (
+        <OfficeProfileRow key={profile.id} profile={profile} onActivate={onActivate} />
+      ))}
     </div>
   );
 }
 
-export function OfficeScene({ profiles }: { profiles: Profile[] }) {
+function OfficeGroupedList({
+  groups,
+  onActivate,
+}: {
+  groups: ProfileTeamGroup<Profile>[];
+  onActivate: (event: MouseEvent, profileId: string) => void;
+}) {
+  return (
+    <div class="office-group-list" data-office-group="teams">
+      {groups.map((group) => (
+        <section
+          key={group.key}
+          class={`profile-group ${group.kind === "unassigned" ? "profile-group--unassigned" : ""}`}
+          aria-label={group.kind === "team" ? group.name : t("team.group.unassigned")}
+        >
+          <header
+            class="profile-group-header"
+            style={group.kind === "team" ? { "--team-color": group.color } : undefined}
+          >
+            <i aria-hidden="true" />
+            <b title={group.kind === "team" ? group.name : t("team.group.unassigned")}>
+              {group.kind === "team" ? group.name : t("team.group.unassigned")}
+            </b>
+            <small>{t("team.group.count", { count: group.profiles.length })}</small>
+          </header>
+          <div class="profile-group-body office-list">
+            {group.profiles.map((profile) => (
+              <OfficeProfileRow
+                key={profileGroupItemKey(group.key, profile.id)}
+                profile={profile}
+                onActivate={onActivate}
+              />
+            ))}
+          </div>
+        </section>
+      ))}
+    </div>
+  );
+}
+
+export function OfficeScene({ profiles, embedded = false }: { profiles: Profile[]; embedded?: boolean }) {
   const working = profiles.filter((profile) => profile.status === "working").length;
   const attention = profiles.filter((profile) => profile.status === "waiting" || profile.status === "blocked").length;
   const world = useMemo(
@@ -294,26 +401,85 @@ export function OfficeScene({ profiles }: { profiles: Profile[] }) {
     [officeLayout.value, officeSize.value, profiles.length]
   );
   const inventory = profileInventoryState.value;
-  const denseRoster = profiles.length >= DENSE_OFFICE_PROFILE_COUNT;
-  const effectiveView: OfficeView = denseRoster ? "list" : officeView.value;
+  const hasTeams = teams.value.length > 0;
+  const groupMode = hasTeams && officeGroupMode.value === "teams" ? "teams" : "profiles";
+  const grouping = groupMode === "teams"
+    ? groupProfilesByTeams(profiles, teams.value)
+    : { mode: "flat" as const, profiles };
+  // Team mode forces list so many-to-many membership is not ambiguous on the scene floor.
+  // Profile count never forces list — large rosters stay on the office floor.
+  const effectiveView: OfficeView = groupMode === "teams" ? "list" : officeView.value;
+  const {
+    menu,
+    menuRef,
+    closeMenu,
+    openProfileMenu,
+    openMenuSession,
+  } = useProfileContextMenu();
+
+  const onProfileActivate = (event: MouseEvent, profileId: string) => {
+    // Right-click / context menu keeps the action menu; left-click opens the detail modal.
+    if (event.type === "contextmenu" || event.button === 2) {
+      openProfileMenu(event, profileId);
+      return;
+    }
+    event.preventDefault();
+    selectProfile(profileId, { openDetail: true });
+  };
 
   return (
-    <section class="office-wrap" aria-labelledby="office-title" data-view={effectiveView}>
+    <section
+      class={`office-wrap ${embedded ? "office-wrap--embedded" : ""}`}
+      aria-label={embedded ? t("office.title") : undefined}
+      aria-labelledby={embedded ? undefined : "office-title"}
+      data-view={effectiveView}
+      data-office-group={groupMode}
+    >
       <header class="office-heading">
-        <div class="heading-info-group">
-          <h1 id="office-title">{t("office.title")}</h1>
-          <InfoTip text={t("office.hint")} align="start" side="bottom" />
-        </div>
+        {!embedded && (
+          <div class="heading-info-group">
+            <h1 id="office-title">{t("office.title")}</h1>
+            <InfoTip text={t("office.hint")} align="start" side="bottom" />
+          </div>
+        )}
+        <div class="office-heading-actions">
         <div class="office-toolbar">
           <div class="shift-readout" aria-label={t("office.summary")}>
             <span class="stat stat--working" title={t("office.workingCount")}><i /><b>{working}</b></span>
             <span class="stat stat--waiting" title={t("office.attentionCount")}><i /><b>{attention}</b></span>
             <span class="stat stat--total" title={t("office.profilesCount")}><i /><b>{profiles.length}</b></span>
           </div>
-          {denseRoster && <span class="office-density-note" role="status">{t("office.denseList")}</span>}
+          {hasTeams && (
+            <div class="profile-group-toggle office-group-seg" role="group" aria-label={t("office.group.aria")}>
+              <button
+                type="button"
+                class={groupMode === "profiles" ? "is-active" : ""}
+                aria-pressed={groupMode === "profiles"}
+                title={t("office.group.profiles")}
+                aria-label={t("office.group.profiles")}
+                onClick={() => setOfficeGroupMode("profiles")}
+              >{t("office.group.profiles")}</button>
+              <button
+                type="button"
+                class={groupMode === "teams" ? "is-active" : ""}
+                aria-pressed={groupMode === "teams"}
+                title={t("office.group.teams")}
+                aria-label={t("office.group.teams")}
+                onClick={() => setOfficeGroupMode("teams")}
+              >{t("office.group.teams")}</button>
+            </div>
+          )}
           <div class="office-seg office-seg--view" role="group" aria-label={t("office.viewLabel")}>
-            <button type="button" class={effectiveView === "scene" ? "is-active" : ""} title={denseRoster ? t("office.denseList") : t("office.viewScene")} aria-label={t("office.viewScene")} aria-pressed={effectiveView === "scene"} disabled={denseRoster} onClick={() => setView("scene")}>▦</button>
-            <button type="button" class={effectiveView === "list" ? "is-active" : ""} title={t("office.viewList")} aria-label={t("office.viewList")} aria-pressed={effectiveView === "list"} onClick={() => setView("list")}>☰</button>
+            <button
+              type="button"
+              class={effectiveView === "scene" ? "is-active" : ""}
+              title={groupMode === "teams" ? t("office.group.teamsForcesList") : t("office.viewScene")}
+              aria-label={t("office.viewScene")}
+              aria-pressed={effectiveView === "scene"}
+              disabled={groupMode === "teams"}
+              onClick={() => setView("scene")}
+            ><CardsIcon /></button>
+            <button type="button" class={effectiveView === "list" ? "is-active" : ""} title={t("office.viewList")} aria-label={t("office.viewList")} aria-pressed={effectiveView === "list"} onClick={() => setView("list")}><ListIcon /></button>
           </div>
           {effectiveView === "scene" && (
             <>
@@ -329,13 +495,38 @@ export function OfficeScene({ profiles }: { profiles: Profile[] }) {
             </>
           )}
         </div>
+        {!embedded && (
+          <button
+            type="button"
+            class="office-collapse-button"
+            aria-label={t("office.remove")}
+            title={t("office.remove")}
+            onClick={() => setOfficeWindowOpen(false)}
+          ><CloseIcon width={18} height={18} /></button>
+        )}
+        </div>
       </header>
 
-      {effectiveView === "scene" && <OfficeStage profiles={profiles} world={world} />}
-      <OfficeList profiles={profiles} />
+      {effectiveView === "scene" && (
+        <Office3D profiles={profiles} world={world} onProfileActivate={onProfileActivate} />
+      )}
+      {effectiveView === "list" && (
+        groupMode === "teams" && grouping.mode === "grouped"
+          ? <OfficeGroupedList groups={grouping.groups} onActivate={onProfileActivate} />
+          : <OfficeList profiles={profiles} onActivate={onProfileActivate} />
+      )}
       {inventory.hasMore && <button class="secondary-button inventory-more" disabled={inventory.loading} onClick={() => void loadMoreProfiles()}>{inventory.loading ? t("inventory.loading") : t("inventory.showMore")}</button>}
       {inventory.truncated && !inventory.hasMore && <small class="inventory-note">{t("inventory.truncated")}</small>}
       {inventory.error && <small class="inventory-note inventory-note--error">{localizeRuntimeMessage(inventory.error)}</small>}
+
+      {menu && (
+        <ProfileContextMenu
+          menu={menu}
+          menuRef={menuRef}
+          onClose={closeMenu}
+          onOpenSession={openMenuSession}
+        />
+      )}
     </section>
   );
 }

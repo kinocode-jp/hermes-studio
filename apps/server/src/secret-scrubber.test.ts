@@ -4,15 +4,15 @@ import { containsLikelySecret, isLikelySecretIdentifier, redactSecrets } from ".
 
 test("redacts namespaced, quoted, spaced, and lowercase secret assignments", () => {
   const source = [
-    "HERMES_DASHBOARD_SESSION_TOKEN=dashboard-example-value",
-    "OPENAI_API_KEY = 'openai-example-value'",
-    '"AWS_SECRET_ACCESS_KEY": "aws-example-secret-value"',
-    "database_password = database-example-value",
-    "service_secret: service-example-value",
-    "github.token = github-example-value",
-    "accessToken = camel-token-example-value",
-    "clientSecret = camel-secret-example-value",
-    "unfinished_token = 'unfinished-example-value",
+    "HERMES_DASHBOARD_SESSION_TOKEN=dashboard-example-value", // gitleaks:allow -- synthetic scrubber fixture
+    "OPENAI_API_KEY = 'openai-example-value'", // gitleaks:allow -- synthetic scrubber fixture
+    '"AWS_SECRET_ACCESS_KEY": "aws-example-secret-value"', // gitleaks:allow -- synthetic scrubber fixture
+    "database_password = database-example-value", // gitleaks:allow -- synthetic scrubber fixture
+    "service_secret: service-example-value", // gitleaks:allow -- synthetic scrubber fixture
+    "github.token = github-example-value", // gitleaks:allow -- synthetic scrubber fixture
+    "accessToken = camel-token-example-value", // gitleaks:allow -- synthetic scrubber fixture
+    "clientSecret = camel-secret-example-value", // gitleaks:allow -- synthetic scrubber fixture
+    "unfinished_token = 'unfinished-example-value", // gitleaks:allow -- synthetic scrubber fixture
   ].join("\n");
 
   const result = redactSecrets(source);
@@ -35,9 +35,9 @@ test("redacts namespaced, quoted, spaced, and lowercase secret assignments", () 
 
 test("retains URL query, authorization-header, private-key, and ANSI protections", () => {
   const source = [
-    "https://example.test/?access_token=query-example-value&mode=safe",
-    "Authorization: Bearer bearer-example-value-123456",
-    "-----BEGIN PRIVATE KEY-----\nprivate-example-value\n-----END PRIVATE KEY-----",
+    "https://example.test/?access_token=query-example-value&mode=safe", // gitleaks:allow -- synthetic scrubber fixture
+    "Authorization: Bearer bearer-example-value-123456", // gitleaks:allow -- synthetic scrubber fixture
+    "-----BEGIN PRIVATE KEY-----\nprivate-example-value\n-----END PRIVATE KEY-----", // gitleaks:allow -- synthetic private-key fixture
     "\u001b[31mwarning\u001b[0m",
   ].join("\n");
 
@@ -56,7 +56,7 @@ test("retains URL query, authorization-header, private-key, and ANSI protections
 
 test("ANSI normalization is allowed for output but rejected on persisted input", () => {
   const decoratedProse = "\u001b[31mwarning\u001b[0m";
-  const decoratedSecret = "\u001b[33mAPI_KEY=credential-value\u001b[0m";
+  const decoratedSecret = "\u001b[33mAPI_KEY=credential-value\u001b[0m"; // gitleaks:allow -- synthetic scrubber fixture
 
   assert.deepEqual(redactSecrets(decoratedProse), { value: "warning", redacted: true });
   assert.equal(containsLikelySecret(decoratedProse), true);
@@ -237,7 +237,7 @@ test("terminal display-state controls fail closed instead of preserving decoy te
 test("LF and CRLF remain normal line breaks while lone CR fails closed", () => {
   const safeLf = "first line\nsecond line";
   const safeCrLf = "first line\r\nsecond line";
-  const secretCrLf = "safe\r\nAPI_KEY=crlf-secret";
+  const secretCrLf = "safe\r\nAPI_KEY=crlf-secret"; // gitleaks:allow -- synthetic scrubber fixture
   const loneCr = "safe\rAPI_KEY=lone-cr-secret";
 
   assert.deepEqual(redactSecrets(safeLf), { value: safeLf, redacted: false });
@@ -355,12 +355,12 @@ test("redacts complete authorization header values independent of scheme or leng
 
 test("redacts high-confidence standalone provider credentials", () => {
   const credentials = [
-    "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghij",
-    "github_pat_ABCDEFGHIJKLMNOPQRSTUVWXYZ_abcdefghij",
-    "AKIAABCDEFGHIJKLMNOP",
-    "ASIAABCDEFGHIJKLMNOP",
-    "sk-proj-ABCDEFGHIJKLMNOPQRSTUVWXYZ123456",
-    "sk-ant-ABCDEFGHIJKLMNOPQRSTUVWXYZ123456",
+    "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghij", // gitleaks:allow -- synthetic provider fixture
+    "github_pat_ABCDEFGHIJKLMNOPQRSTUVWXYZ_abcdefghij", // gitleaks:allow -- synthetic provider fixture
+    "AKIAABCDEFGHIJKLMNOP", // gitleaks:allow -- synthetic provider fixture
+    "ASIAABCDEFGHIJKLMNOP", // gitleaks:allow -- synthetic provider fixture
+    "sk-proj-ABCDEFGHIJKLMNOPQRSTUVWXYZ123456", // gitleaks:allow -- synthetic provider fixture
+    "sk-ant-ABCDEFGHIJKLMNOPQRSTUVWXYZ123456", // gitleaks:allow -- synthetic provider fixture
     "xoxb-" + "123456789012-ABCDEFGHIJKLMNOPQRSTUVWXYZ",
     "sk_" + "live_ABCDEFGHIJKLMNOPQRSTUVWXYZ",
   ];
@@ -588,9 +588,9 @@ test("does not treat token metadata or nonsecret prose identifiers as credential
 test("redaction is idempotent for query and assignment placeholders", () => {
   const source = [
     "https://example.test/?token=query-example-value&mode=safe",
-    "OPENAI_API_KEY=openai-example-value",
-    'clientSecret = "client-example-value"',
-    "session_token=[REDACTED]actual-secret-value",
+    "OPENAI_API_KEY=openai-example-value", // gitleaks:allow -- synthetic scrubber fixture
+    'clientSecret = "client-example-value"', // gitleaks:allow -- synthetic scrubber fixture
+    "session_token=[REDACTED]actual-secret-value", // gitleaks:allow -- synthetic scrubber fixture
     "Authorization: [REDACTED] trailing-secret-value",
   ].join("\n");
 

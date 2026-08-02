@@ -3,10 +3,11 @@ import test from "node:test";
 import type { HermesRuntimeSource } from "./hermes-backend.js";
 import {
   HermesKanbanAdapter,
+  HermesKanbanCommitUnconfirmedError,
   type HermesKanbanRequest,
 } from "./hermes-kanban.js";
 import { createDemoRuntimeStatus, createDemoSnapshot } from "./demo-state.js";
-import { createOfficeServer } from "./server.js";
+import { createStudioServer } from "./server.js";
 
 const ORIGIN = "http://localhost:4173";
 const RAW_CARD = {
@@ -22,7 +23,7 @@ const RAW_CARD = {
   latest_summary: null,
   comment_count: 0,
   workspace_path: "/Users/private/repository",
-  api_key: "never-return-this",
+  api_key: "never-return-this", // gitleaks:allow -- synthetic rejection fixture
 };
 
 function makeFixture(cardCount = 1) {
@@ -48,7 +49,7 @@ function makeFixture(cardCount = 1) {
           assignees: ["mina"],
           latest_event_id: 3,
           now: 200,
-          access_token: "never-return-this",
+          access_token: "never-return-this", // gitleaks:allow -- synthetic rejection fixture
         };
       }
       if (request.path.endsWith("/comments")) return { ok: true };
@@ -74,7 +75,7 @@ function makeFixture(cardCount = 1) {
 
 test("Kanban responses use a bounded response budget independent from request bodies", async () => {
   const fixture = makeFixture(1_000);
-  const server = createOfficeServer({ port: 0, runtimeSource: fixture.runtime, maxJsonBytes: 4 * 1024, allowedOrigins: [ORIGIN] });
+  const server = createStudioServer({ port: 0, runtimeSource: fixture.runtime, maxJsonBytes: 4 * 1024, allowedOrigins: [ORIGIN] });
   const address = await server.listen();
   const base = `http://127.0.0.1:${address.port}`;
   try {
@@ -109,7 +110,7 @@ function headers(session: { cookie: string; csrf?: string }): Record<string, str
 
 test("Kanban board and card reads require a session and return secret-safe DTOs", async () => {
   const fixture = makeFixture();
-  const server = createOfficeServer({ port: 0, runtimeSource: fixture.runtime, allowedOrigins: [ORIGIN] });
+  const server = createStudioServer({ port: 0, runtimeSource: fixture.runtime, allowedOrigins: [ORIGIN] });
   const address = await server.listen();
   const base = `http://127.0.0.1:${address.port}`;
   try {
@@ -138,7 +139,7 @@ test("Kanban board and card reads require a session and return secret-safe DTOs"
 
 test("Kanban mutations require CSRF and expose create/update/status/assignee/comment routes", async () => {
   const fixture = makeFixture();
-  const server = createOfficeServer({ port: 0, runtimeSource: fixture.runtime, allowedOrigins: [ORIGIN] });
+  const server = createStudioServer({ port: 0, runtimeSource: fixture.runtime, allowedOrigins: [ORIGIN] });
   const address = await server.listen();
   const base = `http://127.0.0.1:${address.port}`;
   try {
@@ -187,7 +188,7 @@ test("Kanban mutations require CSRF and expose create/update/status/assignee/com
     });
     assert.equal(comment.status, 201);
     assert.equal(fixture.requests.length, 5);
-    assert.deepEqual(fixture.requests[4]?.body, { body: "Please continue", author: "hermes-office" });
+    assert.deepEqual(fixture.requests[4]?.body, { body: "Please continue", author: "hermes-studio" });
   } finally {
     await server.close();
   }
@@ -195,7 +196,7 @@ test("Kanban mutations require CSRF and expose create/update/status/assignee/com
 
 test("Kanban HTTP boundary rejects unknown fields, unsafe transitions, and oversized JSON", async () => {
   const fixture = makeFixture();
-  const server = createOfficeServer({ port: 0, runtimeSource: fixture.runtime, maxJsonBytes: 32 * 1024, allowedOrigins: [ORIGIN] });
+  const server = createStudioServer({ port: 0, runtimeSource: fixture.runtime, maxJsonBytes: 32 * 1024, allowedOrigins: [ORIGIN] });
   const address = await server.listen();
   const base = `http://127.0.0.1:${address.port}`;
   try {
@@ -232,6 +233,33 @@ test("Kanban HTTP boundary rejects unknown fields, unsafe transitions, and overs
     });
     assert.equal(oversized.status, 413);
     assert.equal(fixture.requests.length, 0);
+  } finally {
+    await server.close();
+  }
+});
+
+test("Kanban POST ambiguity returns a non-retryable commit-unconfirmed contract", async () => {
+  const fixture = makeFixture();
+  const adapter = new HermesKanbanAdapter({
+    listAllowedProfiles: () => ["mina"],
+    request: async () => { throw new HermesKanbanCommitUnconfirmedError(); },
+  });
+  const runtime = { ...fixture.runtime, kanban: () => adapter };
+  const server = createStudioServer({ port: 0, runtimeSource: runtime, allowedOrigins: [ORIGIN] });
+  const address = await server.listen();
+  try {
+    const session = await bootstrap(`http://127.0.0.1:${address.port}`);
+    const response = await fetch(`http://127.0.0.1:${address.port}/api/v1/kanban/cards`, {
+      method: "POST",
+      headers: { ...headers({ ...session, csrf: session.csrf }), "Content-Type": "application/json" },
+      body: JSON.stringify({ title: "Maybe created" }),
+    });
+    assert.equal(response.status, 409);
+    assert.deepEqual(await response.json(), {
+      code: "commit_unconfirmed",
+      message: "Hermes may have committed this Kanban change; refresh before retrying.",
+      retryable: false,
+    });
   } finally {
     await server.close();
   }

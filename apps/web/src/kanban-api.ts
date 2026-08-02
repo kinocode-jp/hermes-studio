@@ -34,13 +34,14 @@ export class KanbanMutationFailure extends Error {
 }
 
 /**
- * A 4xx response (other than Request Timeout) proves that Office Server
+ * A 4xx response (other than Request Timeout) proves that Studio Server
  * rejected the request. Transport failures, 5xx responses, and invalid 2xx
  * bodies happen after a non-idempotent request may have committed, so callers
  * must not present them as safe-to-retry failures.
  */
 export function classifyKanbanMutationFailure(error: unknown): KanbanMutationFailureKind {
   if (error instanceof KanbanMutationFailure) return error.kind;
+  if (error instanceof OfficeHttpError && error.code === "commit_unconfirmed") return "commit-unknown";
   if (error instanceof OfficeHttpError && error.status >= 400 && error.status < 500 && error.status !== 408) {
     return "rejected";
   }

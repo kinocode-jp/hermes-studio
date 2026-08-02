@@ -1,6 +1,16 @@
 const DEFAULT_PROFILE = "default";
-export const MAX_CHAT_SESSION_LEASES_PER_OWNER = 4;
+// Visible panes are not capped by these values. They bound simultaneous live
+// Hermes leases while dispatcher workflows may also keep delegated or closing
+// runs alive off-screen. Operators can tune these host defaults.
+export const MAX_CHAT_SESSION_LEASES_PER_OWNER = 16;
+export const MAX_CHAT_SESSION_LEASES_PER_PROFILE = 8;
 export const MAX_CHAT_SESSION_LEASES_TOTAL = 256;
+
+export interface ChatSessionCoordinatorOptions {
+  maxLeasesPerOwner?: number;
+  maxLeasesPerProfile?: number;
+  maxLeasesTotal?: number;
+}
 
 export type ChatSessionOwner = object;
 
@@ -28,17 +38,27 @@ type Lease = {
 };
 
 export class ChatSessionCoordinator {
+  readonly #maxLeasesPerOwner: number;
+  readonly #maxLeasesPerProfile: number;
+  readonly #maxLeasesTotal: number;
   readonly #durable = new Map<string, Map<string, Lease>>();
   readonly #live = new Map<string, Lease>();
   readonly #leases = new Map<symbol, Lease>();
   readonly #owners = new Map<ChatSessionOwner, Set<symbol>>();
   readonly #closingLive = new Map<string, symbol>();
 
+  constructor(options: ChatSessionCoordinatorOptions = {}) {
+    this.#maxLeasesPerOwner = positiveInteger(options.maxLeasesPerOwner, MAX_CHAT_SESSION_LEASES_PER_OWNER, 1, 128);
+    this.#maxLeasesPerProfile = positiveInteger(options.maxLeasesPerProfile, MAX_CHAT_SESSION_LEASES_PER_PROFILE, 1, this.#maxLeasesPerOwner);
+    this.#maxLeasesTotal = positiveInteger(options.maxLeasesTotal, MAX_CHAT_SESSION_LEASES_TOTAL, this.#maxLeasesPerOwner, 4_096);
+  }
+
   claimCreate(owner: ChatSessionOwner, profile: string | undefined): ChatSessionClaim {
-    if (!this.canCreateLease(owner)) {
+    const normalized = normalizedProfile(profile);
+    if (!this.canCreateLease(owner, normalized)) {
       throw new Error("Chat session lease limit reached.");
     }
-    return this.#claim(this.#newLease(owner, normalizedProfile(profile)));
+    return this.#claim(this.#newLease(owner, normalized));
   }
 
   claimResume(owner: ChatSessionOwner, profile: string | undefined, requestedId: string): ChatSessionClaim | undefined {
@@ -49,7 +69,7 @@ export class ChatSessionCoordinator {
         ? this.#claim(existing)
         : undefined;
     }
-    if (!this.canCreateLease(owner)) return undefined;
+    if (!this.canCreateLease(owner, normalized)) return undefined;
     const lease = this.#newLease(owner, normalized);
     this.#bindDurableAliases(lease, [requestedId]);
     return this.#claim(lease);
@@ -123,6 +143,11 @@ export class ChatSessionCoordinator {
     return this.#live.get(sessionId)?.owner;
   }
 
+  /** Profile bound to a live Hermes session id, if Office currently owns the lease. */
+  profileForLive(sessionId: string): string | undefined {
+    return this.#live.get(sessionId)?.profile;
+  }
+
   /** Authorizes commands, so it is intentionally absent during close settlement. */
   liveLeaseToken(owner: ChatSessionOwner, liveSessionId: string): symbol | undefined {
     const lease = this.#live.get(liveSessionId);
@@ -157,9 +182,15 @@ export class ChatSessionCoordinator {
     return this.#owners.get(owner)?.size ?? 0;
   }
 
-  canCreateLease(owner: ChatSessionOwner): boolean {
-    return this.ownerLeaseCount(owner) < MAX_CHAT_SESSION_LEASES_PER_OWNER
-      && this.#leases.size < MAX_CHAT_SESSION_LEASES_TOTAL;
+  canCreateLease(owner: ChatSessionOwner, profile?: string): boolean {
+    if (this.ownerLeaseCount(owner) >= this.#maxLeasesPerOwner || this.#leases.size >= this.#maxLeasesTotal) return false;
+    if (profile === undefined) return true;
+    const normalized = normalizedProfile(profile);
+    let profileCount = 0;
+    for (const token of this.#owners.get(owner) ?? []) {
+      if (this.#leases.get(token)?.profile === normalized) profileCount += 1;
+    }
+    return profileCount < this.#maxLeasesPerProfile;
   }
 
   ownsDurableSession(owner: ChatSessionOwner, profile: string | undefined, sessionId: string): boolean {
@@ -299,4 +330,10 @@ export class ChatSessionCoordinator {
 
 function normalizedProfile(profile: string | undefined): string {
   return profile ?? DEFAULT_PROFILE;
+}
+
+function positiveInteger(value: number | undefined, fallback: number, min: number, max: number): number {
+  return value === undefined || !Number.isFinite(value)
+    ? fallback
+    : Math.min(max, Math.max(min, Math.trunc(value)));
 }

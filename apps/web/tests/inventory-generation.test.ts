@@ -7,6 +7,7 @@ import { defaultAvatarOrdinal } from "../src/avatar-preferences.ts";
 import { characterHueRotation } from "../src/components/character-portrait.tsx";
 import { locale, localizeRuntimeMessage, setLocale } from "../src/i18n.ts";
 import { storedSessionClientId } from "../src/session-identity.ts";
+import { chatComposerState, clearChatComposerState, setChatComposerAttachments, setChatComposerDraft } from "../src/chat-composer-state.ts";
 import { activeSessionId, applyChatGatewayEvent, applyOfficeSnapshot, interruptSession, openSessionIds, profileList, registerChatRuntime, selectedProfileId, sessions } from "../src/store.ts";
 
 test("a complete session generation upserts extras, prunes unseen rows, and releases an open target once", async () => {
@@ -85,6 +86,29 @@ test("initial snapshots use the same non-regressing runtime status merge and acc
   applyOfficeSnapshot(snapshot({ sessions: [stored("p0", "runtime", "Runtime", "idle")], sequence: 2 }), serverUrl);
   assert.equal(sessions.value[0]?.status, "ready");
   assert.equal(sessions.value[0]?.messages[0]?.status, "complete");
+});
+
+test("an authoritative initial snapshot clears composer data for a removed session", () => {
+  const serverUrl = "http://127.0.0.1:55209";
+  const removedId = storedSessionClientId("p0", "removed-composer");
+  clearChatComposerState(removedId);
+  profileList.value = [profile("p0")];
+  sessions.value = [storedClient("p0", "removed-composer", "Removed")];
+  setChatComposerDraft(removedId, "unsent text");
+  setChatComposerAttachments(removedId, [{
+    id: "inline-image",
+    name: "image.png",
+    mime: "image/png",
+    size: 3,
+    kind: "image",
+    dataUrl: "data:image/png;base64,AAAA",
+  }]);
+
+  applyOfficeSnapshot(snapshot({ sessions: [] }), serverUrl);
+
+  assert.equal(sessions.value.some((session) => session.id === removedId), false);
+  assert.deepEqual(chatComposerState(removedId).value, { draft: "", attachments: [] });
+  clearChatComposerState(removedId);
 });
 
 test("profile pages upsert server fields, preserve UI fields, and prune only at a complete terminal", async () => {
@@ -295,17 +319,17 @@ test("a deferred terminal from an older generation cannot prune the newer genera
 test("profile and session continuation errors localize at render time for every known failure", async () => {
   const browser = installBrowserGlobals();
   const previousLocale = locale.value;
-  const [officeSceneSource, profilePanelSource] = await Promise.all([
+  const [officeSceneSource, sideRailSource] = await Promise.all([
     readFile(new URL("../src/components/office-scene.tsx", import.meta.url), "utf8"),
-    readFile(new URL("../src/components/profile-panel.tsx", import.meta.url), "utf8")
+    readFile(new URL("../src/components/side-rail.tsx", import.meta.url), "utf8")
   ]);
   assert.match(officeSceneSource, /localizeRuntimeMessage\(inventory\.error\)/);
-  assert.match(profilePanelSource, /localizeRuntimeMessage\(inventory\.error\)/);
+  assert.match(sideRailSource, /localizeRuntimeMessage\(inventory\.error\)/);
 
   const cases = [
-    { failure: "invalid" as const, ja: "Office Serverの一覧ページに互換性がありません。", en: "The Office Server returned an incompatible inventory page." },
-    { failure: "snapshot" as const, ja: "Office Serverの一覧を更新できませんでした。もう一度お試しください。", en: "Unable to refresh the Office Server inventory. Try again." },
-    { failure: "http" as const, ja: "Office Serverから一覧を取得できませんでした（HTTP 503）。", en: "Unable to load the inventory from Office Server (HTTP 503)." }
+    { failure: "invalid" as const, ja: "Studio Serverの一覧ページに互換性がありません。", en: "The Studio Server returned an incompatible inventory page." },
+    { failure: "snapshot" as const, ja: "Studio Serverの一覧を更新できませんでした。もう一度お試しください。", en: "Unable to refresh the Studio Server inventory. Try again." },
+    { failure: "http" as const, ja: "Studio Serverから一覧を取得できませんでした（HTTP 503）。", en: "Unable to load the inventory from Studio Server (HTTP 503)." }
   ];
   try {
     let requestGeneration = 100;

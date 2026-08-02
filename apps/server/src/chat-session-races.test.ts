@@ -5,7 +5,7 @@ import { WebSocket } from "ws";
 import type { HermesRuntimeSource } from "./hermes-backend.js";
 import { HermesChatTransportError, type HermesChatEvent, type HermesChatRequest, type HermesChatResult } from "./hermes-chat.js";
 import { ChatDeviceRateLimiter, handleOfficeChatConnection } from "./chat-gateway.js";
-import { ChatSessionCoordinator, MAX_CHAT_SESSION_LEASES_PER_OWNER, MAX_CHAT_SESSION_LEASES_TOTAL } from "./chat-session-coordinator.js";
+import { ChatSessionCoordinator, MAX_CHAT_SESSION_LEASES_PER_OWNER, MAX_CHAT_SESSION_LEASES_PER_PROFILE, MAX_CHAT_SESSION_LEASES_TOTAL } from "./chat-session-coordinator.js";
 import { ChatUpstreamHub } from "./chat-upstream-hub.js";
 import { OfficeAuth, type OfficeAuthSession } from "./office-auth.js";
 
@@ -328,7 +328,7 @@ test("approval and clarification tokens do not cross same-owner live-id reuse", 
   client.rpc(89, "session.resume", { session_id: "parent", profile: "coder" });
   await settle(4);
   client.rpc(87, "approval.respond", { session_id: "live-old", approval_id: approvalId, choice: "deny" });
-  client.rpc(88, "clarify.respond", { request_id: "q-closed", answer: "no" });
+  client.rpc(88, "clarify.respond", { session_id: "live-old", request_id: "q-closed", answer: "no" });
   await settle(4);
 
   assert.equal(client.errorCode(87), -32004);
@@ -339,7 +339,7 @@ test("approval and clarification tokens do not cross same-owner live-id reuse", 
   hermes.publish({ type: "clarify.request", sessionId: "live-old", payload: { requestId: "q-new-lease", question: "New?" } });
   await settle();
   client.rpc(81, "approval.respond", { session_id: "live-old", approval_id: client.approvalId("live-old"), choice: "once" });
-  client.rpc(82, "clarify.respond", { request_id: "q-new-lease", answer: "yes" });
+  client.rpc(82, "clarify.respond", { session_id: "live-old", request_id: "q-new-lease", answer: "yes" });
   await settle(4);
   assert.deepEqual(hermes.interactionRequests, ["approval.respond", "clarify.respond"]);
 });
@@ -358,7 +358,7 @@ test("stale approval and clarification cannot cross close and live-id reuse", as
   hermes.publish({ type: "clarify.request", sessionId: "live-old", payload: { requestId: "q-owned", question: "Continue?" } });
   await settle();
   original.rpc(91, "approval.respond", { session_id: "live-old", approval_id: original.approvalId("live-old"), choice: "once" });
-  original.rpc(92, "clarify.respond", { request_id: "q-owned", answer: "yes" });
+  original.rpc(92, "clarify.respond", { session_id: "live-old", request_id: "q-owned", answer: "yes" });
   await settle(4);
   assert.deepEqual(hermes.interactionRequests, ["approval.respond", "clarify.respond"]);
 
@@ -372,7 +372,7 @@ test("stale approval and clarification cannot cross close and live-id reuse", as
   await settle(4);
 
   original.rpc(95, "approval.respond", { session_id: "live-old", approval_id: staleApprovalId, choice: "deny" });
-  original.rpc(96, "clarify.respond", { request_id: "q-stale", answer: "no" });
+  original.rpc(96, "clarify.respond", { session_id: "live-old", request_id: "q-stale", answer: "no" });
   await settle(4);
   assert.equal(original.errorCode(95), -32004);
   assert.equal(original.errorCode(96), -32004);
@@ -382,7 +382,7 @@ test("stale approval and clarification cannot cross close and live-id reuse", as
   hermes.publish({ type: "clarify.request", sessionId: "live-old", payload: { requestId: "q-reused", question: "New owner?" } });
   await settle();
   replacement.rpc(97, "approval.respond", { session_id: "live-old", approval_id: replacement.approvalId("live-old"), choice: "once" });
-  replacement.rpc(98, "clarify.respond", { request_id: "q-reused", answer: "yes" });
+  replacement.rpc(98, "clarify.respond", { session_id: "live-old", request_id: "q-reused", answer: "yes" });
   await settle(4);
   assert.deepEqual(hermes.interactionRequests, [
     "approval.respond", "clarify.respond", "approval.respond", "clarify.respond",
@@ -401,7 +401,7 @@ test("failed claimed interactions cannot restore across same-owner lease reuse",
   await settle();
   hermes.holdInteractions();
   client.rpc(101, "approval.respond", { session_id: "live-old", approval_id: client.approvalId("live-old"), choice: "once" });
-  client.rpc(102, "clarify.respond", { request_id: "q-generation", answer: "old" });
+  client.rpc(102, "clarify.respond", { session_id: "live-old", request_id: "q-generation", answer: "old" });
   await settle();
 
   client.rpc(103, "session.close", { session_id: "live-old" });
@@ -414,11 +414,11 @@ test("failed claimed interactions cannot restore across same-owner lease reuse",
   const newApprovalId = client.approvalId("live-old");
   hermes.rejectHeldInteractions();
   await settle(4);
-  assert.equal(client.errorCode(101), -32000);
-  assert.equal(client.errorCode(102), -32000);
+  assert.equal(client.errorCode(101), -32008);
+  assert.equal(client.errorCode(102), -32008);
 
   client.rpc(105, "approval.respond", { session_id: "live-old", approval_id: newApprovalId, choice: "deny" });
-  client.rpc(106, "clarify.respond", { request_id: "q-generation", answer: "new" });
+  client.rpc(106, "clarify.respond", { session_id: "live-old", request_id: "q-generation", answer: "new" });
   await settle(4);
   assert.equal(client.errorCode(105), undefined);
   assert.equal(client.errorCode(106), undefined);
@@ -459,6 +459,16 @@ test("session coordinator bounds owner and process-wide pending leases", () => {
   assert.throws(() => coordinator.claimCreate({}, "overflow"), /lease limit/);
   coordinator.releaseOwner(owners[0]!);
   assert.equal(coordinator.canCreateLease({}), true);
+});
+
+test("session coordinator bounds one profile without blocking another profile for the same owner", () => {
+  const coordinator = new ChatSessionCoordinator();
+  const owner = {};
+  for (let index = 0; index < MAX_CHAT_SESSION_LEASES_PER_PROFILE; index += 1) {
+    coordinator.claimCreate(owner, "default");
+  }
+  assert.equal(coordinator.canCreateLease(owner, "default"), false);
+  assert.equal(coordinator.canCreateLease(owner, "dragonite"), true);
 });
 
 test("an owned close reservation blocks rebind after a lease release TOCTOU", () => {
@@ -520,6 +530,19 @@ test("an invalid create with a live id closes the unowned session", async () => 
   assert.deepEqual(hermes.sessionCloseRequests, ["live-invalid"]);
   assert.equal(hermes.isLive("live-invalid"), false);
   assert.equal(client.events("live-invalid").length, 0);
+});
+
+test("a new-chat create never accepts a resumed durable identity", async () => {
+  const { hermes, dependencies } = setup();
+  const client = new FakeWebSocket();
+  handleOfficeChatConnection(client as unknown as WebSocket, dependencies);
+  await settle();
+  client.rpc(21, "session.create", { profile: "coder", title: "Resumed identity" });
+  await settle();
+
+  assert.equal(client.errorCode(21), -32000);
+  assert.deepEqual(hermes.sessionCloseRequests, ["live-resumed-create"]);
+  assert.equal(hermes.isLive("live-resumed-create"), false);
 });
 
 test("an authoritative already-absent close result does not reset existing owners", async () => {
@@ -710,6 +733,10 @@ class RaceFakeHermes {
       return { method: request.method, value: { closed: this.#live.delete(liveId) } };
     }
     if (request.method === "session.create") {
+      if (request.params?.title === "Resumed identity") {
+        this.#live.add("live-resumed-create");
+        return { method: request.method, value: { liveSessionId: "live-resumed-create", resumedSessionId: "old-durable", running: false } };
+      }
       if (request.params?.title === "Invalid identity") {
         this.#live.add("live-invalid");
         this.#event?.({ type: "message.delta", sessionId: "live-invalid", payload: { text: "must be discarded" } });

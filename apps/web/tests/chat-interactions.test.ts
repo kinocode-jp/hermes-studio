@@ -2,8 +2,9 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import type { ChatSession, OfficeSnapshot } from "../src/domain.ts";
 import { approvalChoicesForAccess } from "../src/components/chat-pane.tsx";
-import { applyChatGatewayEvent, applyChatHistory, officeSnapshot, reduceChatGatewayEvent, registerChatRuntime, respondToApproval, sessions } from "../src/store.ts";
+import { applyChatGatewayEvent, applyChatHistory, officeSnapshot, reduceChatGatewayEvent, registerChatRuntime, respondToApproval, sendMessage, sessions } from "../src/store.ts";
 import { localizeRuntimeMessage } from "../src/i18n.ts";
+import { commitUnconfirmedRpcError } from "../src/chat-rpc-results.ts";
 
 const session: ChatSession = {
   id: "client-1",
@@ -104,6 +105,32 @@ test("local owner capability preserves an explicitly allowed permanent approval"
   } finally { officeSnapshot.value = undefined; }
 });
 
+test("only the matching expired interaction is cleared", () => {
+  const approval = reduceChatGatewayEvent(session, {
+    type: "approval.request", liveSessionId: "live-1",
+    payload: { approvalId: "approval-old", choices: ["once"], allowPermanent: false },
+  });
+  const staleExpiry = reduceChatGatewayEvent(approval, {
+    type: "approval.expired", liveSessionId: "live-1", payload: { approvalId: "approval-other" },
+  });
+  assert.equal(staleExpiry, approval);
+  const clearedApproval = reduceChatGatewayEvent(approval, {
+    type: "approval.expired", liveSessionId: "live-1", payload: { approvalId: "approval-old" },
+  });
+  assert.equal(clearedApproval.pendingInteraction, undefined);
+  assert.equal(clearedApproval.status, "streaming");
+
+  const clarification = reduceChatGatewayEvent(session, {
+    type: "clarify.request", liveSessionId: "live-1",
+    payload: { requestId: "question-old", question: "Continue?" },
+  });
+  const clearedClarification = reduceChatGatewayEvent(clarification, {
+    type: "clarify.expired", liveSessionId: "live-1", payload: { requestId: "question-old" },
+  });
+  assert.equal(clearedClarification.pendingInteraction, undefined);
+  assert.equal(clearedClarification.status, "streaming");
+});
+
 test("approval UI hides permanent choice without current capability", () => {
   const interaction = {
     id: "approval:ui", kind: "approval" as const, approvalId: "ui", choices: ["once", "always", "deny"] as const,
@@ -146,6 +173,18 @@ test("an older approval completion cannot clear a newly promoted approval", asyn
   await submissionB;
   assert.deepEqual(submitted, ["approval-A", "approval-B"]);
   assert.equal(sessions.value[0]!.pendingInteraction?.id, "approval:approval-C");
+});
+
+test("a commit-unconfirmed slash command is treated as submitted and cannot invite replay", async () => {
+  registerChatRuntime({
+    ensureSession() {}, releaseSession() {}, submitPrompt() {}, async steer() { return { status: "queued" }; }, interrupt() {},
+    async execSlash() { throw commitUnconfirmedRpcError("unknown commit"); },
+    async respondClarify() {}, async respondApproval() {},
+  });
+  sessions.value = [{ ...session, status: "ready", liveSessionId: "live-1" }];
+
+  assert.equal(await sendMessage(session.id, "/undo"), true);
+  assert.equal(sessions.value[0]?.operationEvidence?.at(-1)?.state, "unconfirmed");
 });
 
 test("duplicate events retain submit lock and completion clears the interaction", () => {

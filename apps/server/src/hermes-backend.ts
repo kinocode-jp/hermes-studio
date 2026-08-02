@@ -1,7 +1,5 @@
 import { randomBytes } from "node:crypto";
 import { spawn, type ChildProcessByStdio } from "node:child_process";
-import { homedir } from "node:os";
-import { join } from "node:path";
 import type { Readable } from "node:stream";
 import type {
   KanbanBoardSummary,
@@ -10,20 +8,32 @@ import type {
   OfficeInventoryMetadata,
   OfficeSnapshot,
   RuntimeStatus,
-} from "@hermes-office/protocol";
-import { OFFICE_PROTOCOL_VERSION } from "./demo-state.js";
+} from "@hermes-studio/protocol";
+import { brandStatePath } from "./brand-env.js";
+import { STUDIO_SERVER_PROTOCOL_VERSION } from "./demo-state.js";
 import { createHermesChatTransport, type HermesChatTransport } from "./hermes-chat.js";
 import { createHermesChildEnvironment, discardHermesChildOutput } from "./hermes-child-environment.js";
-import { collectHermesInventory, HermesInventoryCache, type CollectedHermesInventory, type HermesJsonResult } from "./hermes-inventory.js";
+import {
+  collectHermesInventory,
+  HermesInventoryCache,
+  type CollectedHermesInventory,
+  type HermesJsonResult,
+} from "./hermes-inventory.js";
 import { createHermesKanbanHttpRequester, HermesKanbanAdapter } from "./hermes-kanban.js";
 import { GlobalInheritanceCoordinator } from "./global-inheritance.js";
 import { HermesProfileBackendPool } from "./hermes-profile-pool.js";
-import { isSupportedHermesVersion, probeHermesCli } from "./hermes-runtime.js";
+import { isRecognizedHermesVersion, probeHermesCli } from "./hermes-runtime.js";
 import {
   createHermesSettingsAdapter,
   OfficeGlobalSettingsStore,
+  type HermesProfileBackendAccess,
+  type HermesProfileBackendResolveOptions,
   type HermesSettingsAdapter,
 } from "./hermes-settings.js";
+import { createHermesModelsAdapter, type HermesModelsAdapter } from "./hermes-models.js";
+import { createHermesProjectsAdapter, type HermesProjectsAdapter } from "./hermes-projects.js";
+import { OfficeAgentBehaviorStore } from "./office-agent-behavior.js";
+import type { OfficeTeamSkillLayer } from "./office-teams.js";
 
 const START_TIMEOUT_MS = 20_000;
 const REQUEST_TIMEOUT_MS = 5_000;
@@ -31,6 +41,8 @@ const MAX_RESPONSE_BYTES = 2 * 1024 * 1024;
 const MAX_START_OUTPUT = 32 * 1024;
 const MANAGED_RESTART_ATTEMPTS = 3;
 const MANAGED_RESTART_BACKOFF_MS = 250;
+const CHILD_STOP_GRACE_MS = 3_000;
+const CHILD_SETTLEMENT_GRACE_MS = 1_000;
 
 export interface HermesBackendOptions {
   executable?: string;
@@ -39,22 +51,51 @@ export interface HermesBackendOptions {
   startTimeoutMs?: number;
   requestTimeoutMs?: number;
   globalSettingsPath?: string;
+  agentBehaviorPath?: string;
   maxProfileBackends?: number;
   managedRestartAttempts?: number;
   managedRestartBackoffMs?: number;
+  /** Test/custom resolver for APIs whose storage is scoped by HERMES_HOME. */
+  resolveProfileBackend?(profile: string, options?: HermesProfileBackendResolveOptions): Promise<HermesProfileBackendAccess>;
+  /** Middle inheritance tier: teams that contribute skills/context per profile. */
+  listTeamLayers?(): Promise<readonly OfficeTeamSkillLayer[]>;
 }
 
 export interface HermesRuntimeSource {
   status(): RuntimeStatus;
   snapshot(): Promise<OfficeSnapshot>;
   inventoryPage?(kind: OfficeInventoryKind, cursor: string, limit: number): Promise<OfficeInventoryPage>;
+  /** Permanently delete a durable Hermes session. Absent ids are treated as success. */
+  deleteSession?(profile: string, sessionId: string): Promise<void>;
+  deleteSessions?(profile: string, sessionIds: readonly string[]): Promise<void>;
+  /** Create a durable Hermes profile (proxied to upstream POST /api/profiles). */
+  createProfile?(name: string, options?: { cloneFromDefault?: boolean; description?: string }): Promise<void>;
+  /** Permanently delete a Hermes profile and its local state. */
+  deleteProfile?(name: string): Promise<void>;
   close(): Promise<void>;
   chat(options?: { maxEventBytes?: number }): HermesChatTransport;
   kanban(): HermesKanbanAdapter;
   settings?(): HermesSettingsAdapter;
+  models?(): HermesModelsAdapter;
+  projects?(): HermesProjectsAdapter;
   globalSettings?(): OfficeGlobalSettingsStore;
   globalInheritance?(): GlobalInheritanceCoordinator;
+  agentBehavior?(): OfficeAgentBehaviorStore;
   onStatusChange?(listener: (status: RuntimeStatus) => void): () => void;
+}
+
+export class HermesCommitUnconfirmedError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "HermesCommitUnconfirmedError";
+  }
+}
+
+export class HermesProfileError extends Error {
+  constructor(readonly code: "invalid" | "exists" | "not_found" | "default") {
+    super(`Hermes profile operation failed: ${code}.`);
+    this.name = "HermesProfileError";
+  }
 }
 
 type ManagedChild = ChildProcessByStdio<null, Readable, Readable>;
@@ -70,11 +111,15 @@ export class HermesBackend implements HermesRuntimeSource {
   #state: RuntimeStatus;
   #sequence = 0;
   readonly #profilePool: HermesProfileBackendPool;
+  readonly #resolveProfileBackend: (profile: string, options?: HermesProfileBackendResolveOptions) => Promise<HermesProfileBackendAccess>;
   readonly #globalSettings: OfficeGlobalSettingsStore;
+  readonly #agentBehavior: OfficeAgentBehaviorStore;
   readonly #inventory = new HermesInventoryCache();
   #snapshotRefresh: SnapshotRefresh | undefined;
   #globalInheritance?: GlobalInheritanceCoordinator;
   #settingsAdapter?: HermesSettingsAdapter;
+  #modelsAdapter?: HermesModelsAdapter;
+  #projectsAdapter?: HermesProjectsAdapter;
   #childGeneration = 0;
   #connectionGeneration = 0;
   #startFlight: Promise<RuntimeStatus> | undefined;
@@ -93,8 +138,27 @@ export class HermesBackend implements HermesRuntimeSource {
       isKnownProfile: async (profile) => recordArray(await this.#requestJson("/api/profiles"), "profiles")
         .some((item) => item.name === profile),
     });
+    this.#resolveProfileBackend = options.resolveProfileBackend
+      ?? (async (profile, resolveOptions) => {
+        // The managed sidecar already owns the default HERMES_HOME. Starting
+        // `hermes --profile default serve` creates a second writer for the same
+        // state.db and log files, which can split live-session ownership after a
+        // reconnect. Reuse the primary sidecar and keep the lease API symmetric.
+        if (profile === "default") {
+          if (resolveOptions?.signal?.aborted === true
+            || (resolveOptions?.deadlineMs !== undefined && resolveOptions.deadlineMs <= Date.now())) {
+            throw new Error("Hermes profile backend acquisition timed out.");
+          }
+          const { baseUrl, token } = this.#connectionConfig();
+          return { baseUrl: baseUrl.origin, sessionToken: token, release: () => undefined };
+        }
+        return await this.#profilePool.resolve(profile, resolveOptions);
+      });
     this.#globalSettings = new OfficeGlobalSettingsStore(
-      options.globalSettingsPath ?? join(homedir(), ".hermes-office", "global-settings.json"),
+      options.globalSettingsPath ?? brandStatePath("global-settings.json"),
+    );
+    this.#agentBehavior = new OfficeAgentBehaviorStore(
+      options.agentBehaviorPath ?? brandStatePath("agent-behavior.json"),
     );
     this.#state = {
       mode: options.baseUrl === undefined ? "managed-sidecar" : "existing-local",
@@ -136,17 +200,43 @@ export class HermesBackend implements HermesRuntimeSource {
 
   settings(): HermesSettingsAdapter {
     this.#settingsAdapter ??= createHermesSettingsAdapter({
-      resolveProfileBackend: async (profile) => {
+      resolveProfileBackend: async (profile, resolveOptions) => {
         if (this.#state.state !== "ready") throw new Error("Hermes backend is not ready.");
-        return await this.#profilePool.resolve(profile);
+        return await this.#resolveProfileBackend(profile, resolveOptions);
       },
       ...(this.#options.requestTimeoutMs === undefined ? {} : { timeoutMs: this.#options.requestTimeoutMs }),
     });
     return this.#settingsAdapter;
   }
 
+  models(): HermesModelsAdapter {
+    this.#modelsAdapter ??= createHermesModelsAdapter({
+      resolveProfileBackend: async (profile, resolveOptions) => {
+        if (this.#state.state !== "ready") throw new Error("Hermes backend is not ready.");
+        return await this.#resolveProfileBackend(profile, resolveOptions);
+      },
+      ...(this.#options.requestTimeoutMs === undefined ? {} : { timeoutMs: this.#options.requestTimeoutMs }),
+    });
+    return this.#modelsAdapter;
+  }
+
+  projects(): HermesProjectsAdapter {
+    this.#projectsAdapter ??= createHermesProjectsAdapter({
+      resolveProfileBackend: async (profile, resolveOptions) => {
+        if (this.#state.state !== "ready") throw new Error("Hermes backend is not ready.");
+        return await this.#resolveProfileBackend(profile, resolveOptions);
+      },
+      ...(this.#options.requestTimeoutMs === undefined ? {} : { timeoutMs: this.#options.requestTimeoutMs }),
+    });
+    return this.#projectsAdapter;
+  }
+
   globalSettings(): OfficeGlobalSettingsStore {
     return this.#globalSettings;
+  }
+
+  agentBehavior(): OfficeAgentBehaviorStore {
+    return this.#agentBehavior;
   }
 
   globalInheritance(): GlobalInheritanceCoordinator {
@@ -155,6 +245,9 @@ export class HermesBackend implements HermesRuntimeSource {
       settings: this.settings(),
       listProfiles: async () => recordArray(await this.#requestJson("/api/profiles"), "profiles")
         .flatMap((profile) => typeof profile.name === "string" ? [profile.name] : []),
+      ...(this.#options.listTeamLayers === undefined
+        ? {}
+        : { listTeamLayers: this.#options.listTeamLayers }),
     });
     return this.#globalInheritance;
   }
@@ -191,7 +284,7 @@ export class HermesBackend implements HermesRuntimeSource {
           const cli = await probeHermesCli(executable, 5_000);
           if (this.#shutdownRequested) return this.status();
           if (cli.state !== "available" || cli.version === undefined) {
-            throw new IncompatibleHermesError("Hermes CLI is unavailable or unsupported.");
+            throw new Error("Hermes CLI is unavailable or unsupported.");
           }
           await this.#spawnManaged();
           if (this.#shutdownRequested) { await this.#stopChild(); return this.status(); }
@@ -215,18 +308,22 @@ export class HermesBackend implements HermesRuntimeSource {
       }
     }
     if (this.#shutdownRequested) return this.status();
+    const incompatible = lastError instanceof IncompatibleHermesError;
     this.#setState({
       ...this.#state,
-      state: lastError instanceof IncompatibleHermesError ? "incompatible" : "unreachable",
-      compatibilityMessage: lastError instanceof IncompatibleHermesError
+      state: incompatible ? "incompatible" : "unreachable",
+      compatibilityMessage: incompatible
         ? "HermesのAPI契約を確認してください。"
-        : "Hermes runtimeを起動できませんでした。",
+        : this.#options.baseUrl === undefined
+          ? "Hermes runtimeを起動できませんでした。再試行しています。"
+          : "Hermes runtimeを起動できませんでした。",
     });
+    if (!incompatible) this.#startRecovery();
     return this.status();
   }
 
   async snapshot(): Promise<OfficeSnapshot> {
-    if (this.#state.state !== "ready") return emptySnapshot(this.status(), ++this.#sequence);
+    if (this.#state.state !== "ready") return unavailableSnapshot(this.status(), ++this.#sequence);
 
     try {
       const connection = this.#captureConnection();
@@ -254,6 +351,58 @@ export class HermesBackend implements HermesRuntimeSource {
     return this.#inventory.page(kind, cursor, limit);
   }
 
+  async deleteSession(profile: string, sessionId: string): Promise<void> {
+    await this.deleteSessions(profile, [sessionId]);
+  }
+
+  async deleteSessions(profile: string, sessionIds: readonly string[]): Promise<void> {
+    if (this.#state.state !== "ready") throw new Error("Hermes backend is not ready.");
+    const safeProfile = requireProfile(profile);
+    const safeSessionIds = [...new Set(sessionIds.map(requireSessionId))];
+    if (safeSessionIds.length === 0 || safeSessionIds.length > 500) {
+      throw new Error("Hermes session delete batch size is invalid.");
+    }
+    await this.#deleteDurableSessions(safeProfile, safeSessionIds);
+    this.#inventory.clear();
+    this.#snapshotRefresh = undefined;
+  }
+
+  async createProfile(name: string, options?: { cloneFromDefault?: boolean; description?: string }): Promise<void> {
+    if (this.#state.state !== "ready") throw new Error("Hermes backend is not ready.");
+    const safeName = requireProfile(name);
+    try {
+      await this.#requestJson("/api/profiles", true, undefined, undefined, {
+        method: "POST",
+        body: {
+          name: safeName,
+          clone_from_default: options?.cloneFromDefault !== false,
+          ...(options?.description === undefined ? {} : { description: options.description }),
+        },
+      });
+    } catch (error) {
+      if (error instanceof IncompatibleHermesError && error.status === 400) throw new HermesProfileError("invalid");
+      if (error instanceof IncompatibleHermesError && error.status === 409) throw new HermesProfileError("exists");
+      throw error;
+    }
+    this.#inventory.clear();
+    this.#snapshotRefresh = undefined;
+  }
+
+  async deleteProfile(name: string): Promise<void> {
+    if (this.#state.state !== "ready") throw new Error("Hermes backend is not ready.");
+    const safeName = requireProfile(name);
+    if (safeName === "default") throw new HermesProfileError("default");
+    try {
+      await this.#requestJson(`/api/profiles/${encodeURIComponent(safeName)}`, true, undefined, undefined, { method: "DELETE" });
+    } catch (error) {
+      if (error instanceof IncompatibleHermesError && error.status === 400) throw new HermesProfileError("invalid");
+      if (error instanceof IncompatibleHermesError && error.status === 404) throw new HermesProfileError("not_found");
+      throw error;
+    }
+    this.#inventory.clear();
+    this.#snapshotRefresh = undefined;
+  }
+
   async #collectSnapshotData(connection: ConnectionGeneration): Promise<SnapshotCollection> {
     const current = this.#snapshotRefresh;
     if (current?.generation === connection.generation) return await current.promise;
@@ -277,6 +426,21 @@ export class HermesBackend implements HermesRuntimeSource {
       // Kanban is an optional, independently-failing feature. An unavailable
       // or incompatible board must not discard otherwise healthy inventory.
       return emptyBoards();
+    }
+  }
+
+  async #deleteDurableSessions(profile: string, sessionIds: readonly string[]): Promise<void> {
+    const result = await this.#requestJson(
+      "/api/sessions/bulk-delete",
+      true,
+      15_000,
+      undefined,
+      { method: "POST", body: { ids: sessionIds, profile } },
+    );
+    const deleted = isRecord(result) ? result.deleted : undefined;
+    if (!isRecord(result) || result.ok !== true || !Number.isSafeInteger(deleted)
+      || (deleted as number) < 0 || (deleted as number) > sessionIds.length) {
+      throw new Error("Hermes did not confirm durable session deletion.");
     }
   }
 
@@ -340,7 +504,7 @@ export class HermesBackend implements HermesRuntimeSource {
     const raw = await this.#requestJson("/api/status", false);
     const version = readString(raw, "version");
     if (version === undefined) throw new IncompatibleHermesError("Hermes status contract is unavailable.");
-    if (!isSupportedHermesVersion(version)) throw new IncompatibleHermesError("Hermes API version is unsupported.");
+    if (!isRecognizedHermesVersion(version)) throw new IncompatibleHermesError("Hermes API version is invalid.");
     return version;
   }
 
@@ -430,8 +594,14 @@ export class HermesBackend implements HermesRuntimeSource {
       && this.#token === connection.token;
   }
 
-  async #requestJson(path: string, authenticated = true): Promise<unknown> {
-    return (await this.#requestJsonResult(path, authenticated)).value;
+  async #requestJson(
+    path: string,
+    authenticated = true,
+    timeoutLimitMs?: number,
+    connection?: ConnectionGeneration,
+    init?: { method?: "GET" | "POST" | "DELETE"; body?: Record<string, unknown>; allowNotFound?: boolean },
+  ): Promise<unknown> {
+    return (await this.#requestJsonResult(path, authenticated, timeoutLimitMs, connection, init)).value;
   }
 
   async #requestJsonResult(
@@ -439,6 +609,7 @@ export class HermesBackend implements HermesRuntimeSource {
     authenticated = true,
     timeoutLimitMs?: number,
     connection?: ConnectionGeneration,
+    init?: { method?: "GET" | "POST" | "DELETE"; body?: Record<string, unknown>; allowNotFound?: boolean },
   ): Promise<HermesJsonResult> {
     const baseUrl = connection?.baseUrl ?? this.#baseUrl;
     if (baseUrl === undefined) throw new Error("Hermes backend is not configured.");
@@ -452,25 +623,44 @@ export class HermesBackend implements HermesRuntimeSource {
     const timeout = setTimeout(() => controller.abort(), timeoutMs);
     const token = connection?.token ?? this.#token;
     timeout.unref();
+    const method = init?.method ?? "GET";
     try {
       const response = await fetch(target, {
+        method,
         headers: {
           Accept: "application/json",
           ...(authenticated && token !== undefined ? { "X-Hermes-Session-Token": token } : {}),
+          ...(init?.body === undefined ? {} : { "Content-Type": "application/json" }),
         },
+        ...(init?.body === undefined ? {} : { body: JSON.stringify(init.body) }),
         redirect: "error",
         signal: controller.signal,
       });
       if (!response.ok) {
         const status = response.status;
         try { await response.body?.cancel(); } catch { /* Preserve the HTTP classification if body disposal fails. */ }
+        // Only callers whose resource contract explicitly makes absence
+        // idempotent may turn a 404 into success.
+        if (method === "DELETE" && status === 404 && init?.allowNotFound === true) {
+          return { value: { ok: true, absent: true }, bytes: 0 };
+        }
         if (status === 408 || status === 425 || status === 429 || status >= 500) {
           throw new Error(`Hermes temporarily returned ${status}.`);
         }
-        throw new IncompatibleHermesError(`Hermes returned ${status}.`);
+        throw new IncompatibleHermesError(`Hermes returned ${status}.`, status);
+      }
+      if (response.status === 204) {
+        return { value: { ok: true }, bytes: 0 };
       }
       const text = await readBoundedText(response, MAX_RESPONSE_BYTES);
+      if (text.trim() === "") return { value: { ok: true }, bytes: 0 };
       return { value: JSON.parse(text) as unknown, bytes: Buffer.byteLength(text) };
+    } catch (error) {
+      if (method === "POST" && !(error instanceof IncompatibleHermesError)
+        && !(error instanceof HermesCommitUnconfirmedError)) {
+        throw new HermesCommitUnconfirmedError("Hermes may have committed the profile creation; refresh profiles before retrying.");
+      }
+      throw error;
     } finally {
       clearTimeout(timeout);
     }
@@ -480,16 +670,7 @@ export class HermesBackend implements HermesRuntimeSource {
     const child = this.#child;
     this.#child = undefined;
     this.#invalidateConnection();
-    if (child === undefined || child.exitCode !== null) return;
-    child.kill("SIGTERM");
-    await new Promise<void>((resolve) => {
-      const timer = setTimeout(() => {
-        if (child.exitCode === null) child.kill("SIGKILL");
-        resolve();
-      }, 3_000);
-      timer.unref();
-      child.once("exit", () => { clearTimeout(timer); resolve(); });
-    });
+    await terminateManagedChild(child, CHILD_STOP_GRACE_MS, CHILD_SETTLEMENT_GRACE_MS);
   }
 
   #invalidateConnection(): void {
@@ -607,18 +788,13 @@ function makeSnapshot(runtime: RuntimeStatus, sequence: number, profiles: Office
   return {
     generatedAt: new Date().toISOString(), sequence,
     capabilities: {
-      protocolVersion: OFFICE_PROTOCOL_VERSION, serverVersion: "0.2.0", runtime,
+      protocolVersion: STUDIO_SERVER_PROTOCOL_VERSION, serverVersion: "0.2.0", runtime,
       access: { deviceId: "local-desktop", tier: "owner", exposure: "loopback", authentication: "desktop-capability", allowedOperations: ["state.read"] },
-      features: ["chat", "profiles", "skills", "memory", "kanban", "global-inheritance"],
+      features: ["chat", "profiles", "skills", "memory", "kanban", "teams", "global-inheritance"],
     },
     globalSettings: { sharedContextEnabled: true, sharedSkillsEnabled: true, revision: 1 },
     profiles, sessions, inventory, boards,
   };
-}
-
-function emptySnapshot(runtime: RuntimeStatus, sequence: number): OfficeSnapshot {
-  const empty = { returned: 0, available: 0, total: 0, hasMore: false, truncated: false, partialFailures: 0 };
-  return makeSnapshot(runtime, sequence, [], [], { profiles: empty, sessions: empty }, emptyBoards());
 }
 
 function unavailableSnapshot(runtime: RuntimeStatus, sequence: number): OfficeSnapshot {
@@ -631,4 +807,52 @@ function readString(value: unknown, key: string): string | undefined { const ite
 function isRecord(value: unknown): value is Record<string, unknown> { return typeof value === "object" && value !== null && !Array.isArray(value); }
 function bounded(value: number | undefined, fallback: number, min: number, max: number): number { return value === undefined || !Number.isFinite(value) ? fallback : Math.min(max, Math.max(min, Math.trunc(value))); }
 
-class IncompatibleHermesError extends Error {}
+class IncompatibleHermesError extends Error {
+  constructor(message: string, readonly status?: number) {
+    super(message);
+    this.name = "IncompatibleHermesError";
+  }
+}
+
+async function terminateManagedChild(
+  child: ManagedChild | undefined,
+  termGraceMs: number,
+  settlementGraceMs: number,
+): Promise<void> {
+  if (child === undefined || child.exitCode !== null || child.signalCode !== null) return;
+  await new Promise<void>((resolve) => {
+    let settled = false;
+    let killTimer: ReturnType<typeof setTimeout> | undefined;
+    let settlementTimer: ReturnType<typeof setTimeout> | undefined;
+    const finish = (): void => {
+      if (settled) return;
+      settled = true;
+      if (killTimer !== undefined) clearTimeout(killTimer);
+      if (settlementTimer !== undefined) clearTimeout(settlementTimer);
+      child.off("close", finish);
+      resolve();
+    };
+    child.once("close", finish);
+    child.kill("SIGTERM");
+    killTimer = setTimeout(() => {
+      if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+      settlementTimer = setTimeout(finish, settlementGraceMs);
+    }, termGraceMs);
+  });
+}
+
+
+const PROFILE_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
+const SESSION_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
+
+function requireProfile(value: string): string {
+  const profile = value.trim();
+  if (!PROFILE_ID_PATTERN.test(profile)) throw new Error("Profile identifier is invalid.");
+  return profile;
+}
+
+function requireSessionId(value: string): string {
+  const sessionId = value.trim();
+  if (!SESSION_ID_PATTERN.test(sessionId)) throw new Error("Session identifier is invalid.");
+  return sessionId;
+}

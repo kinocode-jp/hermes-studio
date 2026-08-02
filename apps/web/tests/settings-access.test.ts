@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import type { Operation } from "@hermes-office/protocol";
+import type { Operation } from "@hermes-studio/protocol";
 import type { OfficeSnapshot } from "../src/domain.ts";
 import { canMutateSettingsTab, settingsMutationAccess } from "../src/settings-access.ts";
 import { preserveConcurrentDraft } from "../src/settings-draft.ts";
@@ -30,6 +30,12 @@ function snapshot(allowedOperations: Operation[], tier: "operator" | "manager" |
 
 function emptyPage() { return { returned: 0, available: 0, total: 0, hasMore: false, truncated: false, partialFailures: 0 }; }
 
+const PRIVILEGED_OPS: Operation[] = [
+  "privileged-config.read",
+  "privileged-config.update",
+  "secret.write",
+];
+
 test("settings mutations fail closed for a remote operator snapshot", () => {
   const access = settingsMutationAccess(snapshot(
     ["state.read", "chat.session.create", "chat.message.send", "kanban.card.update"],
@@ -37,36 +43,95 @@ test("settings mutations fail closed for a remote operator snapshot", () => {
     "tailnet",
   ));
 
-  assert.deepEqual(access, { global: false, skill: false, soul: false, memory: false, localOwner: false, hostAdmin: false });
-  assert.equal(canMutateSettingsTab(access, "global"), false);
-  assert.equal(canMutateSettingsTab(access, "skills"), false);
-  assert.equal(canMutateSettingsTab(access, "soul"), false);
-  assert.equal(canMutateSettingsTab(access, "memory"), false);
+  assert.deepEqual(access, {
+    global: false,
+    skill: false,
+    soul: false,
+    project: false,
+    memory: false,
+    config: false,
+    privileged: false,
+    hostApps: false,
+    hermesUpdate: false,
+    obsidianVaults: false,
+    localOwner: false,
+    hostAdmin: false,
+  });
+  assert.equal(canMutateSettingsTab(access, "privileged"), false);
+  // Project overview stays writable: its only editor is the device-local
+  // display-name alias, which needs no server operation.
+  assert.equal(canMutateSettingsTab(access, "project"), true);
 });
 
-test("each settings control follows its exact server-advertised operation", () => {
-  const partial = settingsMutationAccess(snapshot(
-    ["state.read", "profile.update", "memory.update"],
-    "manager",
-    "tailnet",
-  ));
-  assert.deepEqual(partial, { global: false, skill: false, soul: true, memory: true, localOwner: false, hostAdmin: false });
-
-  const owner = settingsMutationAccess(snapshot(
-    ["state.read", "global-settings.update", "skill.enable", "profile.update", "memory.update"],
+test("privileged follows server allowedOperations for local owner and remote owner", () => {
+  const localOwnerNoPriv = settingsMutationAccess(snapshot(
+    ["state.read", "global-settings.update", "skill.enable", "profile.update", "memory.update", "profile-config.update"],
     "owner",
     "loopback",
+    "local-cookie",
   ));
-  assert.deepEqual(owner, { global: true, skill: true, soul: true, memory: true, localOwner: true, hostAdmin: false });
+  assert.equal(localOwnerNoPriv.privileged, false);
+  assert.equal(localOwnerNoPriv.localOwner, true);
 
-  const desktopOwner = settingsMutationAccess(snapshot(
-    ["state.read", "global-settings.update", "skill.enable", "profile.update", "memory.update"],
+  const localOwnerWithPriv = settingsMutationAccess(snapshot(
+    [
+      "state.read",
+      "global-settings.update",
+      "skill.enable",
+      "profile.update",
+      "memory.update",
+      "profile-config.update",
+      ...PRIVILEGED_OPS,
+    ],
+    "owner",
+    "loopback",
+    "local-cookie",
+  ));
+  assert.equal(localOwnerWithPriv.privileged, true);
+  assert.equal(canMutateSettingsTab(localOwnerWithPriv, "privileged"), true);
+
+  // Remote owner with privileged ops advertised (flag on + enrolled owner device).
+  const remoteOwner = settingsMutationAccess(snapshot(
+    ["state.read", ...PRIVILEGED_OPS],
     "owner",
     "tailnet",
+    "device-cookie",
+  ));
+  assert.equal(remoteOwner.privileged, true);
+  assert.equal(remoteOwner.hostApps, false);
+  assert.equal(remoteOwner.obsidianVaults, false);
+  assert.equal(remoteOwner.hostAdmin, false);
+  assert.equal(canMutateSettingsTab(remoteOwner, "privileged"), true);
+
+  // Remote owner without privileged ops (flag off) stays closed.
+  const remoteOwnerNoFlag = settingsMutationAccess(snapshot(
+    ["state.read", "chat.message.send"],
+    "owner",
+    "tailnet",
+    "device-cookie",
+  ));
+  assert.equal(remoteOwnerNoFlag.privileged, false);
+  assert.equal(remoteOwnerNoFlag.hostApps, false);
+
+  const remoteOwnerWithHostApps = settingsMutationAccess(snapshot(
+    ["state.read", ...PRIVILEGED_OPS, "host-app.install", "obsidian.vault.read"],
+    "owner",
+    "tailnet",
+    "device-cookie",
+  ));
+  assert.equal(remoteOwnerWithHostApps.hostApps, true);
+  assert.equal(remoteOwnerWithHostApps.obsidianVaults, true);
+
+  const desktopOwner = settingsMutationAccess(snapshot(
+    ["state.read", ...PRIVILEGED_OPS, "host-app.install", "obsidian.vault.read", "device.revoke", "audit.read"],
+    "owner",
+    "loopback",
     "desktop-capability",
   ));
-  assert.deepEqual(desktopOwner, { global: true, skill: true, soul: true, memory: true, localOwner: false, hostAdmin: true });
-  assert.equal(canMutateSettingsTab(desktopOwner, "host"), true);
+  assert.equal(desktopOwner.privileged, true);
+  assert.equal(desktopOwner.hostApps, true);
+  assert.equal(desktopOwner.obsidianVaults, true);
+  assert.equal(desktopOwner.hostAdmin, true);
 });
 
 test("settings mutations remain disabled until a validated snapshot exists", () => {
@@ -74,7 +139,13 @@ test("settings mutations remain disabled until a validated snapshot exists", () 
     global: false,
     skill: false,
     soul: false,
+    project: false,
     memory: false,
+    config: false,
+    privileged: false,
+    hostApps: false,
+    hermesUpdate: false,
+    obsidianVaults: false,
     localOwner: false,
     hostAdmin: false,
   });

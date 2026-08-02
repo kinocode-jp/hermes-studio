@@ -4,6 +4,7 @@ import { profileList, selectProfile } from "../store";
 import { CharacterPortrait } from "./character-portrait";
 import { StatusPill } from "./status-pill";
 import { canRestoreModalFocus, hasOpenModal, isTopmostModal, registerModal } from "../modal-layer";
+import { profileDisplayName, profileSecondaryName } from "../profile-names";
 
 export function ProfileCommand() {
   const [open, setOpen] = useState(false);
@@ -15,7 +16,7 @@ export function ProfileCommand() {
   const matches = useMemo(() => {
     const normalized = query.trim().toLocaleLowerCase();
     if (!normalized) return profileList.value;
-    return profileList.value.filter((profile) => profile.name.toLocaleLowerCase().includes(normalized));
+    return profileList.value.filter((profile) => `${profileDisplayName(profile)} ${profile.name}`.toLocaleLowerCase().includes(normalized));
   }, [query, profileList.value]);
 
   useEffect(() => {
@@ -70,7 +71,7 @@ export function ProfileCommand() {
 
   return (
     <>
-      <button class="quiet-button profile-command-trigger" type="button" aria-label={t("command.open")} onClick={openCommand}>⌘ K</button>
+      <button class="quiet-button profile-command-trigger" type="button" aria-label={t("command.open")} title={t("command.open")} onClick={openCommand}>⌘</button>
       {open && (
         <div class="profile-command-layer" role="presentation" onPointerDown={(event) => { if (event.target === event.currentTarget) setOpen(false); }}>
           <section ref={dialog} class="profile-command" role="dialog" aria-modal="true" aria-labelledby="profile-command-title" onKeyDown={trapFocus}>
@@ -104,9 +105,9 @@ export function ProfileCommand() {
                   class={index === activeIndex ? "is-active" : ""}
                   onPointerMove={() => setActiveIndex(index)}
                   onClick={() => choose(index)}
-                >
-                  <CharacterPortrait profileId={profile.id} profileName={profile.name} class="character-portrait--command" decorative />
-                  <span><b>{profile.name}</b><small>{profile.sessions} {t("office.chats")}</small></span>
+              >
+                  <CharacterPortrait profileId={profile.id} profileName={profileDisplayName(profile)} class="character-portrait--command" decorative />
+                  <span><b>{profileDisplayName(profile)}</b><small>{[profileSecondaryName(profile), `${profile.sessions} ${t("office.chats")}`].filter(Boolean).join(" · ")}</small></span>
                   <StatusPill status={profile.status} />
                 </button>
               ))}

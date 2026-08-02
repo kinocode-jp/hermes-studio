@@ -1,6 +1,6 @@
 # Third-party software notices
 
-Hermes Office source code is licensed under MIT. It also depends on third-party
+Hermes Studio source code is licensed under MIT. It also depends on third-party
 npm and Rust crates under their own licenses. Those dependencies are not
 relicensed by this project.
 

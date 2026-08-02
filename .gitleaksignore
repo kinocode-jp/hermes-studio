@@ -1,0 +1,7 @@
+# Historical synthetic test fixtures that predate same-line gitleaks:allow.
+# Keep these fingerprint-specific so future findings in the same files remain visible.
+6ddba8288bf87293e4cd3f9c7319c8b43bb46d47:apps/server/src/secret-scrubber.test.ts:aws-access-token:85
+6ddba8288bf87293e4cd3f9c7319c8b43bb46d47:apps/server/src/secret-scrubber.test.ts:aws-access-token:86
+6e701337d0f43b84fd15968038bcb25c4817f088:apps/server/src/global-context-budget.test.ts:generic-api-key:21
+fdb67dfcc8678530b414be5e62750d2b2431ddfd:apps/server/src/hermes-chat.test.ts:generic-api-key:13
+fdb67dfcc8678530b414be5e62750d2b2431ddfd:apps/server/src/hermes-settings.test.ts:generic-api-key:14

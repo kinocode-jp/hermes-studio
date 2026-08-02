@@ -1,0 +1,19 @@
+title = "Hermes Studio secret scanning"
+
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Ignored dependencies, build output, and local scratch files"
+paths = [
+  '''(^|/)node_modules/''',
+  '''(^|/)dist/''',
+  '''(^|/)target/''',
+  '''^tmp/''',
+  '''^apps/desktop/src-tauri/resources/web/''',
+  '''^apps/desktop/src-tauri/resources/server/hermes-studio-server\.mjs$''',
+]
+
+# Synthetic credentials in tests are permitted only where the fixture is
+# declared, using Gitleaks' same-line `gitleaks:allow` marker. No test path is
+# excluded wholesale.

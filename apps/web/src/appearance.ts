@@ -1,6 +1,6 @@
 import { signal } from "@preact/signals";
 
-export const APPEARANCE_STORAGE_KEY = "hermes-office:appearance:v1";
+export const APPEARANCE_STORAGE_KEY = "hermes-studio:appearance:v1";
 
 export const themes = ["paper", "mint", "midnight"] as const;
 export const fontScales = [1, 1.125, 1.25, 1.5] as const;
@@ -11,13 +11,15 @@ export type FontScale = (typeof fontScales)[number];
 type AppearancePreferences = {
   theme: Theme;
   fontScale: FontScale;
+  richLinkPreviews: boolean;
 };
 
-const defaults: AppearancePreferences = { theme: "paper", fontScale: 1 };
+const defaults: AppearancePreferences = { theme: "paper", fontScale: 1, richLinkPreviews: true };
 const initial = readPreferences();
 
 export const activeTheme = signal<Theme>(initial.theme);
 export const activeFontScale = signal<FontScale>(initial.fontScale);
+export const richLinkPreviewsEnabled = signal(initial.richLinkPreviews);
 
 export function initializeAppearance(): void {
   applyAppearance(activeTheme.value, activeFontScale.value);
@@ -35,13 +37,21 @@ export function setFontScale(fontScale: FontScale): void {
   persistPreferences();
 }
 
+export function setRichLinkPreviewsEnabled(enabled: boolean): void {
+  richLinkPreviewsEnabled.value = enabled;
+  persistPreferences();
+}
+
 function readPreferences(): AppearancePreferences {
   if (typeof localStorage === "undefined") return defaults;
   try {
-    const candidate = JSON.parse(localStorage.getItem(APPEARANCE_STORAGE_KEY) ?? "null") as Partial<AppearancePreferences> | null;
+    const candidate = JSON.parse(localStorage.getItem(APPEARANCE_STORAGE_KEY) ?? localStorage.getItem("hermes-office:appearance:v1") ?? "null") as Partial<AppearancePreferences> | null;
     return {
       theme: isTheme(candidate?.theme) ? candidate.theme : defaults.theme,
       fontScale: normalizeFontScale(candidate?.fontScale),
+      richLinkPreviews: typeof candidate?.richLinkPreviews === "boolean"
+        ? candidate.richLinkPreviews
+        : defaults.richLinkPreviews,
     };
   } catch {
     return defaults;
@@ -54,6 +64,7 @@ function persistPreferences(): void {
     localStorage.setItem(APPEARANCE_STORAGE_KEY, JSON.stringify({
       theme: activeTheme.value,
       fontScale: activeFontScale.value,
+      richLinkPreviews: richLinkPreviewsEnabled.value,
     } satisfies AppearancePreferences));
   } catch {
     // Appearance is non-critical; keep the active session usable when storage is unavailable.
@@ -87,7 +98,7 @@ function normalizeFontScale(value: unknown): FontScale {
 }
 
 function themeColor(theme: Theme): string {
-  if (theme === "midnight") return "#101827";
-  if (theme === "mint") return "#effaf6";
-  return "#ffffff";
+  if (theme === "midnight") return "#111b24";
+  if (theme === "mint") return "#eef8f5";
+  return "#f4f7f9";
 }

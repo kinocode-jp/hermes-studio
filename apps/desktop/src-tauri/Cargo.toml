@@ -1,15 +1,15 @@
 [package]
-name = "hermes-office"
+name = "hermes-studio"
 version = "0.1.0"
 description = "A lightweight visual control plane for Hermes Agent"
-authors = ["Hermes Office contributors"]
+authors = ["Hermes Studio contributors"]
 edition = "2021"
 rust-version = "1.97"
 license = "MIT"
-repository = "https://github.com/kinocode-jp/hermes-office"
+repository = "https://github.com/kinocode-jp/hermes-studio"
 
 [lib]
-name = "hermes_office_lib"
+name = "hermes_studio_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]

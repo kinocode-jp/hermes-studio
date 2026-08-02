@@ -1,6 +1,6 @@
 import { signal } from "@preact/signals";
 
-export const WORKSPACE_LAYOUT_STORAGE_KEY = "hermes-office:workspace-layout:v1";
+export const WORKSPACE_LAYOUT_STORAGE_KEY = "hermes-studio:workspace-layout:v1";
 export const WORKSPACE_LAYOUT_VERSION = 1;
 export const WORKSPACE_RATIO_MIN = 0.18;
 export const WORKSPACE_RATIO_MAX = 0.72;

@@ -1,15 +1,15 @@
 {
-  "name": "hermes-office",
+  "name": "hermes-studio",
   "version": "0.1.0",
   "private": true,
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/kinocode-jp/hermes-office.git"
+    "url": "git+https://github.com/kinocode-jp/hermes-studio.git"
   },
-  "homepage": "https://github.com/kinocode-jp/hermes-office#readme",
+  "homepage": "https://github.com/kinocode-jp/hermes-studio#readme",
   "bugs": {
-    "url": "https://github.com/kinocode-jp/hermes-office/issues"
+    "url": "https://github.com/kinocode-jp/hermes-studio/issues"
   },
   "packageManager": "npm@10.9.8",
   "type": "module",
@@ -19,17 +19,22 @@
   ],
   "scripts": {
     "dev": "concurrently --kill-others-on-fail --names server,web \"npm run dev:server\" \"npm run dev:web\"",
-    "dev:web": "npm run dev --workspace @hermes-office/web",
-    "dev:server": "HERMES_OFFICE_ALLOWED_ORIGINS=http://localhost:4173,http://127.0.0.1:4173 npm run dev --workspace @hermes-office/server",
-    "dev:desktop": "npm run tauri:dev --workspace @hermes-office/desktop",
-    "start": "node scripts/start-office.mjs",
-    "build:production": "npm run build:web && npm run build --workspace @hermes-office/server",
-    "build:desktop-assets": "npm run build:web && npm run bundle:server",
-    "bundle:server": "esbuild apps/server/src/index.ts --bundle --platform=node --format=esm --target=node22 --banner:js=\"import { createRequire } from 'node:module'; const require = createRequire(import.meta.url);\" --outfile=apps/desktop/src-tauri/resources/server/hermes-office-server.mjs",
+    "dev:web": "VITE_STUDIO_SERVER_PORT=4318 npm run dev --workspace @hermes-studio/web",
+    "dev:web:desktop": "VITE_STUDIO_SERVER_PORT=4317 npm run dev --workspace @hermes-studio/web",
+    "dev:server": "HERMES_STUDIO_PORT=4318 HERMES_STUDIO_ALLOWED_ORIGINS=http://localhost:4173,http://127.0.0.1:4173 npm run dev --workspace @hermes-studio/server",
+    "dev:desktop": "npm run tauri:dev --workspace @hermes-studio/desktop",
+    "start": "node scripts/start-studio.mjs",
+    "start:tailnet": "node scripts/start-tailnet.mjs",
+    "start:tailnet:desktop": "node scripts/start-tailnet.mjs --desktop",
+    "forget:tailnet:desktop": "node scripts/start-tailnet.mjs --forget-desktop",
+    "build:production": "npm run build:web && npm run build --workspace @hermes-studio/server",
+    "build:desktop-assets": "HERMES_STUDIO_DESKTOP_BUILD=1 npm run build:web && npm run bundle:server && npm run bundle:web-for-desktop",
+    "bundle:server": "esbuild apps/server/src/index.ts --bundle --platform=node --format=esm --target=node22 --banner:js=\"import { createRequire } from 'node:module'; const require = createRequire(import.meta.url);\" --outfile=apps/desktop/src-tauri/resources/server/hermes-studio-server.mjs",
+    "bundle:web-for-desktop": "rm -rf apps/desktop/src-tauri/resources/web && mkdir -p apps/desktop/src-tauri/resources/web && cp -R apps/web/dist/. apps/desktop/src-tauri/resources/web/",
     "build": "npm run build --workspaces --if-present",
-    "build:web": "npm run build --workspace @hermes-office/web",
+    "build:web": "npm run build --workspace @hermes-studio/web",
     "typecheck": "npm run typecheck --workspaces --if-present",
-    "test:server": "npm test --workspace @hermes-office/server"
+    "test:server": "npm test --workspace @hermes-studio/server"
   },
   "devDependencies": {
     "concurrently": "^9.2.1",

@@ -1,3 +1,3 @@
 fn main() {
-    hermes_office_lib::run();
+    hermes_studio_lib::run();
 }

@@ -18,7 +18,7 @@
 The current Cargo lockfile includes `glib 0.18.5` through Tauri's Linux GTK3
 dependency graph. That version is in the affected range for
 [RUSTSEC-2024-0429](https://rustsec.org/advisories/RUSTSEC-2024-0429.html).
-Hermes Office does not call the affected API directly, and the current desktop
+Hermes Studio does not call the affected API directly, and the current desktop
 bundle configuration targets macOS app/DMG, but reachability on Linux has not
 been established.
 

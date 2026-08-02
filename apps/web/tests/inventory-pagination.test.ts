@@ -22,6 +22,20 @@ test("a stored session loaded after the snapshot page remains selectable and res
   assert.deepEqual(getOpenChatTargets().at(-1), { clientSessionId: clientId, profileId: "profile-0", storedSessionId: "session-100" });
 });
 
+test("Kanban worker terminal markers do not add a conversation or profile session count", () => {
+  sessions.value = [];
+  openSessionIds.value = [];
+  profileList.value = [];
+
+  applyOfficeSnapshot(snapshotWithSessions([
+    stored("p1", "real-chat"),
+    { id: "worker-terminal", profileId: "p1", title: "Kanban terminal transition recorded; this worker run is finished.", activity: "idle" },
+  ]), "http://127.0.0.1:4317");
+
+  assert.deepEqual(sessions.value.map((session) => session.storedSessionId), ["real-chat"]);
+  assert.equal(profileList.value.find((profile) => profile.id === "p1")?.sessions, 1);
+});
+
 test("an authoritative inventory row clears a promoted draft title presentation", () => {
   sessions.value = [{
     id: "draft-client", storedSessionId: "stored-draft", liveSessionId: "live-draft", profileId: "profile-0",
@@ -58,9 +72,11 @@ test("same raw session IDs arriving on different pages remain independently addr
   assert.deepEqual(sessions.value.map((session) => session.id), [firstId, secondId]);
   openSession(firstId);
   openSession(secondId);
+  // Live leases prioritize the most recently selected pane while retaining
+  // both profile-scoped identities for the same raw Hermes session ID.
   assert.deepEqual(getOpenChatTargets(), [
-    { clientSessionId: firstId, profileId: "p1", storedSessionId: "shared-id" },
     { clientSessionId: secondId, profileId: "p2", storedSessionId: "shared-id" },
+    { clientSessionId: firstId, profileId: "p1", storedSessionId: "shared-id" },
   ]);
 });
 

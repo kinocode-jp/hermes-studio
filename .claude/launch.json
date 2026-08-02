@@ -5,7 +5,7 @@
       "name": "web",
       "cwd": "apps/web",
       "runtimeExecutable": "npm",
-      "runtimeArgs": ["run", "dev", "--workspace", "@hermes-office/web"],
+      "runtimeArgs": ["run", "dev", "--workspace", "@hermes-studio/web"],
       "port": 4173
     }
   ]

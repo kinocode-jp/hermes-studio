@@ -1,4 +1,4 @@
-import type { OfficeInventoryKind, ProtocolError } from "@hermes-office/protocol";
+import type { OfficeInventoryKind, ProtocolError } from "@hermes-studio/protocol";
 import type { HermesRuntimeSource } from "./hermes-backend.js";
 import { InventoryCursorError } from "./hermes-inventory.js";
 

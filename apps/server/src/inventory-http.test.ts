@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import type { ProfileSummary } from "@hermes-office/protocol";
+import type { ProfileSummary } from "@hermes-studio/protocol";
 import type { HermesRuntimeSource } from "./hermes-backend.js";
 import { HermesInventoryCache } from "./hermes-inventory.js";
 import { routeInventoryHttp } from "./inventory-http.js";

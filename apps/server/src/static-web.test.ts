@@ -11,7 +11,7 @@ test("serves the app shell and immutable built assets", async () => {
     const assets = new StaticWebAssets(root);
     const shell = await assets.read("/");
     const script = await assets.read("/assets/app-123.js");
-    const atlas = await assets.read("/characters/hermes-office-character-atlas-v4.webp");
+    const atlas = await assets.read("/characters/hermes-studio-character-atlas-v4.webp");
     const manifest = await assets.read("/manifest.webmanifest");
     assert.equal(shell?.body.toString(), "<main>Office</main>");
     assert.equal(shell?.cacheControl, "no-cache");
@@ -52,7 +52,7 @@ test("rejects traversal, encoded traversal, and API paths", async () => {
 
 test("does not follow a web-root symlink to files outside the configured directory", async () => {
   const root = await fixture();
-  const outside = await mkdtemp(join(tmpdir(), "hermes-office-private-"));
+  const outside = await mkdtemp(join(tmpdir(), "hermes-studio-private-"));
   try {
     await writeFile(join(outside, "private.txt"), "private material");
     await symlink(join(outside, "private.txt"), join(root, "leak.txt"));
@@ -65,12 +65,12 @@ test("does not follow a web-root symlink to files outside the configured directo
 });
 
 async function fixture(): Promise<string> {
-  const root = await mkdtemp(join(tmpdir(), "hermes-office-web-"));
+  const root = await mkdtemp(join(tmpdir(), "hermes-studio-web-"));
   await mkdir(join(root, "assets"));
   await mkdir(join(root, "characters"));
   await writeFile(join(root, "index.html"), "<main>Office</main>");
   await writeFile(join(root, "assets/app-123.js"), "export {};");
-  await writeFile(join(root, "characters/hermes-office-character-atlas-v4.webp"), "webp");
+  await writeFile(join(root, "characters/hermes-studio-character-atlas-v4.webp"), "webp");
   await writeFile(join(root, "manifest.webmanifest"), "{}");
   return root;
 }
