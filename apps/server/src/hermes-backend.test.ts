@@ -100,6 +100,37 @@ test("session deletion rejects an invalid Hermes bulk acknowledgement", async ()
   }
 });
 
+test("snapshot is read-only and preserves durable delegated and marker-like conversations", async () => {
+  const mutations: string[] = [];
+  const rows = [
+    { ...sessionRow(0), id: "ordinary-session" },
+    { ...sessionRow(1), id: "terminal-title", title: "Kanban Task Transition Recorded" },
+    { ...sessionRow(2), id: "terminal-preview", title: "Worker completion", preview: "Kanban terminal transition recorded; this worker run is finished." },
+    { ...sessionRow(3), id: "terminal-delegated", title: "Untitled session", conversation_kind: "delegated", delegation_task_id: "t_0123abcd" },
+  ];
+  const fixture = await startHermesFixture((request, response, url) => {
+    if (url.pathname === "/api/profiles") return writeJson(response, { profiles: [profileRow(0)] });
+    if (url.pathname === "/api/profiles/sessions") return writeJson(response, { sessions: rows, total: rows.length, errors: [] });
+    if (url.pathname === "/api/plugins/kanban/board") return writeJson(response, { columns: [{ name: "done", tasks: [{ id: "t_0123abcd" }] }], latest_event_id: 0 });
+    if (request.method !== "GET") {
+      mutations.push(`${request.method ?? "UNKNOWN"} ${url.pathname}`);
+      return writeJson(response, { ok: false });
+    }
+    return defaultFixtureRoute(request, response, url);
+  });
+  try {
+    assert.equal((await fixture.backend.start()).state, "ready");
+    const snapshot = await fixture.backend.snapshot();
+    assert.deepEqual(snapshot.sessions.map((session) => session.id), rows.map((session) => session.id));
+    assert.equal(snapshot.inventory.sessions.total, rows.length);
+    assert.equal(snapshot.sessions.at(-1)?.conversationKind, "delegated");
+    assert.deepEqual(mutations, []);
+  } finally {
+    await fixture.backend.close();
+    await fixture.close();
+  }
+});
+
 test("concurrent snapshots share one inventory collection and both cursors remain usable", async () => {
   const rows = Array.from({ length: 101 }, (_, index) => sessionRow(index));
   let profileRequests = 0;

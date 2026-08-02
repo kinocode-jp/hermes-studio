@@ -3,7 +3,9 @@ import {
   activeFontScale,
   activeTheme,
   fontScales,
+  richLinkPreviewsEnabled,
   setFontScale,
+  setRichLinkPreviewsEnabled,
   setTheme,
   themes,
   type Theme,
@@ -42,7 +44,7 @@ export function AppearanceSettings() {
       if (!isTopmostModal(panel.current)) return;
       if (event.key === "Escape") { event.preventDefault(); setOpen(false); return; }
       if (event.key !== "Tab") return;
-      const controls = [...(panel.current?.querySelectorAll<HTMLElement>('button, [tabindex]:not([tabindex="-1"])') ?? [])];
+      const controls = [...(panel.current?.querySelectorAll<HTMLElement>('button, input, [tabindex]:not([tabindex="-1"])') ?? [])];
       if (controls.length === 0) return;
       const first = controls[0]!;
       const last = controls[controls.length - 1]!;
@@ -158,6 +160,27 @@ export function AppearanceSettings() {
                 onClick={() => { resetWorkspaceLayout(); setLayoutAnnouncement(t("appearance.resetDone")); }}
               >{t("appearance.reset")}</button>
               <p class="visually-hidden" aria-live="polite" aria-atomic="true">{layoutAnnouncement}</p>
+            </section>
+
+            <section aria-labelledby="link-preview-heading">
+              <div class="appearance-section-title">
+                <div class="heading-info-group">
+                  <h3 id="link-preview-heading">{t("appearance.linkPreviews")}</h3>
+                  <InfoTip text={t("appearance.linkPreviewsDetail")} align="start" />
+                </div>
+                <small>{richLinkPreviewsEnabled.value ? t("common.on") : t("common.off")}</small>
+              </div>
+              <label class="appearance-toggle-row">
+                <span>
+                  <b>{t("appearance.linkPreviews")}</b>
+                  <small>{t("appearance.linkPreviewsSites")}</small>
+                </span>
+                <input
+                  type="checkbox"
+                  checked={richLinkPreviewsEnabled.value}
+                  onChange={(event) => setRichLinkPreviewsEnabled(event.currentTarget.checked)}
+                />
+              </label>
             </section>
           </aside>
         </>

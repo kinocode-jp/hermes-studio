@@ -139,7 +139,7 @@ test("a failed explicit close preserves ordered live events and interaction stat
   owner.rpc(23, "approval.respond", {
     session_id: "live-owner", approval_id: approvalId, choice: "once",
   });
-  owner.rpc(24, "clarify.respond", { request_id: "q-during-close", answer: "wait" });
+  owner.rpc(24, "clarify.respond", { session_id: "live-owner", request_id: "q-during-close", answer: "wait" });
   await settle(4);
   assert.equal(owner.errorCode(22), -32006, "commands remain fenced during close settlement");
   assert.equal(owner.errorCode(23), -32004);
@@ -154,7 +154,7 @@ test("a failed explicit close preserves ordered live events and interaction stat
   owner.rpc(25, "approval.respond", {
     session_id: "live-owner", approval_id: approvalId, choice: "once",
   });
-  owner.rpc(26, "clarify.respond", { request_id: "q-during-close", answer: "continue" });
+  owner.rpc(26, "clarify.respond", { session_id: "live-owner", request_id: "q-during-close", answer: "continue" });
   await settle(6);
   assert.equal(owner.errorCode(25), undefined);
   assert.equal(owner.errorCode(26), undefined);

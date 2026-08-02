@@ -328,7 +328,7 @@ test("approval and clarification tokens do not cross same-owner live-id reuse", 
   client.rpc(89, "session.resume", { session_id: "parent", profile: "coder" });
   await settle(4);
   client.rpc(87, "approval.respond", { session_id: "live-old", approval_id: approvalId, choice: "deny" });
-  client.rpc(88, "clarify.respond", { request_id: "q-closed", answer: "no" });
+  client.rpc(88, "clarify.respond", { session_id: "live-old", request_id: "q-closed", answer: "no" });
   await settle(4);
 
   assert.equal(client.errorCode(87), -32004);
@@ -339,7 +339,7 @@ test("approval and clarification tokens do not cross same-owner live-id reuse", 
   hermes.publish({ type: "clarify.request", sessionId: "live-old", payload: { requestId: "q-new-lease", question: "New?" } });
   await settle();
   client.rpc(81, "approval.respond", { session_id: "live-old", approval_id: client.approvalId("live-old"), choice: "once" });
-  client.rpc(82, "clarify.respond", { request_id: "q-new-lease", answer: "yes" });
+  client.rpc(82, "clarify.respond", { session_id: "live-old", request_id: "q-new-lease", answer: "yes" });
   await settle(4);
   assert.deepEqual(hermes.interactionRequests, ["approval.respond", "clarify.respond"]);
 });
@@ -358,7 +358,7 @@ test("stale approval and clarification cannot cross close and live-id reuse", as
   hermes.publish({ type: "clarify.request", sessionId: "live-old", payload: { requestId: "q-owned", question: "Continue?" } });
   await settle();
   original.rpc(91, "approval.respond", { session_id: "live-old", approval_id: original.approvalId("live-old"), choice: "once" });
-  original.rpc(92, "clarify.respond", { request_id: "q-owned", answer: "yes" });
+  original.rpc(92, "clarify.respond", { session_id: "live-old", request_id: "q-owned", answer: "yes" });
   await settle(4);
   assert.deepEqual(hermes.interactionRequests, ["approval.respond", "clarify.respond"]);
 
@@ -372,7 +372,7 @@ test("stale approval and clarification cannot cross close and live-id reuse", as
   await settle(4);
 
   original.rpc(95, "approval.respond", { session_id: "live-old", approval_id: staleApprovalId, choice: "deny" });
-  original.rpc(96, "clarify.respond", { request_id: "q-stale", answer: "no" });
+  original.rpc(96, "clarify.respond", { session_id: "live-old", request_id: "q-stale", answer: "no" });
   await settle(4);
   assert.equal(original.errorCode(95), -32004);
   assert.equal(original.errorCode(96), -32004);
@@ -382,7 +382,7 @@ test("stale approval and clarification cannot cross close and live-id reuse", as
   hermes.publish({ type: "clarify.request", sessionId: "live-old", payload: { requestId: "q-reused", question: "New owner?" } });
   await settle();
   replacement.rpc(97, "approval.respond", { session_id: "live-old", approval_id: replacement.approvalId("live-old"), choice: "once" });
-  replacement.rpc(98, "clarify.respond", { request_id: "q-reused", answer: "yes" });
+  replacement.rpc(98, "clarify.respond", { session_id: "live-old", request_id: "q-reused", answer: "yes" });
   await settle(4);
   assert.deepEqual(hermes.interactionRequests, [
     "approval.respond", "clarify.respond", "approval.respond", "clarify.respond",
@@ -401,7 +401,7 @@ test("failed claimed interactions cannot restore across same-owner lease reuse",
   await settle();
   hermes.holdInteractions();
   client.rpc(101, "approval.respond", { session_id: "live-old", approval_id: client.approvalId("live-old"), choice: "once" });
-  client.rpc(102, "clarify.respond", { request_id: "q-generation", answer: "old" });
+  client.rpc(102, "clarify.respond", { session_id: "live-old", request_id: "q-generation", answer: "old" });
   await settle();
 
   client.rpc(103, "session.close", { session_id: "live-old" });
@@ -418,7 +418,7 @@ test("failed claimed interactions cannot restore across same-owner lease reuse",
   assert.equal(client.errorCode(102), -32008);
 
   client.rpc(105, "approval.respond", { session_id: "live-old", approval_id: newApprovalId, choice: "deny" });
-  client.rpc(106, "clarify.respond", { request_id: "q-generation", answer: "new" });
+  client.rpc(106, "clarify.respond", { session_id: "live-old", request_id: "q-generation", answer: "new" });
   await settle(4);
   assert.equal(client.errorCode(105), undefined);
   assert.equal(client.errorCode(106), undefined);

@@ -142,6 +142,23 @@ export type ChatSession = {
   pendingInteraction?: ChatPendingInteraction | undefined;
   steerPending?: boolean | undefined;
   steerOperationId?: string | undefined;
+  /**
+   * Delivery fence for guidance accepted against one specific assistant run.
+   * If that run terminalizes before any later activity can consume the queue,
+   * Studio promotes the text to one ordinary prompt in the next turn.
+   */
+  steerDelivery?: {
+    operationId: string;
+    body: string;
+    liveSessionId: string;
+    runId?: string | undefined;
+    runSequence?: number | undefined;
+    acknowledgement: "pending" | "queued";
+    /** A correlated assistant/tool frame arrived after steer send, even if its ACK is still in flight. */
+    activityObserved?: boolean | undefined;
+    terminalObserved?: boolean | undefined;
+    recovering?: boolean | undefined;
+  } | undefined;
   interruptPending?: boolean | undefined;
   interruptOperationId?: string | undefined;
   slashPending?: boolean | undefined;

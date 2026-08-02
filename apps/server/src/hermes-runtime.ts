@@ -208,7 +208,7 @@ export function isRecognizedHermesVersion(version: string): boolean {
 
 export function createVersionProbeEnvironment(source: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
   const environment: NodeJS.ProcessEnv = {};
-  for (const key of ["HOME", "PATH", "USER", "LOGNAME", "SHELL", "TMPDIR", "TEMP", "TMP", "SYSTEMROOT", "WINDIR", "COMSPEC", "PATHEXT"] as const) {
+  for (const key of ["HOME", "PATH", "USER", "LOGNAME", "SHELL", "TMPDIR", "TEMP", "TMP", "SYSTEMROOT", "WINDIR", "COMSPEC", "PATHEXT", "HERMES_HOME"] as const) {
     const value = source[key];
     if (value !== undefined && value !== "" && !value.includes("\0")) environment[key] = value;
   }

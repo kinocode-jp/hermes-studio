@@ -1,7 +1,8 @@
 import { useCallback, useEffect, useRef, useState } from "preact/hooks";
 import { canRestoreModalFocus, hasOpenModal, isTopmostModal, lockBackgroundElements, registerModal } from "../modal-layer";
+import { PHONE_VIEWPORT_QUERY } from "../viewport";
 
-export const PHONE_OVERLAY_VIEWPORT = "(max-width: 768px)";
+export const PHONE_OVERLAY_VIEWPORT = PHONE_VIEWPORT_QUERY;
 export const COMPACT_OVERLAY_VIEWPORT = "(max-width: 1279px)";
 const FOCUSABLE = [
   "a[href]",

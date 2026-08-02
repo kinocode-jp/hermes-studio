@@ -38,6 +38,7 @@ import {
   rejectOfficeSynchronization,
   setAuthRequiredObserver,
 } from "./office-api-session";
+import { recordOfficeSnapshotRequestIdentity } from "./office-snapshot-request-tracker";
 
 export function connectOfficeApi(callbacks: OfficeApiCallbacks, configuredServerUrl = studioServerUrl()): OfficeApiConnection {
 
@@ -121,6 +122,7 @@ export function connectOfficeApi(callbacks: OfficeApiCallbacks, configuredServer
       connectionGeneration: expectedConnectionGeneration,
       requestGeneration: ++latestSnapshotRequestGeneration
     };
+    recordOfficeSnapshotRequestIdentity(identity);
     if (showConnecting) callbacks.onConnecting(serverUrl);
     try {
       snapshotRequestsAwaitingSession.add(identity.requestGeneration);

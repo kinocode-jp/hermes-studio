@@ -11,6 +11,7 @@ import { localizeRuntimeMessage, officeMessage, officeRuntimeMessage, t, type Ru
 import { isLocalOfficeClient } from "../auth-state";
 import { canMutateSettingsTab, settingsMutationAccess } from "../settings-access";
 import { profileDisplayName, profileStoredDisplayName, setProfileDisplayName } from "../profile-names";
+import { notifyProfileProjectsChanged } from "../profile-project-revision";
 import { preserveConcurrentDraft } from "../settings-draft";
 import { SettingsMutationRegistry, type SettingsMutationScope } from "../settings-mutation-registry";
 import { officeSnapshot } from "../store";
@@ -266,6 +267,7 @@ export function LiveSettings({ profileId, profileLabel, scope = "all", initialTa
     setProjectsError(null);
     try {
       await action();
+      notifyProfileProjectsChanged();
     } catch (reason) {
       setProjectsError(errorState(reason));
     } finally {
@@ -303,6 +305,18 @@ export function LiveSettings({ profileId, profileLabel, scope = "all", initialTa
     void performProjects(`projects:folder:${projectId}`, async () => {
       await addProfileProjectFolder(profileId, projectId, { path });
       setFolderDrafts((current) => ({ ...current, [projectId]: "" }));
+      await refreshProjects(profileId);
+    });
+  };
+
+  const createProjectWithoutFolder = () => {
+    if (!profileId || !mutationAccess.project) return;
+    const name = newProjectName.trim();
+    if (name === "") return;
+    void performProjects("projects:create", async () => {
+      await createProfileProject(profileId, { name });
+      setNewProjectName("");
+      setNewProjectFormOpen(false);
       await refreshProjects(profileId);
     });
   };
@@ -1559,7 +1573,7 @@ export function LiveSettings({ profileId, profileLabel, scope = "all", initialTa
                         );
                       })}
                     </ul>
-                    {/* New project: name is optional (defaults to the folder name); the folder always comes from the picker. */}
+                    {/* A folder is optional in Hermes Projects; selecting one can still supply the default name. */}
                     {newProjectFormOpen ? (
                       <form
                         class="settings-projects__create"
@@ -1582,6 +1596,11 @@ export function LiveSettings({ profileId, profileLabel, scope = "all", initialTa
                           class="settings-projects__browse"
                           disabled={!mutationAccess.project || busy.has("projects:create")}
                         >{t("settings.projects.chooseFolder")}</button>
+                        <button
+                          type="button"
+                          disabled={!mutationAccess.project || busy.has("projects:create") || newProjectName.trim() === ""}
+                          onClick={createProjectWithoutFolder}
+                        >{t("settings.projects.createWithoutFolder")}</button>
                         <button
                           type="button"
                           class="settings-projects__quiet"

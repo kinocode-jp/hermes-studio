@@ -10,7 +10,7 @@ import {
   serializeOfficeChatEvent,
   type ChatGatewayDependencies,
 } from "./chat-gateway.js";
-import { ChatSessionCoordinator } from "./chat-session-coordinator.js";
+import { ChatSessionCoordinator, MAX_CHAT_SESSION_LEASES_PER_OWNER } from "./chat-session-coordinator.js";
 import { ChatUpstreamHub } from "./chat-upstream-hub.js";
 import { OfficeAuth, type OfficeAuthSession } from "./office-auth.js";
 
@@ -148,9 +148,11 @@ test("gateway fails closed when its shared session coordinator is not injected",
   assert.deepEqual(client.closed, { code: 1011, reason: "Chat session hub unavailable" });
 });
 
-test("one Office connection cannot retain more than four session leases", async () => {
+test("one Office connection cannot retain more than the configured owner session leases", async () => {
   const runtime = runtimeWithConnections(() => connection());
-  const coordinator = new ChatSessionCoordinator();
+  // Raise the profile bound to the owner bound so this fixture exercises the
+  // owner boundary rather than stopping first at the independent profile cap.
+  const coordinator = new ChatSessionCoordinator({ maxLeasesPerProfile: MAX_CHAT_SESSION_LEASES_PER_OWNER });
   const client = new FakeWebSocket();
   handleOfficeChatConnection(client as unknown as WebSocket, {
     auth: new OfficeAuth(), officeSession: REMOTE_SESSION, runtimeSource: runtime,
@@ -159,18 +161,19 @@ test("one Office connection cannot retain more than four session leases", async 
     limits: { socketRateCapacity: 100 }, sessionCoordinator: coordinator,
   });
   await flush();
-  for (let index = 1; index <= 5; index += 1) {
+  for (let index = 1; index <= MAX_CHAT_SESSION_LEASES_PER_OWNER + 1; index += 1) {
     client.rpc(120 + index, "session.resume", { session_id: `lease-${index}`, profile: "test-bind" });
     await flush();
   }
 
-  assert.equal(client.errorCode(125), -32007);
-  assert.equal(client.errorCode(124), undefined);
-  const error = client.frames().find((frame) => frame.id === 125)?.error as { data?: { reason?: string } } | undefined;
+  const rejectedId = 120 + MAX_CHAT_SESSION_LEASES_PER_OWNER + 1;
+  assert.equal(client.errorCode(rejectedId), -32007);
+  assert.equal(client.errorCode(rejectedId - 1), undefined);
+  const error = client.frames().find((frame) => frame.id === rejectedId)?.error as { data?: { reason?: string } } | undefined;
   assert.equal(error?.data?.reason, "session_limit");
-  client.rpc(126, "session.resume", { session_id: "lease-1", profile: "test-bind" });
+  client.rpc(rejectedId + 1, "session.resume", { session_id: "lease-1", profile: "test-bind" });
   await flush();
-  assert.equal(client.errorCode(126), undefined, "the bound does not reject an existing lease owned by this socket");
+  assert.equal(client.errorCode(rejectedId + 1), undefined, "the bound does not reject an existing lease owned by this socket");
 });
 
 test("slow or failed chat clients are closed with a resynchronization policy", async () => {
@@ -251,22 +254,31 @@ test("approval and clarification remain exact-socket, one-shot, expiring, and di
   now += 51;
   a.rpc(6, "approval.respond", { session_id: "s-expired", choice: "once" });
   callbacks[0]!({ type: "clarify.request", sessionId: "s-1", payload: { requestId: "q-1", question: "Proceed?" } });
-  b.rpc(7, "clarify.respond", { request_id: "q-1", answer: "yes" });
-  a.rpc(8, "clarify.respond", { request_id: "q-1", answer: "yes" });
-  a.rpc(9, "clarify.respond", { request_id: "q-1", answer: "again" });
+  b.rpc(7, "clarify.respond", { session_id: "s-1", request_id: "q-1", answer: "yes" });
+  a.rpc(8, "clarify.respond", { session_id: "s-1", request_id: "q-1", answer: "yes" });
+  a.rpc(9, "clarify.respond", { session_id: "s-1", request_id: "q-1", answer: "again" });
   callbacks[0]!({ type: "clarify.request", sessionId: "s-1", payload: { requestId: "q-expired", question: "Late?" } });
   now += 51;
-  a.rpc(10, "clarify.respond", { request_id: "q-expired", answer: "late" });
+  a.rpc(10, "clarify.respond", { session_id: "s-1", request_id: "q-expired", answer: "late" });
   await flush();
   for (const id of [3, 4, 5, 6, 7, 9, 10]) assert.ok(a.hasError(id) || b.hasError(id));
   assert.equal(requests[0]!.filter((item) => item.method === "clarify.respond").length, 2);
   assert.equal(requests[0]!.some((item) => item.method === "approval.respond" && item.params?.choice === "deny"), true);
   assert.equal(requests[0]!.some((item) => item.method === "clarify.respond" && item.params?.answer === ""), true);
+  await bindSessions(a, "s-2");
+  callbacks[0]!({ type: "clarify.request", sessionId: "s-1", payload: { requestId: "same-id", question: "First pane?" } });
+  callbacks[0]!({ type: "clarify.request", sessionId: "s-2", payload: { requestId: "same-id", question: "Second pane?" } });
+  a.rpc(11, "clarify.respond", { session_id: "s-1", request_id: "same-id", answer: "one" });
+  a.rpc(12, "clarify.respond", { session_id: "s-2", request_id: "same-id", answer: "two" });
+  await flush();
+  assert.equal(a.errorCode(11), undefined);
+  assert.equal(a.errorCode(12), undefined);
+  assert.equal(requests[0]!.filter((item) => item.method === "clarify.respond" && item.params?.request_id === "same-id").length, 2);
   a.emit("close");
   await flush();
   assert.equal(closes[0], 0, "one Browser disconnect must keep the shared Hermes connection open");
   const requestsAfterDisconnect = requests[0]!.length;
-  a.rpc(12, "session.interrupt", { session_id: "s-1" });
+  a.rpc(13, "session.interrupt", { session_id: "s-1" });
   await flush();
   assert.equal(requests[0]!.length, requestsAfterDisconnect);
 
@@ -342,18 +354,18 @@ test("approval and clarification claims are exclusive and recover only after tim
   assert.equal(client.errorCode(23), -32004);
 
   publish({ type: "clarify.request", sessionId: "s-retry", payload: { requestId: "q-retry", question: "Retry?" } });
-  client.rpc(24, "clarify.respond", { request_id: "q-retry", answer: "yes" });
-  client.rpc(25, "clarify.respond", { request_id: "q-retry", answer: "competing" });
+  client.rpc(24, "clarify.respond", { session_id: "s-retry", request_id: "q-retry", answer: "yes" });
+  client.rpc(25, "clarify.respond", { session_id: "s-retry", request_id: "q-retry", answer: "competing" });
   await flush();
   assert.equal(requests.length, 3);
   assert.equal(client.errorCode(25), -32004);
   clarificationFailure.reject(new HermesChatTransportError("backend_rejected", "temporary clarification failure", 4090));
   await flush();
   assert.equal(client.errorCode(24), -32000);
-  client.rpc(26, "clarify.respond", { request_id: "q-retry", answer: "retry" });
+  client.rpc(26, "clarify.respond", { session_id: "s-retry", request_id: "q-retry", answer: "retry" });
   await flush();
   assert.equal(requests.length, 4);
-  client.rpc(27, "clarify.respond", { request_id: "q-retry", answer: "again" });
+  client.rpc(27, "clarify.respond", { session_id: "s-retry", request_id: "q-retry", answer: "again" });
   await flush();
   assert.equal(client.errorCode(27), -32004);
 
@@ -408,10 +420,10 @@ test("malformed interaction acknowledgements are commit-unconfirmed and consume 
   assert.equal(approvalAttempts, 1);
 
   publish({ type: "clarify.request", sessionId: "s-malformed", payload: { requestId: "q-malformed", question: "Retry?" } });
-  client.rpc(112, "clarify.respond", { request_id: "q-malformed", answer: "first" });
+  client.rpc(112, "clarify.respond", { session_id: "s-malformed", request_id: "q-malformed", answer: "first" });
   await flush();
   assert.equal(client.errorCode(112), -32008);
-  client.rpc(113, "clarify.respond", { request_id: "q-malformed", answer: "second" });
+  client.rpc(113, "clarify.respond", { session_id: "s-malformed", request_id: "q-malformed", answer: "second" });
   await flush();
   assert.equal(client.errorCode(113), -32004);
   assert.equal(clarifyAttempts, 1);

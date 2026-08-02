@@ -13,7 +13,12 @@ import { brandStatePath } from "./brand-env.js";
 import { STUDIO_SERVER_PROTOCOL_VERSION } from "./demo-state.js";
 import { createHermesChatTransport, type HermesChatTransport } from "./hermes-chat.js";
 import { createHermesChildEnvironment, discardHermesChildOutput } from "./hermes-child-environment.js";
-import { collectHermesInventory, HermesInventoryCache, type CollectedHermesInventory, type HermesJsonResult } from "./hermes-inventory.js";
+import {
+  collectHermesInventory,
+  HermesInventoryCache,
+  type CollectedHermesInventory,
+  type HermesJsonResult,
+} from "./hermes-inventory.js";
 import { createHermesKanbanHttpRequester, HermesKanbanAdapter } from "./hermes-kanban.js";
 import { GlobalInheritanceCoordinator } from "./global-inheritance.js";
 import { HermesProfileBackendPool } from "./hermes-profile-pool.js";
@@ -357,18 +362,7 @@ export class HermesBackend implements HermesRuntimeSource {
     if (safeSessionIds.length === 0 || safeSessionIds.length > 500) {
       throw new Error("Hermes session delete batch size is invalid.");
     }
-    const result = await this.#requestJson(
-      "/api/sessions/bulk-delete",
-      true,
-      15_000,
-      undefined,
-      { method: "POST", body: { ids: safeSessionIds, profile: safeProfile } },
-    );
-    const deleted = isRecord(result) ? result.deleted : undefined;
-    if (!isRecord(result) || result.ok !== true || !Number.isSafeInteger(deleted)
-      || (deleted as number) < 0 || (deleted as number) > safeSessionIds.length) {
-      throw new Error("Hermes did not confirm durable session deletion.");
-    }
+    await this.#deleteDurableSessions(safeProfile, safeSessionIds);
     this.#inventory.clear();
     this.#snapshotRefresh = undefined;
   }
@@ -432,6 +426,21 @@ export class HermesBackend implements HermesRuntimeSource {
       // Kanban is an optional, independently-failing feature. An unavailable
       // or incompatible board must not discard otherwise healthy inventory.
       return emptyBoards();
+    }
+  }
+
+  async #deleteDurableSessions(profile: string, sessionIds: readonly string[]): Promise<void> {
+    const result = await this.#requestJson(
+      "/api/sessions/bulk-delete",
+      true,
+      15_000,
+      undefined,
+      { method: "POST", body: { ids: sessionIds, profile } },
+    );
+    const deleted = isRecord(result) ? result.deleted : undefined;
+    if (!isRecord(result) || result.ok !== true || !Number.isSafeInteger(deleted)
+      || (deleted as number) < 0 || (deleted as number) > sessionIds.length) {
+      throw new Error("Hermes did not confirm durable session deletion.");
     }
   }
 

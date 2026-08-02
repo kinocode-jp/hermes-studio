@@ -228,7 +228,7 @@ export const OPERATION_POLICIES: Readonly<Record<Operation, OperationPolicy>> = 
     true,
   ),
   // Bounded discovery only: the server probes fixed loopback model endpoints
-  // and may update only Studio-owned custom endpoint ids for this profile.
+  // and may reconcile only Studio-owned custom endpoint ids for this profile.
   "local-model-providers.sync": policy(
     "local-model-providers.sync",
     "operator",

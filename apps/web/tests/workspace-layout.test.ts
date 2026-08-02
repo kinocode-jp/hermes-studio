@@ -158,7 +158,7 @@ test("dashboard interaction contract exposes pointer, keyboard, drag, and mobile
   assert.match(component, /resetActiveDashboardSizes\(\)/);
   assert.match(component, /draggable/);
   assert.match(component, /movePanel\(panelId, index\)/);
-  assert.match(component, /addDashboardPanel\("chat", \{ sessionId, index \}\)/);
+  assert.match(component, /addDashboardPanel\("chat", \{ sessionId, index: target\.index \}\)/);
   assert.match(component, /replaceDashboardPanel\(target\.panelId, kind\)/);
   assert.match(component, /replaceDashboardPanel\(target\.panelId, "chat", \{ sessionId \}\)/);
   assert.match(component, /showDropReplace/);

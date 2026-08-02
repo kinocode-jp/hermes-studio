@@ -24,6 +24,7 @@ import {
   registerChatRuntime,
   replaceProfileChatModalPane,
   selectProfileChatModalSession,
+  sendMessage,
   setProfileChatModalSessionInventoryAuthoritative,
   setProfileChatModalActivePane,
   setProfileChatModalPanes,
@@ -47,6 +48,11 @@ import {
   saveProfileChatModalLayout,
   savedProfileChatModalLayout,
 } from "../src/profile-chat-modal-prefs.ts";
+import {
+  clearChatComposerState,
+  setChatComposerAttachments,
+  setChatComposerDraft,
+} from "../src/chat-composer-state.ts";
 
 test("opening a fifth chat keeps every visible pane", () => {
   const current = ["one", "two", "three", "four"];
@@ -63,6 +69,104 @@ test("reopening an existing chat does not reorder or duplicate it", () => {
 test("live-session safety bounds are separate from visible pane counts", () => {
   assert.equal(MAX_LIVE_CHAT_SESSIONS, 16);
   assert.equal(MAX_LIVE_CHAT_SESSIONS_PER_PROFILE, 8);
+});
+
+test("a draft's first prompt claims capacity before session.create", async () => {
+  const released: string[] = [];
+  const ensured: string[] = [];
+  const storedSessions: ChatSession[] = Array.from({ length: MAX_LIVE_CHAT_SESSIONS }, (_, index) => ({
+    id: `lease-${index + 1}`,
+    storedSessionId: `stored-${index + 1}`,
+    liveSessionId: `live-${index + 1}`,
+    profileId: `profile-${index + 1}`,
+    title: `Lease ${index + 1}`,
+    status: "ready",
+    messages: [],
+    remoteKind: "stored",
+    connectionState: "ready",
+    historyState: "loaded",
+  }));
+  const draft: ChatSession = {
+    id: "first-prompt-draft", profileId: "draft-profile", title: "", status: "ready", messages: [],
+    remoteKind: "draft", connectionState: "ready", historyState: "loaded", readOnly: false,
+  };
+  sessions.value = [...storedSessions, draft];
+  openSessionIds.value = [...storedSessions.map((session) => session.id), draft.id];
+  activeSessionId.value = draft.id;
+  registerChatRuntime({
+    ensureSession(target) { ensured.push(target.clientSessionId); }, releaseSession(sessionId) { released.push(sessionId); },
+    async submitPrompt() { return { status: "rejected", message: "synthetic" }; },
+    async steer() { return { status: "queued" }; }, interrupt() {}, async respondClarify() {}, async respondApproval() {},
+  });
+  ensured.length = 0;
+
+  await sendMessage(draft.id, "claim a live slot");
+
+  assert.equal(released.includes(storedSessions.at(-1)!.id), true);
+  assert.equal(ensured.includes(storedSessions.at(-1)!.id), true, "a rejected first prompt returns the borrowed slot");
+});
+
+test("a draft's first slash command also claims live-session capacity", async () => {
+  const released: string[] = [];
+  const ensured: string[] = [];
+  const storedSessions: ChatSession[] = Array.from({ length: MAX_LIVE_CHAT_SESSIONS }, (_, index) => ({
+    id: `slash-lease-${index + 1}`,
+    storedSessionId: `slash-stored-${index + 1}`,
+    liveSessionId: `slash-live-${index + 1}`,
+    profileId: `slash-profile-${index + 1}`,
+    title: `Slash lease ${index + 1}`,
+    status: "ready",
+    messages: [],
+    remoteKind: "stored",
+    connectionState: "ready",
+    historyState: "loaded",
+  }));
+  const draft: ChatSession = {
+    id: "first-slash-draft", profileId: "draft-profile", title: "", status: "ready", messages: [],
+    remoteKind: "draft", connectionState: "ready", historyState: "loaded", readOnly: false,
+  };
+  sessions.value = [...storedSessions, draft];
+  openSessionIds.value = [...storedSessions.map((session) => session.id), draft.id];
+  activeSessionId.value = draft.id;
+  registerChatRuntime({
+    ensureSession(target) { ensured.push(target.clientSessionId); }, releaseSession(sessionId) { released.push(sessionId); },
+    async submitPrompt() { return { status: "accepted" }; },
+    async execSlash() { return { status: "ok", output: "ready", warning: "" }; },
+    async steer() { return { status: "queued" }; }, interrupt() {}, async respondClarify() {}, async respondApproval() {},
+  });
+  ensured.length = 0;
+
+  await sendMessage(draft.id, "/status");
+
+  assert.equal(released.includes(storedSessions.at(-1)!.id), true);
+  assert.equal(ensured.includes(storedSessions.at(-1)!.id), true, "the completed local slash returns the borrowed slot");
+});
+
+test("closing and reopening an unused draft keeps its local composer ready", () => {
+  const released: string[] = [];
+  const ensured: string[] = [];
+  const draft: ChatSession = {
+    id: "reopen-local-draft", profileId: "draft-profile", title: "", status: "ready", messages: [],
+    remoteKind: "draft", connectionState: "ready", historyState: "loaded", readOnly: false,
+  };
+  sessions.value = [draft];
+  openSessionIds.value = [draft.id];
+  activeSessionId.value = draft.id;
+  registerChatRuntime({
+    ensureSession(target) { ensured.push(target.clientSessionId); }, releaseSession(sessionId) { released.push(sessionId); },
+    async submitPrompt() { return { status: "accepted" }; }, async steer() { return { status: "queued" }; },
+    interrupt() {}, async respondClarify() {}, async respondApproval() {},
+  });
+
+  closeSession(draft.id);
+  assert.deepEqual(released, [draft.id]);
+  assert.equal(sessions.value[0]?.connectionState, "ready");
+  assert.equal(sessions.value[0]?.readOnly, false);
+
+  openSession(draft.id);
+  assert.equal(ensured.includes(draft.id), true);
+  assert.equal(sessions.value[0]?.connectionState, "ready");
+  assert.equal(sessions.value[0]?.readOnly, false);
 });
 
 test("fresh dashboard state waits for its runtime-backed default chat", () => {
@@ -461,6 +565,50 @@ test("sidebar chat click replaces the blank initial pane only when the conversat
   assert.equal(sessions.value.some((session) => session.id === storedEmpty.id), true, "a persisted empty conversation stays available in the sidebar");
 });
 
+test("sidebar replacement keeps a new-chat session with delivery evidence or unsent composer content", async (context) => {
+  const existing: ChatSession = {
+    id: "dashboard-retention-existing", storedSessionId: "stored-existing", profileId: "profile", title: "Existing",
+    status: "ready", messages: [], remoteKind: "stored", connectionState: "ready", historyState: "loaded",
+  };
+  const cases: Array<{ name: string; patch?: Partial<ChatSession>; compose?: (sessionId: string) => void }> = [
+    { name: "delivery evidence", patch: { operationEvidence: [{ id: "sent", kind: "prompt", body: "hello", at: "12:00", state: "accepted" }] } },
+    { name: "live identity", patch: { liveSessionId: "live-dashboard-draft" } },
+    { name: "composer text", compose: (sessionId) => setChatComposerDraft(sessionId, "keep me") },
+    { name: "composer attachment", compose: (sessionId) => setChatComposerAttachments(sessionId, [{
+      id: "dashboard-attachment", name: "note.txt", mime: "text/plain", size: 4, kind: "file", textContent: "note",
+    }]) },
+  ];
+
+  for (const item of cases) {
+    await context.test(item.name, () => {
+      const draft: ChatSession = {
+        id: `dashboard-retention-${item.name.replaceAll(" ", "-")}`,
+        profileId: "profile", title: "", titlePresentation: "new-chat",
+        status: "ready", messages: [], remoteKind: "draft", connectionState: "ready", historyState: "loaded",
+        ...item.patch,
+      };
+      clearChatComposerState(draft.id);
+      item.compose?.(draft.id);
+      sessions.value = [draft, existing];
+      openSessionIds.value = [draft.id];
+      activeSessionId.value = draft.id;
+      resetDashboardStateForTests({
+        version: 1,
+        activeDashboardId: "retention-dashboard",
+        dashboards: [{
+          id: "retention-dashboard", name: "", activeChatPanelId: "draft-pane",
+          panels: [{ id: "draft-pane", kind: "chat", sessionId: draft.id }],
+        }],
+      });
+
+      assert.equal(selectDashboardChatSession(existing.id), "replaced");
+      assert.deepEqual(activeDashboard.value.panels.map((panel) => panel.sessionId), [existing.id]);
+      assert.equal(sessions.value.some((session) => session.id === draft.id), true, "sidebar replacement must retain the conversation in the session list");
+      clearChatComposerState(draft.id);
+    });
+  }
+});
+
 test("sidebar chat click focuses a visible conversation before considering a blank initial pane", () => {
   const draft: ChatSession = {
     id: "visible-initial-draft", profileId: "profile", title: "", titlePresentation: "new-chat",
@@ -539,6 +687,20 @@ test("restoring several persisted chat panes does not recursively reactivate the
     assert.deepEqual(openSessionIds.value, ids);
     assert.equal(activeSessionId.value, "restore-two", "the persisted active pane is restored last and remains active");
 
+    const repeatedEnsures: string[] = [];
+    registerChatRuntime({
+      ensureSession(target) { repeatedEnsures.push(target.clientSessionId); }, releaseSession() {}, submitPrompt() {},
+      async steer() { return { status: "queued" }; }, interrupt() {}, async respondClarify() {}, async respondApproval() {},
+    });
+    sessions.value = sessions.value.map((session, index) => index === 0 ? {
+      ...session,
+      storedSessionId: `stored-${session.id}`,
+      remoteKind: "stored" as const,
+      connectionState: "error" as const,
+      historyState: "loaded" as const,
+    } : session);
+    assert.deepEqual(repeatedEnsures, [], "a state update must not be mistaken for a request to reopen an existing pane");
+
     const newDashboardId = createDashboardWithDefaultChat();
     assert.equal(activeDashboardId.value, newDashboardId);
     assert.equal(activeDashboard.value.panels.length, 1, "old panes must not reopen during the dashboard handoff");
@@ -546,6 +708,10 @@ test("restoring several persisted chat panes does not recursively reactivate the
     assert.equal(initialSession?.titlePresentation, "new-chat");
   } finally {
     dispose();
+    registerChatRuntime({
+      ensureSession() {}, releaseSession() {}, submitPrompt() {}, async steer() { return { status: "queued" }; },
+      interrupt() {}, async respondClarify() {}, async respondApproval() {},
+    });
     officeConnection.value = previousConnection;
     profileList.value = previousProfiles;
     sessions.value = previousSessions;
@@ -652,6 +818,49 @@ test("modal click discards the unused local draft that its initial pane replaces
   assert.equal(selectProfileChatModalSession(existing.id), true);
   assert.deepEqual(profileChatModalPaneIds.value, [existing.id]);
   assert.equal(sessions.value.some((session) => session.id === draft.id), false);
+});
+
+test("modal replacement retains a new-chat draft once it contains user or runtime activity", async (context) => {
+  const existing: ChatSession = {
+    id: "modal-retention-existing", storedSessionId: "stored-existing", profileId: "profile", title: "Existing",
+    status: "ready", messages: [], remoteKind: "stored", connectionState: "ready", historyState: "loaded",
+  };
+  const cases: Array<{
+    name: string;
+    patch?: Partial<ChatSession>;
+    compose?: (sessionId: string) => void;
+  }> = [
+    { name: "operation evidence", patch: { operationEvidence: [{ id: "sent", kind: "prompt", body: "hello", at: "12:00", state: "accepted" }] } },
+    { name: "live identity", patch: { liveSessionId: "live-draft" } },
+    { name: "slash pending", patch: { slashPending: true } },
+    { name: "active run", patch: { status: "waiting" } },
+    { name: "composer text", compose: (sessionId) => setChatComposerDraft(sessionId, "unsent text") },
+    { name: "composer attachment", compose: (sessionId) => setChatComposerAttachments(sessionId, [{
+      id: "attachment", name: "note.txt", mime: "text/plain", size: 4, kind: "file", textContent: "note",
+    }]) },
+  ];
+
+  for (const item of cases) {
+    await context.test(item.name, () => {
+      const draft: ChatSession = {
+        id: `modal-retention-${item.name.replaceAll(" ", "-")}`,
+        profileId: "profile", title: "", titlePresentation: "new-chat",
+        status: "ready", messages: [], remoteKind: "draft", connectionState: "ready", historyState: "loaded",
+        ...item.patch,
+      };
+      clearChatComposerState(draft.id);
+      item.compose?.(draft.id);
+      sessions.value = [draft, existing];
+      profileChatModalId.value = "profile";
+      profileChatModalPaneIds.value = [draft.id];
+      profileChatModalActivePaneId.value = draft.id;
+
+      assert.equal(selectProfileChatModalSession(existing.id), true);
+      assert.deepEqual(profileChatModalPaneIds.value, [existing.id]);
+      assert.equal(sessions.value.some((session) => session.id === draft.id), true, "replacement must not archive an authored or active draft");
+      clearChatComposerState(draft.id);
+    });
+  }
 });
 
 test("opening a modal before session pagination completes preserves and later restores its saved panes", () => {
@@ -939,14 +1148,55 @@ test("closing a streaming pane defers its live release until the run becomes ter
   assert.equal(sessions.value[0]?.connectionState, "disconnected");
 });
 
+test("a hidden slash operation retains and reserves its live lease until the command settles", () => {
+  const released: string[] = [];
+  const slashSession: ChatSession = {
+    id: "hidden-slash", storedSessionId: "stored-slash", liveSessionId: "live-slash",
+    profileId: "slash-profile", title: "Slash", status: "ready", messages: [],
+    operationEvidence: [{ id: "slash-op", kind: "prompt", body: "/status", at: "12:00", state: "pending" }],
+    slashPending: true, remoteKind: "stored", connectionState: "ready", historyState: "loaded",
+  };
+  const visible = Array.from({ length: MAX_LIVE_CHAT_SESSIONS }, (_, index): ChatSession => ({
+    id: `slash-visible-${index}`, storedSessionId: `stored-visible-${index}`,
+    profileId: `visible-profile-${index}`, title: `Visible ${index}`, status: "ready", messages: [],
+    remoteKind: "stored", connectionState: "ready", historyState: "loaded",
+  }));
+  sessions.value = [slashSession, ...visible];
+  openSessionIds.value = [slashSession.id, ...visible.map((session) => session.id)];
+  activeSessionId.value = slashSession.id;
+  profileChatModalId.value = null;
+  profileChatModalPaneIds.value = [];
+  embeddedChatSessionIds.value = [];
+  registerChatRuntime({
+    ensureSession() {}, releaseSession(sessionId) { released.push(sessionId); },
+    async submitPrompt() { return { status: "accepted" }; }, async steer() { return { status: "queued" }; }, interrupt() {},
+    async respondClarify() {}, async respondApproval() {},
+  });
+
+  closeSession(slashSession.id);
+  assert.deepEqual(released, []);
+  assert.equal(getOpenChatTargets().length, MAX_LIVE_CHAT_SESSIONS - 1, "the hidden slash lease consumes one global slot");
+
+  sessions.value = sessions.value.map((session) => session.id === slashSession.id ? {
+    ...session,
+    slashPending: false,
+    operationEvidence: session.operationEvidence?.map((operation) => ({ ...operation, state: "accepted" as const })),
+  } : session);
+  assert.deepEqual(released, [slashSession.id]);
+  assert.equal(getOpenChatTargets().length, MAX_LIVE_CHAT_SESSIONS);
+});
+
 test("an active pane displaces an older lease while a hidden run reserves profile capacity", () => {
   const ensured: string[] = [];
   const released: string[] = [];
-  const workspaceSessions: ChatSession[] = Array.from({ length: 7 }, (_, offset) => offset + 1).map((index) => ({
-    id: `workspace-${index}`, storedSessionId: `stored-${index}`, liveSessionId: `live-${index}`,
-    profileId: "profile", title: `Workspace ${index}`, status: "ready", messages: [],
-    remoteKind: "stored", connectionState: "ready", historyState: "loaded",
-  }));
+  const workspaceSessions: ChatSession[] = Array.from(
+    { length: MAX_LIVE_CHAT_SESSIONS_PER_PROFILE },
+    (_, index): ChatSession => ({
+      id: `workspace-${index + 1}`, storedSessionId: `stored-${index + 1}`, liveSessionId: `live-${index + 1}`,
+      profileId: "profile", title: `Workspace ${index + 1}`, status: "ready", messages: [],
+      remoteKind: "stored", connectionState: "ready", historyState: "loaded",
+    }),
+  );
   sessions.value = [
     {
       id: "background-run", storedSessionId: "stored-run", liveSessionId: "live-run", profileId: "profile", title: "Run",
@@ -975,10 +1225,12 @@ test("an active pane displaces an older lease while a hidden run reserves profil
   closeSession("background-run");
   openSession("replacement");
   assert.equal(ensured.includes("replacement"), true, "the selected pane should receive a live lease");
-  assert.deepEqual(getOpenChatTargets().map((target) => target.clientSessionId), [
-    "replacement", "workspace-1", "workspace-2", "workspace-3", "workspace-4", "workspace-5", "workspace-6",
-  ]);
-  assert.equal(released.includes("workspace-7"), true, "an older inactive lease should yield to the selected pane");
+  // One hidden streaming run reserves a profile slot. The replacement is
+  // prioritized and one older visible lease is displaced at the real bound.
+  const visibleWhileHidden = getOpenChatTargets().map((target) => target.clientSessionId);
+  assert.equal(visibleWhileHidden[0], "replacement");
+  assert.equal(visibleWhileHidden.length, MAX_LIVE_CHAT_SESSIONS_PER_PROFILE - 1);
+  assert.equal(workspaceSessions.some((session) => released.includes(session.id)), true);
 
   sessions.value = sessions.value.map((item) => item.id === "background-run" ? {
     ...item,
@@ -987,13 +1239,17 @@ test("an active pane displaces an older lease while a hidden run reserves profil
     messages: item.messages.map((message) => ({ ...message, status: "complete" as const })),
   } : item);
   assert.equal(released.includes("background-run"), true);
-  assert.equal(ensured.includes("workspace-7"), true, "the freed profile lease should reconnect the remaining visible pane");
+  assert.equal(getOpenChatTargets().length, MAX_LIVE_CHAT_SESSIONS_PER_PROFILE,
+    "after the hidden run ends, visible panes reclaim the reserved profile slot");
 });
 
 test("modal panes take foreground lease priority within the per-profile live bound", () => {
   const ensured: string[] = [];
   const released: string[] = [];
-  const workspaceSessions: ChatSession[] = Array.from({ length: 8 }, (_, offset) => offset + 1).map((index) => ({
+  const workspaceSessions: ChatSession[] = Array.from(
+    { length: MAX_LIVE_CHAT_SESSIONS_PER_PROFILE },
+    (_, offset) => offset + 1,
+  ).map((index) => ({
       id: `workspace-${index}`, storedSessionId: `stored-workspace-${index}`, profileId: "profile", title: `Workspace ${index}`,
       status: "ready", messages: [], remoteKind: "stored", connectionState: "ready", historyState: "loaded",
     }));
@@ -1016,22 +1272,22 @@ test("modal panes take foreground lease priority within the per-profile live bou
 
   assert.equal(addProfileChatModalPane("modal"), true);
   assert.deepEqual(getOpenChatTargets().map((target) => target.clientSessionId), [
-    "modal", "workspace-1", "workspace-2", "workspace-3", "workspace-4", "workspace-5", "workspace-6", "workspace-7",
+    "modal", ...workspaceSessions.slice(0, -1).map((session) => session.id),
   ]);
-  assert.deepEqual(released, ["workspace-8"]);
+  assert.deepEqual(released, [workspaceSessions.at(-1)!.id]);
   assert.equal(ensured.includes("modal"), true);
 
   closeProfileChatModal();
   assert.deepEqual(getOpenChatTargets().map((target) => target.clientSessionId), workspaceSessions.map((session) => session.id));
-  assert.deepEqual(released, ["workspace-8", "modal"]);
-  assert.equal(ensured.includes("workspace-8"), true);
+  assert.deepEqual(released, [workspaceSessions.at(-1)!.id, "modal"]);
+  assert.equal(ensured.includes(workspaceSessions.at(-1)!.id), true);
 });
 
 test("embedded modal chats take a foreground lease without becoming workspace panes", () => {
   const ensured: string[] = [];
   const released: string[] = [];
   sessions.value = [
-    ...[1, 2, 3, 4].map((index): ChatSession => ({
+    ...Array.from({ length: MAX_LIVE_CHAT_SESSIONS_PER_PROFILE }, (_, index) => index + 1).map((index): ChatSession => ({
       id: `workspace-${index}`, storedSessionId: `stored-${index}`, profileId: "profile", title: "Workspace",
       status: "ready", messages: [], remoteKind: "stored", connectionState: "ready", historyState: "loaded",
     })),
@@ -1040,7 +1296,8 @@ test("embedded modal chats take a foreground lease without becoming workspace pa
       status: "ready", messages: [], remoteKind: "stored", connectionState: "disconnected", historyState: "loaded",
     },
   ];
-  openSessionIds.value = ["workspace-1", "workspace-2", "workspace-3", "workspace-4"];
+  const workspaceIds = sessions.value.filter((session) => session.id.startsWith("workspace-")).map((session) => session.id);
+  openSessionIds.value = workspaceIds;
   profileChatModalId.value = null;
   profileChatModalPaneIds.value = [];
   embeddedChatSessionIds.value = [];
@@ -1052,14 +1309,15 @@ test("embedded modal chats take a foreground lease without becoming workspace pa
   });
 
   assert.equal(openEmbeddedChatSession("embedded"), true);
-  assert.deepEqual(openSessionIds.value, ["workspace-1", "workspace-2", "workspace-3", "workspace-4"]);
-  assert.deepEqual(getOpenChatTargets().map((target) => target.clientSessionId), ["embedded", "workspace-1", "workspace-2", "workspace-3", "workspace-4"]);
-  assert.deepEqual(released, []);
+  assert.deepEqual(openSessionIds.value, workspaceIds, "embedded presentation does not mutate workspace pane membership");
+  assert.deepEqual(getOpenChatTargets().map((target) => target.clientSessionId), ["embedded", ...workspaceIds.slice(0, -1)]);
+  assert.deepEqual(released, [workspaceIds.at(-1)!]);
 
   closeEmbeddedChatSession("embedded");
-  assert.deepEqual(getOpenChatTargets().map((target) => target.clientSessionId), ["workspace-1", "workspace-2", "workspace-3", "workspace-4"]);
-  assert.deepEqual(released, ["embedded"]);
-  assert.deepEqual(ensured, ["workspace-1", "workspace-2", "workspace-3", "workspace-4", "embedded"]);
+  assert.deepEqual(getOpenChatTargets().map((target) => target.clientSessionId), workspaceIds);
+  assert.deepEqual(released, [workspaceIds.at(-1)!, "embedded"]);
+  assert.equal(ensured.includes("embedded"), true);
+  assert.equal(ensured.includes(workspaceIds.at(-1)!), true);
 });
 
 test("dashboard mirror pauses only for cleared, unavailable server inventory", () => {

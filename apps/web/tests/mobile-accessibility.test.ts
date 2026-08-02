@@ -276,8 +276,9 @@ test("mobile route stack closes workspace then inspector and restores workspace 
 });
 
 test("mobile route and modal overlays expose consistent focus, inert, and navigation semantics", async () => {
-  const [app, rail, settings, profileChat, overlay, outsideClose, main, routes] = await Promise.all([
+  const [app, mobileApp, rail, settings, profileChat, overlay, outsideClose, main, routes, viewport] = await Promise.all([
     readFile(new URL("../src/app.tsx", import.meta.url), "utf8"),
+    readFile(new URL("../src/components/mobile-app-shell.tsx", import.meta.url), "utf8"),
     readFile(new URL("../src/components/side-rail.tsx", import.meta.url), "utf8"),
     readFile(new URL("../src/components/settings-modal.tsx", import.meta.url), "utf8"),
     readFile(new URL("../src/components/profile-chat-modal.tsx", import.meta.url), "utf8"),
@@ -285,6 +286,7 @@ test("mobile route and modal overlays expose consistent focus, inert, and naviga
     readFile(new URL("../src/components/use-modal-outside-close.ts", import.meta.url), "utf8"),
     readFile(new URL("../src/main.tsx", import.meta.url), "utf8"),
     readFile(new URL("../src/mobile-routes.ts", import.meta.url), "utf8"),
+    readFile(new URL("../src/viewport.ts", import.meta.url), "utf8"),
   ]);
 
   assert.doesNotMatch(rail, /onClick=\{\(\) => \{\s*addDashboardPanel\(item\.kind\)/);
@@ -306,9 +308,21 @@ test("mobile route and modal overlays expose consistent focus, inert, and naviga
   assert.match(rail, /activeSessionId\.value[\s\S]*sidebar\.currentChatOpen[\s\S]*sidebar\.defaultChatStart/);
   assert.match(app, /data-mobile-route-chrome/);
   assert.match(rail, /data-mobile-route-chrome/);
+  assert.match(app, /if \(phoneViewport\)[\s\S]*<MobileAppShell \/>/);
+  assert.match(mobileApp, /id: "chat", label: "新規会話"/);
+  assert.match(mobileApp, /id: "kanban", label: "カンバン"/);
+  assert.match(mobileApp, /id: "profiles", label: "プロフィール"/);
+  assert.match(mobileApp, /id: "projects", label: "プロジェクト"/);
+  assert.match(mobileApp, /id: "more", label: "その他"/);
+  assert.match(mobileApp, /createSession\(profile\.id\)/);
+  assert.match(mobileApp, /<KanbanBoard \/>/);
+  assert.match(mobileApp, /<ProfilesPanel \/>/);
+  assert.match(mobileApp, /<MobileProjectsPage \/>/);
+  assert.match(mobileApp, /<OfficeScene profiles=\{profileList\.value\} \/>/);
+  assert.doesNotMatch(mobileApp, /sidebar-nav-chevron/);
   assert.match(app, /<SettingsModal \/>/);
   assert.match(app, /<ProfileChatModal \/>/);
-  assert.match(profileChat, /if \(openPaneIds\.includes\(session\.id\)\)/);
+  assert.match(profileChat, /selected=\{openPaneIds\.includes\(session\.id\)\}/);
   assert.match(profileChat, /setProfileChatModalActivePane\(session\.id\)/);
   assert.match(profileChat, /profileChatModalActivePaneId\.value === session\.id/);
   assert.match(profileChat, /replaceProfileChatModalPane\(target\.sessionId, sessionId\)/);
@@ -331,7 +345,8 @@ test("mobile route and modal overlays expose consistent focus, inert, and naviga
     assert.match(modal, /useModalOutsideClose/);
   }
   assert.match(overlay, /COMPACT_OVERLAY_VIEWPORT = "\(max-width: 1279px\)"/);
-  assert.match(overlay, /PHONE_OVERLAY_VIEWPORT = "\(max-width: 768px\)"/);
+  assert.match(overlay, /PHONE_OVERLAY_VIEWPORT = PHONE_VIEWPORT_QUERY/);
+  assert.match(viewport, /PHONE_VIEWPORT_QUERY = "\(max-width: 768px\), \(max-width: 1400px\) and \(any-pointer: coarse\)"/);
   assert.match(overlay, /mobileOverlayBackgroundElements\(overlayRoot, appShell, kind, preserveMobileRouteChrome\)/);
   assert.match(overlay, /while \(overlayBranch !== appShell\)/);
   assert.match(overlay, /parent === appShell && keepRouteChrome/);
@@ -441,6 +456,10 @@ test("mobile tab and Kanban CSS preserve scrolling, focus, scaled text, and touc
   assert.match(styles, /\.mobile-chat-tabs button \{[^}]*clamp\(148px, 48vw, 220px\)/);
   assert.match(styles, /\.side-rail\[data-mobile-profiles-open="true"\] \.sidebar-session \{[^}]*touch-action: pan-y/);
   assert.match(styles, /\.side-rail\[data-mobile-profiles-open="true"\] \.sidebar-session > i \{[^}]*touch-action: none/);
+  assert.match(styles, /\.mobile-bottom-tabs \{[\s\S]*grid-template-columns: repeat\(5, minmax\(0, 1fr\)\)/);
+  assert.match(styles, /\.mobile-bottom-tabs > button \{[\s\S]*min-height: 56px/);
+  assert.match(styles, /\.mobile-bottom-tabs > button\.is-active \{[\s\S]*var\(--accent-soft\)/);
+  assert.match(styles, /\.mobile-page-stage--kanban > \.kanban-page \{[\s\S]*overflow: auto/);
   assert.match(styles, /\.user-instruction-body\.is-collapsed \{[^}]*max-height: calc\(1\.65em \* 10\)/);
   assert.match(styles, /\.user-instruction:hover \.user-instruction-utilities,[\s\S]*opacity: 1/);
   assert.match(styles, /@media \(hover: none\) \{[\s\S]*\.user-instruction-copy \{[^}]*var\(--target-mobile, 44px\)/);
@@ -509,7 +528,7 @@ test("small phones preserve scaled primary navigation, safe areas, and touch tar
 
 test("compact Profile overlays keep 44px controls through 768, 1024, and 1279px", async () => {
   const appearance = await readFile(new URL("../src/appearance.css", import.meta.url), "utf8");
-  const compactRule = appearance.match(/@media \(max-width: (1279)px\) \{([\s\S]*?)\n\}\n\n@media \(max-width: 768px\)/);
+  const compactRule = appearance.match(/@media \(max-width: (1279)px\) \{([\s\S]*?)\n\}\n\n@media \(max-width: 768px\),/);
   assert.ok(compactRule, "compact touch-target rules must precede the phone-only rules");
   const maxWidth = Number(compactRule[1]);
   for (const viewport of [768, 1024, 1279]) {

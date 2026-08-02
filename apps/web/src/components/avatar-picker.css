@@ -92,7 +92,7 @@
   line-height: 1.5;
 }
 
-@media (max-width: 768px) {
+@media (max-width: 768px), (max-width: 1400px) and (any-pointer: coarse) {
   .avatar-picker-backdrop { align-items: end; padding: 0; }
   .avatar-picker {
     width: 100% !important;

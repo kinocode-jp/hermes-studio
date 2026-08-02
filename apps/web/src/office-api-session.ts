@@ -208,6 +208,9 @@ export async function logoutRemoteDevice(serverUrl = studioServerUrl()): Promise
 
 async function requestOfficeJson<T>(url: URL, options: OfficeApiRequestOptions, session: OfficeClientSession, serverUrl: string, retryAuth: boolean): Promise<T> {
   const controller = new AbortController();
+  const abortFromCaller = () => controller.abort(options.signal?.reason);
+  if (options.signal?.aborted) abortFromCaller();
+  else options.signal?.addEventListener("abort", abortFromCaller, { once: true });
   const timeout = window.setTimeout(() => controller.abort(), options.timeoutMs ?? FETCH_TIMEOUT_MS);
   const method = options.method ?? "GET";
   try {
@@ -235,6 +238,7 @@ async function requestOfficeJson<T>(url: URL, options: OfficeApiRequestOptions, 
     return await response.json() as T;
   } finally {
     window.clearTimeout(timeout);
+    options.signal?.removeEventListener("abort", abortFromCaller);
   }
 }
 

@@ -272,7 +272,8 @@ export class GlobalInheritanceCoordinator {
         try {
           await this.#applyGlobalSkillMutation(revision, profile, skill, true, false, deadlineMs);
           managed.set(key, { profile, skill });
-        } catch {
+        } catch (error) {
+          if (error instanceof GlobalIntentPersistenceError) throw error.original;
           failures.push({ profile, skill, operation: "enable" });
         }
       }
@@ -287,7 +288,8 @@ export class GlobalInheritanceCoordinator {
         try {
           await this.#applyGlobalSkillMutation(revision, profile, item.skill, false, true, deadlineMs);
           managed.delete(keyOf(item.profile, item.skill));
-        } catch {
+        } catch (error) {
+          if (error instanceof GlobalIntentPersistenceError) throw error.original;
           failures.push({ profile, skill: item.skill, operation: "disable" });
         }
       }
@@ -319,7 +321,21 @@ export class GlobalInheritanceCoordinator {
     deadlineMs: number,
   ): Promise<void> {
     assertBeforeDeadline(deadlineMs);
-    const prepared = await this.#options.store.prepareGlobalSkillMutation(revision, profile, skill, desiredEnabled, expectedEnabled);
+    let prepared;
+    try {
+      prepared = await this.#options.store.prepareGlobalSkillMutation(
+        revision,
+        profile,
+        skill,
+        desiredEnabled,
+        expectedEnabled,
+      );
+    } catch (error) {
+      // Without a durable intent it is unsafe to report an ordinary pending
+      // materialization: there is nothing a restart can reconcile. Propagate
+      // storage/conflict failure before any Hermes mutation begins.
+      throw new GlobalIntentPersistenceError(error);
+    }
     if (prepared.existing) {
       await this.#reconcilePendingGlobalSkillMutation(prepared.transaction, deadlineMs);
       return;
@@ -444,6 +460,9 @@ function dedupeFailures(failures: OfficeGlobalSettingsDto["skillSync"]["failures
 
 function keyOf(profile: string, skill: string): string { return `${profile}\0${skill}`; }
 function unavailable(): HermesSettingsError { return new HermesSettingsError("rejected", "Global skills are pending synchronization. Retry after checking the affected profiles."); }
+class GlobalIntentPersistenceError extends Error {
+  constructor(readonly original: unknown) { super("Global skill intent could not be persisted."); }
+}
 function reconciliationPending(): HermesSettingsError { return new HermesSettingsError("rejected", "Profile skill changed, but ownership reconciliation is still pending. Retry safely before global synchronization."); }
 function isDefinitePreconditionFailure(error: unknown): boolean {
   return error instanceof HermesSettingsError

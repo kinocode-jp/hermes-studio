@@ -77,6 +77,7 @@ type CompletedRun = {
   sequence: number;
   fingerprints: Set<string>;
   sources: Set<string>;
+  taskId?: string;
   usedAnonymousMessageIdentity: boolean;
 };
 
@@ -85,8 +86,12 @@ type SessionEventCorrelation = {
   activeRunSequence?: number;
   activeRunObserved?: boolean;
   activeRunSources: Set<string>;
+  activeRunTaskId?: string;
   activeRunFingerprints: Set<string>;
   activeRunUsedAnonymousMessageIdentity?: boolean;
+  activeRunPreparedByPrompt?: boolean;
+  activeRunAnonymousStream?: boolean;
+  terminalFenceObserved: boolean;
   completedAnonymousMessageHistory: boolean;
   messageReplayFence: ReplayFence;
   toolReplayFence: ReplayFence;
@@ -244,11 +249,31 @@ export class ChatUpstreamHub {
     // routing lease; release, reuse, or ownership transfer still fails closed.
     const authorizeSettlement = (): boolean => this.#coordinator.routingLeaseToken(owner, liveSessionId)
       === expectedLeaseToken;
-    return await this.#requestUnchecked(
+    const steerRun = request.method === "session.steer"
+      ? this.#steerRunState(liveSessionId)
+      : undefined;
+    // Hermes accepts non-empty steer text even after its turn has ended, but
+    // that queue has no consumer. Once Office has observed the terminal fence,
+    // do not hand the text upstream; the Browser can safely promote it to a new
+    // prompt without risking a duplicate commit.
+    if (steerRun?.state === "idle") {
+      return { method: request.method, value: { status: "turn_ended" } };
+    }
+    const result = await this.#requestUnchecked(
       request, internal,
       authorizeCommand,
       authorizeSettlement,
     );
+    if (request.method === "session.steer" && result.value.status === "turn_ended") {
+      // Only the synthetic pre-request branch above proves no upstream side
+      // effect. The same status returned after Hermes received steer is commit
+      // ambiguous and must never unlock Browser auto-promotion.
+      throw new ChatCommitUnconfirmedError();
+    }
+    // Once steer was handed upstream, a terminal arriving before its ACK does
+    // not prove whether Hermes consumed the queue. Preserve the authoritative
+    // queued ACK; Browser recovery is allowed only for the pre-send idle case.
+    return result;
   }
 
   async #requestUnchecked(
@@ -281,6 +306,10 @@ export class ChatUpstreamHub {
         }
         throw new Error("Hermes live session ownership changed.");
       }
+      if (promptSessionId !== undefined && expectedRunId !== undefined && typeof result.value.taskId === "string") {
+        const state = this.#eventCorrelations.get(promptSessionId);
+        if (state?.activeRunId === expectedRunId) state.activeRunTaskId = result.value.taskId;
+      }
       this.#observeRequestUsage(request);
       return result;
     } catch (error) {
@@ -290,6 +319,10 @@ export class ChatUpstreamHub {
       if ((request.method === "session.create" || request.method === "session.resume")
         && error instanceof HermesChatTransportError && error.code === "timed_out"
         && generation === this.#generation) {
+        // A timed-out start is commit-ambiguous: Hermes may have created a
+        // close-on-disconnect session whose late live id can no longer be
+        // observed. Reset the shared generation so Hermes authoritatively reaps
+        // that unknown lease before any client retries.
         try { await connection.close(); } finally { this.#upstreamUnavailable(generation); }
       }
       if (commitSensitiveRequest(request) && commitCouldBeUnconfirmed(request.method, error)) {
@@ -584,6 +617,70 @@ export class ChatUpstreamHub {
       eventSequence,
     };
 
+    if (event.type === "error" && event.payload.status !== "resync_required") {
+      const taskId = stringPayload(event.payload, "taskId", "task_id");
+      const sources = messageSourceIds(event.payload);
+      const hasOrigin = sources.length > 0 || taskId !== undefined;
+      if (!hasOrigin && state.activeRunId !== undefined && state.completedRuns.length > 0) {
+        return resyncRequiredEvent(event, payload, "An error could belong to either the active or a completed run. Reload session history.");
+      }
+      const candidates = new Map<string, { id: string; sequence: number; active: boolean }>();
+      const addCandidate = (id: string | undefined, sequence: number | undefined, active: boolean): void => {
+        if (id !== undefined && sequence !== undefined) candidates.set(id, { id, sequence, active });
+      };
+      if (hasOrigin) {
+        if (state.activeRunId !== undefined && (
+          (taskId !== undefined && state.activeRunTaskId === taskId)
+          || sources.some((source) => state.activeRunSources.has(source))
+        )) addCandidate(state.activeRunId, state.activeRunSequence, true);
+        for (const run of state.completedRuns) {
+          if ((taskId !== undefined && run.taskId === taskId)
+            || sources.some((source) => run.sources.has(source))) {
+            addCandidate(run.id, run.sequence, false);
+          }
+        }
+      } else if (state.activeRunId !== undefined) {
+        addCandidate(state.activeRunId, state.activeRunSequence, true);
+      } else if (state.completedRuns.length === 1) {
+        const only = state.completedRuns[0]!;
+        addCandidate(only.id, only.sequence, false);
+      }
+      if (candidates.size === 0) {
+        return resyncRequiredEvent(event, payload, "An error could not be correlated to an assistant run. Reload session history.");
+      }
+      if (candidates.size !== 1) {
+        return resyncRequiredEvent(event, payload, "Error origins identified conflicting assistant runs. Reload session history.");
+      }
+      const candidate = candidates.values().next().value!;
+      const runId = candidate.id;
+      const runSequence = candidate.sequence;
+      payload.runId = runId;
+      payload.runSequence = runSequence;
+      if (candidate.active) {
+        state.completedRuns = [
+          ...state.completedRuns.filter((run) => run.id !== runId),
+          {
+            id: runId,
+            sequence: runSequence,
+            fingerprints: new Set(state.activeRunFingerprints),
+            sources: new Set(state.activeRunSources),
+            ...(state.activeRunTaskId === undefined ? {} : { taskId: state.activeRunTaskId }),
+            usedAnonymousMessageIdentity: state.activeRunUsedAnonymousMessageIdentity === true,
+          },
+        ].slice(-MAX_RECENT_COMPLETED_RUNS);
+        delete state.activeRunId;
+        delete state.activeRunSequence;
+        delete state.activeRunObserved;
+        state.activeRunSources = new Set();
+        delete state.activeRunTaskId;
+        state.activeRunFingerprints = new Set();
+        delete state.activeRunUsedAnonymousMessageIdentity;
+        delete state.activeRunPreparedByPrompt;
+        delete state.activeRunAnonymousStream;
+        state.terminalFenceObserved = true;
+      }
+    }
+
     if (MESSAGE_EVENT_TYPES.has(event.type)) {
       const fingerprint = eventFingerprint(event);
       const sources = messageSourceIds(event.payload);
@@ -612,7 +709,32 @@ export class ChatUpstreamHub {
       }
       const matchesCurrentFingerprint = state.activeRunFingerprints.has(fingerprint);
       const matchesCurrentSource = sources.some((source) => state.activeRunSources.has(source));
+      // Hermes 0.19 emits message frames without a message id. A prompt ACK
+      // on this same ordered transport is the causal boundary for a fresh
+      // anonymous message.start; older anonymous deltas still fail closed.
+      const startsExpectedAnonymousRun = event.type === "message.start"
+        && sources.length === 0
+        && state.activeRunId !== undefined
+        && state.activeRunObserved === false
+        && state.activeRunPreparedByPrompt === true;
+      const continuesExpectedAnonymousRun = event.type !== "message.start"
+        && sources.length === 0
+        && state.activeRunId !== undefined
+        && state.activeRunObserved === true
+        && state.activeRunAnonymousStream === true;
+      if (state.activeRunId !== undefined
+        && state.activeRunObserved === false
+        && state.activeRunPreparedByPrompt === true
+        && sources.length === 0
+        && event.type !== "message.start") {
+        return resyncRequiredEvent(
+          event,
+          payload,
+          "An anonymous message frame arrived before the expected run start. Reload session history.",
+        );
+      }
       if (state.activeRunId !== undefined && state.activeRunObserved !== true
+        && !startsExpectedAnonymousRun
         && (recentCompleted !== undefined || seenFingerprint || seenPreferredSource || seenAnonymous)) {
         return resyncRequiredEvent(
           event,
@@ -623,10 +745,11 @@ export class ChatUpstreamHub {
       const startIntroducesUnlinkedIdentity = event.type === "message.start"
         && state.activeRunId !== undefined
         && state.activeRunObserved === true
-        && (sources.length > 0
+        && (state.activeRunAnonymousStream === true
+          || (sources.length > 0
           ? state.activeRunSources.size > 0 && !matchesCurrentSource
           : (state.activeRunSources.size > 0 || state.activeRunUsedAnonymousMessageIdentity === true)
-            && !matchesCurrentFingerprint);
+            && !matchesCurrentFingerprint));
       if (startIntroducesUnlinkedIdentity) {
         return resyncRequiredEvent(
           event,
@@ -635,6 +758,7 @@ export class ChatUpstreamHub {
         );
       }
       if (state.activeRunId !== undefined && state.activeRunObserved === true
+        && !continuesExpectedAnonymousRun
         && ((completedByFingerprint !== undefined && !matchesCurrentFingerprint)
           || (completedBySource !== undefined && !matchesCurrentSource)
           || (seenFingerprint && !matchesCurrentFingerprint)
@@ -674,6 +798,14 @@ export class ChatUpstreamHub {
       } else {
         state.activeRunId = runId;
         state.activeRunSequence = runSequence;
+        state.activeRunPreparedByPrompt = false;
+        // message.start establishes the anonymous stream for the whole run.
+        // Do not clear that fact when the first anonymous delta/interim frame
+        // arrives, otherwise the next chunk is mistaken for completed
+        // anonymous history on every turn after the first.
+        state.activeRunAnonymousStream = state.activeRunAnonymousStream === true
+          || startsExpectedAnonymousRun;
+        state.terminalFenceObserved = false;
         state.activeRunFingerprints.add(fingerprint);
         state.messageReplayFence.record(replayKeys);
         if (sources.length === 0) {
@@ -688,6 +820,7 @@ export class ChatUpstreamHub {
           sequence: runSequence,
           fingerprints: new Set(state.activeRunFingerprints),
           sources: new Set(state.activeRunSources),
+          ...(state.activeRunTaskId === undefined ? {} : { taskId: state.activeRunTaskId }),
           usedAnonymousMessageIdentity: state.activeRunUsedAnonymousMessageIdentity === true,
         };
         state.completedRuns = [
@@ -697,12 +830,16 @@ export class ChatUpstreamHub {
         if (completedRun.usedAnonymousMessageIdentity) {
           state.completedAnonymousMessageHistory = true;
         }
-        if (state.activeRunId === runId) state.activeRunId = undefined;
-        state.activeRunSequence = undefined;
-        state.activeRunObserved = undefined;
+        if (state.activeRunId === runId) delete state.activeRunId;
+        delete state.activeRunSequence;
+        delete state.activeRunObserved;
         state.activeRunSources = new Set();
+        delete state.activeRunTaskId;
         state.activeRunFingerprints = new Set();
-        state.activeRunUsedAnonymousMessageIdentity = undefined;
+        delete state.activeRunUsedAnonymousMessageIdentity;
+        delete state.activeRunPreparedByPrompt;
+        delete state.activeRunAnonymousStream;
+        state.terminalFenceObserved = true;
       } else if (!replayedPreviousRun) {
         state.activeRunObserved = true;
       }
@@ -947,6 +1084,9 @@ export class ChatUpstreamHub {
           const created = this.#newRunIdentity();
           state.activeRunId = created.id;
           state.activeRunSequence = created.sequence;
+          state.activeRunPreparedByPrompt = false;
+          state.activeRunAnonymousStream = false;
+          state.terminalFenceObserved = false;
         }
         occurrence.runId = state.activeRunId;
         occurrence.runSequence = state.activeRunSequence;
@@ -959,7 +1099,10 @@ export class ChatUpstreamHub {
           "A tool frame matched a different completed occurrence. Reload session history.",
         );
       }
-      if (occurrence.open && occurrence.runId === state.activeRunId) state.activeRunObserved = true;
+      if (occurrence.open && occurrence.runId === state.activeRunId) {
+        state.activeRunObserved = true;
+        state.activeRunPreparedByPrompt = false;
+      }
       occurrence.fingerprints.add(fingerprint);
       state.toolReplayFence.record(replayKeys);
       payload.toolOccurrenceId = occurrence.id;
@@ -1007,7 +1150,10 @@ export class ChatUpstreamHub {
     const created: SessionEventCorrelation = {
       activeRunSources: new Set(),
       activeRunFingerprints: new Set(),
+      activeRunPreparedByPrompt: false,
+      activeRunAnonymousStream: false,
       completedAnonymousMessageHistory: false,
+      terminalFenceObserved: false,
       messageReplayFence: new ReplayFence(),
       toolReplayFence: new ReplayFence(),
       completedRuns: [],
@@ -1015,6 +1161,16 @@ export class ChatUpstreamHub {
     };
     this.#eventCorrelations.set(sessionId, created);
     return created;
+  }
+
+  #steerRunState(sessionId: string):
+    | { state: "unknown" | "idle" }
+    | { state: "active"; runId: string } {
+    const correlation = this.#eventCorrelations.get(sessionId);
+    if (correlation === undefined) return { state: "unknown" };
+    return correlation.activeRunId === undefined
+      ? { state: correlation.terminalFenceObserved ? "idle" : "unknown" }
+      : { state: "active", runId: correlation.activeRunId };
   }
 
   #newRunIdentity(): { id: string; sequence: number } {
@@ -1032,20 +1188,27 @@ export class ChatUpstreamHub {
     state.activeRunSequence = run.sequence;
     state.activeRunObserved = false;
     state.activeRunSources = new Set();
+    delete state.activeRunTaskId;
     state.activeRunFingerprints = new Set();
-    state.activeRunUsedAnonymousMessageIdentity = undefined;
+    delete state.activeRunUsedAnonymousMessageIdentity;
+    state.activeRunPreparedByPrompt = true;
+    state.activeRunAnonymousStream = false;
+    state.terminalFenceObserved = false;
     return run.id;
   }
 
   #rollbackExpectedPromptRun(sessionId: string, runId: string): void {
     const state = this.#eventCorrelations.get(sessionId);
     if (state?.activeRunId !== runId || state.activeRunObserved === true) return;
-    state.activeRunId = undefined;
-    state.activeRunSequence = undefined;
-    state.activeRunObserved = undefined;
+    delete state.activeRunId;
+    delete state.activeRunSequence;
+    delete state.activeRunObserved;
     state.activeRunSources = new Set();
+    delete state.activeRunTaskId;
     state.activeRunFingerprints = new Set();
-    state.activeRunUsedAnonymousMessageIdentity = undefined;
+    delete state.activeRunUsedAnonymousMessageIdentity;
+    delete state.activeRunPreparedByPrompt;
+    delete state.activeRunAnonymousStream;
   }
 
   /**
@@ -1319,7 +1482,8 @@ function eventFingerprint(event: HermesChatEvent): string {
 
 function commitSensitiveRequest(request: HermesChatRequest): boolean {
   if (request.method === "prompt.submit" || request.method === "session.steer"
-    || request.method === "approval.respond" || request.method === "clarify.respond") return true;
+    || request.method === "session.interrupt" || request.method === "approval.respond"
+    || request.method === "clarify.respond") return true;
   if (request.method !== "slash.exec" || typeof request.params?.command !== "string") return false;
   return /^\/(?:compact|undo|model|reasoning)(?:\s|$)/i.test(request.params.command.trim());
 }

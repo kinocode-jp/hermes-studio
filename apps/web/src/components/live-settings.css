@@ -1223,7 +1223,7 @@
   cursor: pointer;
 }
 .dir-picker__pick:disabled { opacity: .5; cursor: default; }
-@media (max-width: 768px) {
+@media (max-width: 768px), (max-width: 1400px) and (any-pointer: coarse) {
   .dir-picker-layer { padding: 48px 8px 8px; align-items: end; }
   .dir-picker { width: 100%; max-height: 100%; }
   .dir-picker__row { min-height: 44px; }
@@ -1392,7 +1392,7 @@
   padding-top: 12px;
   border-top: 1px solid var(--ls-line);
 }
-@media (max-width: 768px) {
+@media (max-width: 768px), (max-width: 1400px) and (any-pointer: coarse) {
   .settings-projects__head,
   .settings-projects__rename,
   .settings-projects__addfolder,

@@ -5,11 +5,15 @@ import test from "node:test";
 import { WebSocketServer } from "ws";
 import {
   createHermesChatTransport,
+  composeStudioPromptForWire,
   HermesChatTransportError,
   type HermesChatEvent,
   type HermesChatRequest,
 } from "./hermes-chat.js";
-import { appendStudioFollowUpTurnInstruction } from "./office-agent-behavior.js";
+import {
+  appendStudioDefaultDelegationTurnInstruction,
+  appendStudioFollowUpTurnInstruction,
+} from "./office-agent-behavior.js";
 
 const TOKEN = "0123456789abcdef0123456789abcdef"; // gitleaks:allow -- synthetic test credential
 const DASHBOARD_SECRET = "dashboard-example-value-123456"; // gitleaks:allow -- synthetic test credential
@@ -22,6 +26,48 @@ const OPENAI_STANDALONE_SECRET = "sk-proj-ABCDEFGHIJKLMNOPQRSTUVWXYZ123456"; // 
 const AUTH_HEADER_SECRET = "opaque-auth-header-value"; // gitleaks:allow -- synthetic test credential
 const COOKIE_SECRET = "office-cookie-example-value-123456"; // gitleaks:allow -- synthetic test credential
 const JWT_SECRET = ["eyJhbGciOiJIUzI1NiJ9", "eyJzdWIiOiIxIn0", "signature0123456789"].join(".");
+const MINIMAL_TEST_CATALOG = JSON.stringify({
+  version: 1, catalogStatus: "unavailable", usableFor: ["main", "subagent"],
+  coverage: "profile-scoped live provider catalogs",
+});
+
+test("prompt wire budgeting preserves user text and degrades only the model catalog", () => {
+  const catalog = [
+    JSON.stringify({ version: 1, catalogStatus: "complete", usableFor: ["main", "subagent"] }),
+    ...Array.from({ length: 400 }, (_, index) => JSON.stringify({
+      profile: "coder", provider: "openai", model: `model-${index}`, reasoningEfforts: ["low", "high"],
+    })),
+  ].join("\n");
+  const composed = composeStudioPromptForWire("keep-user-body", "live-budget", {
+    studioDefaultDelegationTurn: true,
+    studioDefaultDelegationModelCatalog: catalog,
+    studioFollowUpTurn: true,
+  }, 32 * 1024);
+  assert.match(composed, /^keep-user-body/);
+  assert.match(composed, /"catalogStatus":"partial"/);
+  assert.match(composed, /"truncated":true/);
+  assert.equal(composed.includes("model-399"), false);
+  const serialized = JSON.stringify({
+    jsonrpc: "2.0", id: Number.MAX_SAFE_INTEGER, method: "prompt.submit",
+    params: { session_id: "live-budget", text: composed },
+  });
+  assert.ok(Buffer.byteLength(serialized) <= 32 * 1024);
+});
+
+test("prompt wire input boundary is identical for default and specialist Profiles", () => {
+  const escapedBoundary = "\\".repeat(16_000);
+  for (const internal of [
+    { studioDefaultDelegationTurn: true as const, studioDefaultDelegationModelCatalog: MINIMAL_TEST_CATALOG, studioFollowUpTurn: true as const },
+    { studioFollowUpTurn: true as const },
+  ]) {
+    assert.throws(
+      () => composeStudioPromptForWire(escapedBoundary, "live-budget", internal, 16 * 1024),
+      (error: unknown) => error instanceof HermesChatTransportError
+        && error.code === "invalid_request"
+        && /conversation context budget/.test(error.message),
+    );
+  }
+});
 
 test("fetchHistory authenticates internally and returns a bounded secret-safe DTO", async (t) => {
   const observedUrls: string[] = [];
@@ -164,7 +210,7 @@ test("chat connection sends only validated allowlisted RPC and normalizes result
   await connection.request({ method: "session.resume", params: { session_id: "stored-1", profile: "coder" } });
   await connection.request(
     { method: "prompt.submit", params: { session_id: "live-1", text: "What changed?" } },
-    { studioFollowUpTurn: true },
+    { studioDefaultDelegationTurn: true, studioFollowUpTurn: true },
   );
   await connection.request({ method: "clarify.respond", params: { request_id: "clarify-1", answer: "" } });
   await new Promise((resolve) => setTimeout(resolve, 20));
@@ -177,7 +223,9 @@ test("chat connection sends only validated allowlisted RPC and normalizes result
   assert.deepEqual(received[2]?.params, { session_id: "stored-1", profile: "coder", close_on_disconnect: true, source: "desktop" });
   assert.deepEqual(received[3]?.params, {
     session_id: "live-1",
-    text: appendStudioFollowUpTurnInstruction("What changed?"),
+    text: appendStudioFollowUpTurnInstruction(
+      appendStudioDefaultDelegationTurnInstruction("What changed?", MINIMAL_TEST_CATALOG),
+    ),
   });
   assert.deepEqual(received[4]?.params, { request_id: "clarify-1", answer: "" });
   assert.deepEqual(result.value, { liveSessionId: "live-1", storedSessionId: "stored-1", messageCount: 0, running: false, status: "RPC_TOKEN=[REDACTED]", model: "model-safe", provider: "provider-safe", reasoningEffort: "high" });

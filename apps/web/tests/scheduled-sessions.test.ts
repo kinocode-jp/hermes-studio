@@ -3,6 +3,8 @@ import { readFile } from "node:fs/promises";
 import test from "node:test";
 import type { ChatSession } from "../src/domain.ts";
 import {
+  isScheduledSession,
+  isScheduledSessionHidden,
   scheduledSessionKey,
   scheduledSessionsToPrune,
 } from "../src/scheduled-sessions.ts";
@@ -33,6 +35,32 @@ test("zero keep count selects every scheduled session for pruning", () => {
     scheduledSessionsToPrune(sessions, 0, scheduledSessionKey("default", newest.title)).map((session) => session.id),
     ["new", "old"],
   );
+});
+
+test("Kanban worker terminal markers are excluded from conversation sessions", () => {
+  const terminalMarker: ChatSession = {
+    id: "kanban-terminal-marker",
+    storedSessionId: "kanban-terminal-marker",
+    profileId: "default",
+    title: "Kanban terminal transition recorded; this worker run is finished.",
+    status: "ready",
+    messages: [],
+    connectionState: "disconnected",
+    historyState: "unloaded",
+    remoteKind: "stored",
+    readOnly: true,
+  };
+
+  assert.equal(isScheduledSession(terminalMarker), false);
+  assert.equal(isScheduledSessionHidden(terminalMarker), true);
+  assert.equal(isScheduledSessionHidden({ ...terminalMarker, title: "Kanban Task Completion Recorded" }), true);
+  assert.equal(isScheduledSessionHidden({ ...terminalMarker, title: "Kanban Task Transition Recorded" }), true);
+  assert.equal(isScheduledSessionHidden({ ...terminalMarker, title: "Kanban terminal transition recorded" }), true);
+  assert.equal(isScheduledSessionHidden({ ...terminalMarker, title: "Worker log", lastMessagePreview: "Kanban terminal transition recorded" }), true);
+  assert.equal(isScheduledSessionHidden({ ...terminalMarker, title: "Untitled session", conversationKind: "delegated" }), false);
+  assert.equal(isScheduledSessionHidden({ ...terminalMarker, title: "Discussion: Kanban terminal transition recorded later" }), false);
+  assert.equal(isScheduledSessionHidden({ ...terminalMarker, title: "Untitled session", lastMessagePreview: "The Kanban terminal transition recorded a useful result" }), false);
+  assert.equal(isScheduledSessionHidden({ ...terminalMarker, conversationKind: "delegated" }), false);
 });
 
 test("scheduled session deletion uses an in-app confirmation dialog in desktop WebViews", async () => {

@@ -38,6 +38,10 @@ import {
 } from "./dashboard-layout";
 import { officeWindowOpen, setOfficeWindowOpen } from "./office-window";
 import {
+  isDiscardableUnusedChatDraft,
+  isReplaceableInitialChatSession,
+} from "./chat-session-retention";
+import {
   activeSessionId,
   closeSession,
   createSession,
@@ -203,23 +207,6 @@ function replaceableInitialChatPanel(): { panelId: string; sessionId: string } |
   });
   return candidates.find((candidate) => candidate.panelId === activeDashboard.value.activeChatPanelId)
     ?? candidates.at(-1);
-}
-
-function isReplaceableInitialChatSession(session: ChatSession | undefined): boolean {
-  return session?.titlePresentation === "new-chat"
-    && session.messages.length === 0
-    && session.status !== "streaming";
-}
-
-/**
- * A blank startup composer backed only by a purely local, unpersisted draft is
- * discarded when its pane is replaced; persisted conversations stay listed.
- */
-function isDiscardableUnusedChatDraft(session: ChatSession | undefined): boolean {
-  return session !== undefined
-    && isReplaceableInitialChatSession(session)
-    && session.remoteKind === "draft"
-    && session.storedSessionId === undefined;
 }
 
 /**
@@ -478,16 +465,21 @@ export function installDashboardWiring(): () => void {
     const preferred = dashboard.panels.find((panel) =>
       panel.id === dashboard.activeChatPanelId && panel.kind === "chat",
     )?.sessionId;
-    const restoreOrder = preferred && wanted.includes(preferred)
-      ? [...wanted.filter((sessionId) => sessionId !== preferred), preferred]
-      : wanted;
     // openSession reads and writes active-target signals. Those are restoration
     // side effects, not dependencies of this effect; tracking them causes a
     // multi-pane restore to reactivate every pane forever.
     untracked(() => {
       switching = true;
       try {
-        for (const id of restoreOrder) openSession(id, { workspace: true });
+        const alreadyOpen = new Set(openSessionIds.value);
+        // Restore in persisted panel order. Focus the preferred pane in a
+        // separate idempotent call so active selection cannot reorder panes.
+        for (const id of wanted) {
+          if (alreadyOpen.has(id)) continue;
+          openSession(id, { workspace: true });
+          alreadyOpen.add(id);
+        }
+        if (preferred && alreadyOpen.has(preferred)) openSession(preferred, { workspace: true });
       } finally {
         switching = false;
       }

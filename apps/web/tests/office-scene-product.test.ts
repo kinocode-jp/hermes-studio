@@ -57,8 +57,8 @@ test("scene scaling and mobile fallback preserve accessible click targets", asyn
   assert.match(styles, /\.ow-char \{[^}]*min-width: 84px[^}]*min-height: 84px/);
   assert.match(styles, /\.office-row \{[^}]*min-height: (?:max\(68px, var\(--target-mobile\)\)|68px)/);
   // Mobile must honor scene/list selection (no forced list-only fallback) and keep 44px toggles.
-  const phoneStyles = styles.match(/@media \(max-width: 768px\) \{([\s\S]*?)\n\}\n\n@media \(prefers-reduced-motion/di)?.[1] ?? "";
-  assert.ok(phoneStyles, "phone scene rules must exist at the shared 768px breakpoint");
+  const phoneStyles = styles.match(/@media \(max-width: 768px\), \(max-width: 1400px\) and \(any-pointer: coarse\) \{([\s\S]*?)\n\}\n\n@media \(prefers-reduced-motion/di)?.[1] ?? "";
+  assert.ok(phoneStyles, "phone scene rules must include compact touch-first foldables");
   assert.doesNotMatch(phoneStyles, /\.office-seg--view,\s*\.office-seg--scene \{ display: none/);
   assert.doesNotMatch(phoneStyles, /\.office-wrap\[data-view="scene"\] \.office-stage \{ display: none/);
   assert.doesNotMatch(phoneStyles, /\.office-wrap\[data-view="scene"\] \.office-list \{ display: grid/);

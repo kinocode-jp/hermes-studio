@@ -2,6 +2,7 @@ import { useState } from "preact/hooks";
 import type { ChatSession } from "../domain";
 import { loadAllSessions, requestInventorySnapshotRefresh } from "../inventory";
 import { isScheduledSessionHidden } from "../scheduled-sessions";
+import { sessionMatchesDeleteScope, type SessionDeleteScope } from "../session-delete-scope";
 import { deleteSessions, sessions as sessionStore } from "../store";
 import { chatSessionTitle, t } from "../i18n";
 import { TrashIcon } from "./icons";
@@ -14,17 +15,17 @@ export function SessionDeleteDialog({ session, onClose }: {
   return <SessionsDeleteDialog sessions={[session]} onClose={onClose} />;
 }
 
-export function SessionsDeleteDialog({ sessions, onClose, deleteAllProfileId }: {
+export function SessionsDeleteDialog({ sessions, onClose, deleteScope }: {
   sessions: readonly ChatSession[];
   onClose: () => void;
-  deleteAllProfileId?: string;
+  deleteScope?: SessionDeleteScope;
 }) {
   const [busy, setBusy] = useState(false);
   const [failed, setFailed] = useState(false);
   const [progress, setProgress] = useState<{ completed: number; total: number } | null>(null);
   const ids = [...new Set(sessions.map((session) => session.id))];
   const single = sessions.length === 1;
-  const bulk = !single || deleteAllProfileId !== undefined;
+  const bulk = !single || deleteScope !== undefined;
   const overlay = useMobileOverlay<HTMLElement>({
     kind: "modal",
     open: true,
@@ -51,7 +52,7 @@ export function SessionsDeleteDialog({ sessions, onClose, deleteAllProfileId }: 
         });
         if (result.failed.length > 0) throw new Error("session-delete-partial");
         completed += result.deleted.length;
-        if (!deleteAllProfileId) {
+        if (!deleteScope) {
           onClose();
           return;
         }
@@ -59,7 +60,7 @@ export function SessionsDeleteDialog({ sessions, onClose, deleteAllProfileId }: 
         await requestInventorySnapshotRefresh();
         if (!await loadAllSessions()) throw new Error("session-inventory-incomplete");
         pendingIds = sessionStore.value
-          .filter((session) => session.profileId === deleteAllProfileId && !isScheduledSessionHidden(session))
+          .filter((session) => sessionMatchesDeleteScope(session, deleteScope) && !isScheduledSessionHidden(session))
           .map((session) => session.id);
         if (pendingIds.length === 0) {
           onClose();
@@ -107,7 +108,11 @@ export function SessionsDeleteDialog({ sessions, onClose, deleteAllProfileId }: 
         <div id="session-delete-message" class="scheduled-delete-dialog-message">
           <p>{!bulk
             ? t("chat.sessionDeleteConfirm", { title: chatSessionTitle(sessions[0]!) })
-            : t("chat.sessionsDeleteConfirm", { count: ids.length })}</p>
+            : deleteScope?.kind === "project"
+              ? t("project.menu.deleteProjectConfirm", { count: ids.length })
+              : deleteScope?.kind === "all-projects"
+                ? t("project.menu.deleteAllConfirm", { count: ids.length })
+                : t("chat.sessionsDeleteConfirm", { count: ids.length })}</p>
           <p>{t("chat.sessionDeleteNote")}</p>
         </div>
         {progress && (

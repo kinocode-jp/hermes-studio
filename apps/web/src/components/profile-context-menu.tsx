@@ -346,7 +346,7 @@ export function ProfileContextMenu({
       {deleteRequest && (
         <SessionsDeleteDialog
           sessions={deleteRequest.sessions}
-          {...(deleteRequest.all ? { deleteAllProfileId: menu.profileId } : {})}
+          {...(deleteRequest.all ? { deleteScope: { kind: "profile" as const, profileId: menu.profileId } } : {})}
           onClose={() => {
             setDeleteRequest(null);
             onClose();

@@ -67,6 +67,7 @@ import {
   performHostFileAction,
   readHostFileAction,
 } from "./host-fs.js";
+import { LinkPreviewError, LinkPreviewRateLimiter, resolveLinkPreview } from "./link-preview.js";
 
 const TRANSPORT_CLOSE_GRACE_MS = 750;
 const SHUTDOWN_PERSISTENCE_GRACE_MS = 1_500;
@@ -219,6 +220,7 @@ export function createStudioServer(options: StudioServerOptions = {}): StudioSer
   const chatSocketSessions = new WeakMap<WebSocket, import("./office-auth.js").OfficeAuthSession>();
   const chatSocketAuthGuards = new WeakMap<WebSocket, ChatSocketAuthGuard>();
   const chatDeviceLimiter = new ChatDeviceRateLimiter();
+  const linkPreviewLimiter = new LinkPreviewRateLimiter();
   const chatSessionCoordinator = new ChatSessionCoordinator({
     maxLeasesPerOwner: maxChatSessionLeasesPerOwner,
     maxLeasesPerProfile: maxChatSessionLeasesPerProfile,
@@ -716,6 +718,36 @@ export function createStudioServer(options: StudioServerOptions = {}): StudioSer
       return;
     }
     const authenticatedSession = readAccess.session;
+
+    if (requestUrl.pathname === "/api/v1/link-preview") {
+      if (!linkPreviewLimiter.consume(authenticatedSession.principal.id)) {
+        writeError(response, 429, "rate_limited", "Too many link preview requests.", maxJsonBytes, { "Retry-After": "3" });
+        return;
+      }
+      const previewController = new AbortController();
+      const abortPreview = () => previewController.abort(new DOMException("Link preview client disconnected.", "AbortError"));
+      const abortClosedPreview = () => { if (!response.writableEnded) abortPreview(); };
+      request.once("aborted", abortPreview);
+      response.once("close", abortClosedPreview);
+      try {
+        const preview = await resolveLinkPreview(requestUrl.searchParams.get("url"), previewController.signal);
+        if (!response.destroyed) {
+          writeJson(response, 200, preview, maxResponseJsonBytes, { "Cache-Control": "private, max-age=3600" });
+        }
+      } catch (error) {
+        if (response.destroyed || previewController.signal.aborted) {
+          // The browser no longer needs the preview; do not write to a closed response.
+        } else if (error instanceof LinkPreviewError && error.code === "unsupported") {
+          writeError(response, 400, "bad_request", error.message, maxJsonBytes);
+        } else {
+          writeError(response, 502, "runtime_unavailable", "Link preview is temporarily unavailable.", maxJsonBytes);
+        }
+      } finally {
+        request.off("aborted", abortPreview);
+        response.off("close", abortClosedPreview);
+      }
+      return;
+    }
 
     if (requestUrl.pathname === "/api/v1/audit") {
       const auditAccess = auth.authorizeOperation(request, "audit.read", false);

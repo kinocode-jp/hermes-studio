@@ -7,6 +7,7 @@ import type { OfficeAuth, OfficeAuthSession } from "./office-auth.js";
 import { ChatSessionCoordinator, type ChatSessionClaim } from "./chat-session-coordinator.js";
 import { ChatCommitUnconfirmedError, ChatUpstreamHub } from "./chat-upstream-hub.js";
 import type { UsageTelemetryStore } from "./usage-telemetry.js";
+import type { LiveModelsCatalog } from "./hermes-models.js";
 import { composeSessionCreateSystemSeed, studioDefaultProfileOrchestrationInstruction, studioFollowUpSessionInstruction, studioProfileAgentBehaviorInstruction } from "./office-agent-behavior.js";
 
 const MAX_IN_FLIGHT = 4;
@@ -23,6 +24,14 @@ const MAX_APPROVAL_QUEUE = 8;
 const MAX_APPROVAL_SESSIONS = 128;
 const MAX_LIVE_EVENT_COUNT = 4_096;
 const MAX_LIVE_EVENT_BYTES = 8 * 1024 * 1024;
+const READINESS_HEARTBEAT_MS = 5_000;
+const DELEGATION_CATALOG_DEADLINE_MS = 2_500;
+const DELEGATION_CATALOG_MAX_PROFILES = 32;
+const DELEGATION_CATALOG_MAX_PROVIDERS_PER_PROFILE = 16;
+const DELEGATION_CATALOG_MAX_MODELS_PER_PROVIDER = 128;
+const DELEGATION_CATALOG_MAX_REQUESTS = 128;
+const DELEGATION_CATALOG_CONCURRENCY = 4;
+const DELEGATION_CATALOG_MAX_UTF8_BYTES = 64 * 1024;
 const OWNED_LIVE_METHODS = new Set<HermesChatMethod>(["prompt.submit", "session.steer", "session.interrupt", "slash.exec"]);
 
 export interface ChatGatewayLimits {
@@ -61,6 +70,8 @@ export interface ChatGatewayDependencies {
   now?: () => number;
   sessionIsActive?: () => boolean;
   invalidationSignal?: AbortSignal;
+  /** Testable interval for authenticated pre-ready progress frames. */
+  readinessHeartbeatMs?: number;
   sessionCoordinator: ChatSessionCoordinator;
   chatHub: ChatUpstreamHub;
   /** Optional Office-owned skill/MCP/tool usage meter (fail-safe). */
@@ -70,6 +81,7 @@ export interface ChatGatewayDependencies {
 type PendingResponseState = "pending" | "claimed" | "consumed";
 interface PendingResponse {
   sessionId: string;
+  requestId: string;
   leaseToken: symbol;
   createdAt: number;
   createdOrder: number;
@@ -126,6 +138,7 @@ export function handleOfficeChatConnection(client: WebSocket, dependencies: Chat
   }
   const canApprovePermanently = auth.effectiveAccess(officeSession).allowedOperations.includes("chat.approval.permanent");
   const now = dependencies.now ?? Date.now;
+  const readinessHeartbeatMs = Math.max(1, dependencies.readinessHeartbeatMs ?? READINESS_HEARTBEAT_MS);
   const sessionOwner = {};
   const limits = {
     ...DEFAULT_LIMITS,
@@ -145,12 +158,19 @@ export function handleOfficeChatConnection(client: WebSocket, dependencies: Chat
   const clarificationExpiryTimers = new Map<string, ReturnType<typeof setTimeout>>();
   const liveEventBudgets = new Map<string, { leaseToken: symbol; count: number; bytes: number }>();
   let hubReady = false;
+  let officeHelloReceived = false;
+  let readinessHeartbeatTimer: ReturnType<typeof setTimeout> | undefined;
   let closed = false;
   let inFlight = 0;
   let chronology = 0;
   let rateTokens = limits.socketRateCapacity;
   let rateUpdatedAt = now();
   let closeWhenIdleReason: string | undefined;
+
+  const clearReadinessHeartbeat = (): void => {
+    if (readinessHeartbeatTimer !== undefined) clearTimeout(readinessHeartbeatTimer);
+    readinessHeartbeatTimer = undefined;
+  };
 
   const clearExpiryTimer = (timers: Map<string, ReturnType<typeof setTimeout>>, key: string): void => {
     const timer = timers.get(key);
@@ -170,10 +190,10 @@ export function handleOfficeChatConnection(client: WebSocket, dependencies: Chat
         clearExpiryTimer(approvalExpiryTimers, liveId);
       }
     }
-    for (const [requestId, entry] of pendingClarifications) {
+    for (const [key, entry] of pendingClarifications) {
       if (entry.leaseToken === leaseToken) {
-        pendingClarifications.delete(requestId);
-        clearExpiryTimer(clarificationExpiryTimers, requestId);
+        pendingClarifications.delete(key);
+        clearExpiryTimer(clarificationExpiryTimers, key);
       }
     }
     for (const [liveId, budget] of liveEventBudgets) {
@@ -188,6 +208,7 @@ export function handleOfficeChatConnection(client: WebSocket, dependencies: Chat
   const shutdown = (): void => {
     if (closed) return;
     closed = true;
+    clearReadinessHeartbeat();
     queued.length = 0;
     for (const timer of approvalExpiryTimers.values()) clearTimeout(timer);
     for (const timer of clarificationExpiryTimers.values()) clearTimeout(timer);
@@ -261,6 +282,22 @@ export function handleOfficeChatConnection(client: WebSocket, dependencies: Chat
     }
   };
 
+  const sendReadinessProgress = (): void => {
+    send({ jsonrpc: "2.0", method: "office.waiting", params: { phase: "attaching" } });
+  };
+
+  const scheduleReadinessHeartbeat = (): void => {
+    clearReadinessHeartbeat();
+    if (closed || hubReady || !officeHelloReceived || client.readyState !== WebSocket.OPEN) return;
+    readinessHeartbeatTimer = setTimeout(() => {
+      readinessHeartbeatTimer = undefined;
+      if (closed || hubReady || !officeHelloReceived || client.readyState !== WebSocket.OPEN) return;
+      sendReadinessProgress();
+      scheduleReadinessHeartbeat();
+    }, readinessHeartbeatMs);
+    readinessHeartbeatTimer.unref();
+  };
+
   const sendInteractionExpired = (
     type: "approval.expired" | "clarify.expired",
     sessionId: string,
@@ -284,7 +321,9 @@ export function handleOfficeChatConnection(client: WebSocket, dependencies: Chat
           && typeof frame.params?.choice === "string"
           && claim.entry.choices.has(frame.params.choice);
       }
-      return frame.method === "clarify.respond" && frame.params?.request_id === claim.key;
+      return frame.method === "clarify.respond"
+        && frame.params?.session_id === claim.entry.sessionId
+        && frame.params?.request_id === claim.entry.requestId;
     });
   };
 
@@ -336,10 +375,10 @@ export function handleOfficeChatConnection(client: WebSocket, dependencies: Chat
     if (promoted !== undefined) activateAndSendApproval(sessionId, promoted);
   };
 
-  const settleExpiredClarification = async (requestId: string, entry: PendingResponse): Promise<void> => {
-    if (closed || pendingClarifications.get(requestId) !== entry || entry.state !== "pending") return;
+  const settleExpiredClarification = async (key: string, entry: PendingResponse): Promise<void> => {
+    if (closed || pendingClarifications.get(key) !== entry || entry.state !== "pending") return;
     if (sessionCoordinator.routingLeaseToken(sessionOwner, entry.sessionId) !== entry.leaseToken) {
-      pendingClarifications.delete(requestId);
+      pendingClarifications.delete(key);
       return;
     }
     entry.state = "claimed";
@@ -349,20 +388,20 @@ export function handleOfficeChatConnection(client: WebSocket, dependencies: Chat
         sessionOwner,
         entry.sessionId,
         entry.leaseToken,
-        { method: "clarify.respond", params: { request_id: requestId, answer: "" } },
+        { method: "clarify.respond", params: { request_id: entry.requestId, answer: "" } },
         authorizeSideEffect,
       );
       safeToContinue = true;
     } catch (error) {
       safeToContinue = error instanceof HermesChatTransportError && error.code === "backend_rejected";
     }
-    if (closed || pendingClarifications.get(requestId) !== entry || entry.state !== "claimed") return;
+    if (closed || pendingClarifications.get(key) !== entry || entry.state !== "claimed") return;
     consumeClaim(
-      { kind: "clarification", key: requestId, entry },
+      { kind: "clarification", key, entry },
       pendingApprovals,
       pendingClarifications,
     );
-    sendInteractionExpired("clarify.expired", entry.sessionId, { requestId });
+    sendInteractionExpired("clarify.expired", entry.sessionId, { requestId: entry.requestId });
     if (!safeToContinue) {
       sendInteractionSettlementError(entry.sessionId);
       return;
@@ -421,26 +460,26 @@ export function handleOfficeChatConnection(client: WebSocket, dependencies: Chat
     }
   }
 
-  function scheduleClarificationExpiry(requestId: string, entry: PendingResponse, minimumDelayMs = 1): void {
-    clearExpiryTimer(clarificationExpiryTimers, requestId);
+  function scheduleClarificationExpiry(key: string, entry: PendingResponse, minimumDelayMs = 1): void {
+    clearExpiryTimer(clarificationExpiryTimers, key);
     if (closed) return;
     const timer = setTimeout(() => {
-      clarificationExpiryTimers.delete(requestId);
-      if (closed || pendingClarifications.get(requestId) !== entry) return;
+      clarificationExpiryTimers.delete(key);
+      if (closed || pendingClarifications.get(key) !== entry) return;
       if (entry.state === "claimed") return;
-      if (hasQueuedTimelyResponse({ kind: "clarification", key: requestId, entry })) {
-        scheduleClarificationExpiry(requestId, entry, 25);
+      if (hasQueuedTimelyResponse({ kind: "clarification", key, entry })) {
+        scheduleClarificationExpiry(key, entry, 25);
         return;
       }
       const currentTime = now();
       if (entry.expiresAt > currentTime) {
-        scheduleClarificationExpiry(requestId, entry);
+        scheduleClarificationExpiry(key, entry);
         return;
       }
-      void settleExpiredClarification(requestId, entry);
+      void settleExpiredClarification(key, entry);
     }, Math.max(minimumDelayMs, entry.expiresAt - now()));
     timer.unref();
-    clarificationExpiryTimers.set(requestId, timer);
+    clarificationExpiryTimers.set(key, timer);
   }
 
   const trimClarifications = (): void => {
@@ -498,7 +537,7 @@ export function handleOfficeChatConnection(client: WebSocket, dependencies: Chat
         ownedRequestLiveId = targetId;
         ownedRequestLeaseToken = targetLeaseToken;
       }
-      if (frame.method !== "session.resume" && frame.method !== "approval.respond"
+      if (frame.method !== "session.resume" && frame.method !== "approval.respond" && frame.method !== "clarify.respond"
         && !OWNED_LIVE_METHODS.has(frame.method) && targetId !== undefined && targetOwner !== undefined && targetOwner !== sessionOwner) {
         sendSessionInUse(send, frame.id);
         return;
@@ -532,27 +571,30 @@ export function handleOfficeChatConnection(client: WebSocket, dependencies: Chat
         ownedRequestLeaseToken = pending.leaseToken;
       }
       if (frame.method === "clarify.respond") {
+        const sessionId = typeof frame.params?.session_id === "string" ? frame.params.session_id : "";
         const requestId = typeof frame.params?.request_id === "string" ? frame.params.request_id : "";
-        const pending = pendingClarifications.get(requestId);
+        const key = clarificationKey(sessionId, requestId);
+        const pending = pendingClarifications.get(key);
         const identityMatches = pending !== undefined
-          && sessionCoordinator.routingLeaseToken(sessionOwner, pending.sessionId) === pending.leaseToken;
+          && pending.sessionId === sessionId
+          && sessionCoordinator.routingLeaseToken(sessionOwner, sessionId) === pending.leaseToken;
         const ownsTarget = identityMatches
-          && sessionCoordinator.ownsLiveLease(sessionOwner, pending.sessionId, pending.leaseToken);
+          && sessionCoordinator.ownsLiveLease(sessionOwner, sessionId, pending.leaseToken);
         if (pending !== undefined && !identityMatches) {
-          pendingClarifications.delete(requestId);
-          clearExpiryTimer(clarificationExpiryTimers, requestId);
+          pendingClarifications.delete(key);
+          clearExpiryTimer(clarificationExpiryTimers, key);
         }
         if (!ownsTarget || pending === undefined || pending.state !== "pending" || receivedOrder < pending.createdOrder || receivedAt < pending.createdAt || pending.expiresAt <= receivedAt) {
           if (pending?.expiresAt !== undefined && pending.expiresAt <= receivedAt) {
-            clearExpiryTimer(clarificationExpiryTimers, requestId);
-            await settleExpiredClarification(requestId, pending);
+            clearExpiryTimer(clarificationExpiryTimers, key);
+            await settleExpiredClarification(key, pending);
           }
           sendRpcError(send, frame.id, -32004, "Pending clarification was not found.");
           return;
         }
         pending.state = "claimed";
-        claim = { kind: "clarification", key: requestId, entry: pending };
-        ownedRequestLiveId = pending.sessionId;
+        claim = { kind: "clarification", key, entry: pending };
+        ownedRequestLiveId = sessionId;
         ownedRequestLeaseToken = pending.leaseToken;
       }
       if (frame.method === "session.create") {
@@ -588,6 +630,24 @@ export function handleOfficeChatConnection(client: WebSocket, dependencies: Chat
         ownedRequest = { liveSessionId: ownedRequestLiveId, leaseToken: ownedRequestLeaseToken };
       }
       if (sessionClaim !== undefined) sessionStartSettlement = chatHub.beginSessionStart(sessionOwner);
+      const isDefaultPrompt = frame.method === "prompt.submit" && ownedRequest !== undefined
+        && sessionCoordinator.profileForLive(ownedRequest.liveSessionId) === "default";
+      const defaultPromptModelCatalog = isDefaultPrompt
+        ? await resolveDefaultDelegationModelCatalog(runtimeSource)
+        : undefined;
+      const promptInternal = frame.method === "prompt.submit"
+        ? {
+          studioFollowUpTurn: true as const,
+          ...(isDefaultPrompt
+            ? {
+              studioDefaultDelegationTurn: true as const,
+              ...(defaultPromptModelCatalog === undefined
+                ? {}
+                : { studioDefaultDelegationModelCatalog: defaultPromptModelCatalog }),
+            }
+            : {}),
+        }
+        : undefined;
       const result = frame.method === "session.close" && typeof frame.params?.session_id === "string"
         ? await chatHub.closeOwnedSession(sessionOwner, frame.params.session_id, authorizeSideEffect)
         : ownedRequest !== undefined
@@ -595,7 +655,7 @@ export function handleOfficeChatConnection(client: WebSocket, dependencies: Chat
             sessionOwner, ownedRequest.liveSessionId, ownedRequest.leaseToken,
             { method: frame.method, ...upstreamRequestParams(frame.method, frame.params) },
             authorizeSideEffect,
-            frame.method === "prompt.submit" ? { studioFollowUpTurn: true } : undefined,
+            promptInternal,
           )
         : await chatHub.request(
           sessionOwner,
@@ -674,7 +734,7 @@ export function handleOfficeChatConnection(client: WebSocket, dependencies: Chat
       }
       if (closed) cleanupOwnedSessions();
       if (error instanceof ChatCommitUnconfirmedError
-        && (frame.method === "prompt.submit" || frame.method === "session.steer" || frame.method === "slash.exec"
+        && (frame.method === "prompt.submit" || frame.method === "session.steer" || frame.method === "session.interrupt" || frame.method === "slash.exec"
           || frame.method === "approval.respond" || frame.method === "clarify.respond")) {
         sendCommitUnconfirmed(send, frame.id);
       } else {
@@ -714,7 +774,12 @@ export function handleOfficeChatConnection(client: WebSocket, dependencies: Chat
     // loopback upgrade can deterministically request a fresh readiness frame.
     // It is still rate-limited like every other inbound message.
     if (isOfficeHello(data.toString())) {
+      officeHelloReceived = true;
       if (hubReady) send({ jsonrpc: "2.0", method: "office.ready", params: {} });
+      else {
+        sendReadinessProgress();
+        scheduleReadinessHeartbeat();
+      }
       return;
     }
     if (queued.length >= limits.maxQueue) { client.close(1013, "Chat queue is full"); return; }
@@ -781,14 +846,15 @@ export function handleOfficeChatConnection(client: WebSocket, dependencies: Chat
       if (leaseToken === undefined) return;
       const createdAt = now();
       const createdOrder = ++chronology;
-      const existing = pendingClarifications.get(event.payload.requestId);
+      const key = clarificationKey(event.sessionId, event.payload.requestId);
+      const existing = pendingClarifications.get(key);
       if (existing?.leaseToken !== leaseToken || existing.state !== "claimed") {
         const entry: PendingResponse = {
-          sessionId: event.sessionId, leaseToken, createdAt, createdOrder,
+          sessionId: event.sessionId, requestId: event.payload.requestId, leaseToken, createdAt, createdOrder,
           expiresAt: createdAt + (clarificationTtlOverride ?? limits.clarificationTtlMs), state: "pending",
         };
-        pendingClarifications.set(event.payload.requestId, entry);
-        scheduleClarificationExpiry(event.payload.requestId, entry);
+        pendingClarifications.set(key, entry);
+        scheduleClarificationExpiry(key, entry);
       }
       trimClarifications();
     }
@@ -810,9 +876,13 @@ export function handleOfficeChatConnection(client: WebSocket, dependencies: Chat
   }).then(() => {
     if (closed) { chatHub.detach(sessionOwner); return; }
     hubReady = true;
+    clearReadinessHeartbeat();
     send({ jsonrpc: "2.0", method: "office.ready", params: {} });
     drain();
-  }).catch(() => client.close(1013, "Hermes chat unavailable"));
+  }).catch(() => {
+    clearReadinessHeartbeat();
+    client.close(1013, "Hermes chat unavailable");
+  });
 }
 
 function isOfficeHello(value: string): boolean {
@@ -845,8 +915,12 @@ function chatOperation(method: HermesChatMethod): Operation {
 }
 
 function chatTargetId(method: HermesChatMethod, params: Record<string, unknown> | undefined): string | undefined {
-  if (method === "session.create" || method === "clarify.respond") return undefined;
+  if (method === "session.create") return undefined;
   return typeof params?.session_id === "string" ? params.session_id : undefined;
+}
+
+function clarificationKey(sessionId: string, requestId: string): string {
+  return `${sessionId}\0${requestId}`;
 }
 
 function sendRpcError(send: (value: unknown) => void, id: string | number, code: number, message: string): void {
@@ -954,6 +1028,10 @@ function upstreamRequestParams(
     ...params,
     close_on_disconnect: true,
   } };
+  if (method === "clarify.respond") return { params: {
+    ...(typeof params.request_id === "string" ? { request_id: params.request_id } : {}),
+    ...(typeof params.answer === "string" ? { answer: params.answer } : {}),
+  } };
   if (method !== "approval.respond") return { params };
   return { params: {
     ...(typeof params.session_id === "string" ? { session_id: params.session_id } : {}),
@@ -1019,6 +1097,187 @@ async function optionalSessionSeedPart(value: Promise<string | undefined> | unde
   } finally {
     if (timer !== undefined) clearTimeout(timer);
   }
+}
+
+type DelegationProfileCatalog = {
+  profile: string;
+  root?: LiveModelsCatalog;
+  providers: LiveModelsCatalog[];
+  expectedProviderIds: string[];
+  providerListTruncated: boolean;
+};
+
+/**
+ * Resolve the same profile-scoped live catalogs used by the Studio model UI.
+ * Every dimension is bounded and failures are represented without diagnostics;
+ * catalog discovery must never prevent the user's prompt from being sent.
+ */
+export async function resolveDefaultDelegationModelCatalog(
+  runtimeSource: HermesRuntimeSource,
+  deadlineMs = DELEGATION_CATALOG_DEADLINE_MS,
+): Promise<string | undefined> {
+  let adapter: ReturnType<NonNullable<HermesRuntimeSource["models"]>> | undefined;
+  try { adapter = runtimeSource.models?.(); }
+  catch { adapter = undefined; }
+  const catalogAdapter = adapter;
+  const deadline = Date.now() + deadlineMs;
+  try {
+    const snapshot = await withinDelegationCatalogDeadline(() => runtimeSource.snapshot(), deadline);
+    const profiles = [...snapshot.profiles]
+      .map(({ id }) => id)
+      .filter((id) => id !== "default")
+      .sort((left, right) => left.localeCompare(right))
+      .slice(0, DELEGATION_CATALOG_MAX_PROFILES);
+    const roots = catalogAdapter === undefined
+      ? profiles.map(() => undefined)
+      : await boundedCatalogMap(profiles, async (profile) => {
+        try { return await withinDelegationCatalogDeadline(() => catalogAdapter.loadLiveCatalog(profile), deadline); }
+        catch { return undefined; }
+      });
+    const collected: DelegationProfileCatalog[] = profiles.map((profile, index) => {
+      const root = roots[index];
+      return {
+        profile,
+        ...(root === undefined ? {} : { root }),
+        providers: root === undefined ? [] : [root],
+        expectedProviderIds: root?.providers.map(({ id }) => id)
+          .sort((left, right) => left.localeCompare(right))
+          .slice(0, DELEGATION_CATALOG_MAX_PROVIDERS_PER_PROFILE) ?? [],
+        providerListTruncated: (root?.providers.length ?? 0) > DELEGATION_CATALOG_MAX_PROVIDERS_PER_PROFILE,
+      };
+    });
+    const jobs = collected.flatMap((profile) => profile.expectedProviderIds
+      .filter((provider) => provider !== profile.root?.provider)
+      .map((provider) => ({ profile, provider })))
+      .slice(0, Math.max(0, DELEGATION_CATALOG_MAX_REQUESTS - profiles.length));
+    await boundedCatalogMap(jobs, async ({ profile, provider }) => {
+      try {
+        if (catalogAdapter === undefined) return undefined;
+        const catalog = await withinDelegationCatalogDeadline(
+          () => catalogAdapter.loadLiveCatalog(profile.profile, provider),
+          deadline,
+        );
+        profile.providers.push(catalog);
+      } catch { /* The profile is emitted as partial/unavailable without diagnostics. */ }
+      return undefined;
+    });
+    return formatDelegationModelCatalog(
+      collected,
+      snapshot.profiles.length - (snapshot.profiles.some(({ id }) => id === "default") ? 1 : 0) > profiles.length
+        || profileInventoryIncomplete(snapshot.inventory.profiles),
+    );
+  } catch {
+    return unavailableDelegationModelCatalog();
+  }
+}
+
+function profileInventoryIncomplete(page: {
+  returned: number;
+  available: number;
+  total?: number;
+  hasMore: boolean;
+  truncated: boolean;
+  partialFailures: number;
+}): boolean {
+  return page.truncated || page.partialFailures > 0 || page.hasMore
+    || page.returned < page.available
+    || (page.total !== undefined && page.available < page.total);
+}
+
+async function boundedCatalogMap<T, R>(items: readonly T[], task: (item: T) => Promise<R>): Promise<R[]> {
+  const results = new Array<R>(items.length);
+  let cursor = 0;
+  const workers = Array.from({ length: Math.min(DELEGATION_CATALOG_CONCURRENCY, items.length) }, async () => {
+    while (cursor < items.length) {
+      const index = cursor++;
+      results[index] = await task(items[index]!);
+    }
+  });
+  await Promise.all(workers);
+  return results;
+}
+
+async function withinDelegationCatalogDeadline<T>(operation: () => Promise<T>, deadline: number): Promise<T> {
+  const remaining = deadline - Date.now();
+  if (remaining <= 0) throw new Error("catalog deadline");
+  // Invoke lazily only after the deadline guard. Bounded workers may continue
+  // draining their local job indexes after timeout, but no expired job is
+  // allowed to start new adapter I/O.
+  const value = operation();
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    return await Promise.race([
+      value,
+      new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(() => reject(new Error("catalog deadline")), remaining);
+      }),
+    ]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}
+
+function formatDelegationModelCatalog(profiles: readonly DelegationProfileCatalog[], profilesTruncated: boolean): string {
+  let catalogStatus = profiles.length === 0 || profiles.every(({ root }) => root === undefined)
+    ? "unavailable"
+    : profilesTruncated || profiles.some((profile) => !profileCatalogCoverageComplete(profile))
+      ? "partial"
+      : "complete";
+  const lines = [
+    JSON.stringify({ version: 1, catalogStatus, usableFor: ["main", "subagent"], coverage: "profile-scoped live provider catalogs" }),
+  ];
+  let bytes = Buffer.byteLength(`${lines[0]}\n`);
+  let truncated = profilesTruncated;
+  const append = (record: Record<string, unknown>, reserveTruncationMarker = true): boolean => {
+    const line = JSON.stringify(record);
+    const added = Buffer.byteLength(`${line}\n`);
+    const limit = DELEGATION_CATALOG_MAX_UTF8_BYTES - (reserveTruncationMarker ? 32 : 0);
+    if (bytes + added > limit) { truncated = true; return false; }
+    lines.push(line);
+    bytes += added;
+    return true;
+  };
+  for (const profile of profiles) {
+    const loadedProviderIds = new Set(profile.providers.map(({ provider }) => provider));
+    const coverageComplete = profileCatalogCoverageComplete(profile);
+    if (!append({
+      profile: profile.profile,
+      status: profile.root === undefined ? "unavailable" : coverageComplete ? "complete" : "partial",
+      defaultProvider: profile.root?.defaultProvider ?? null,
+      defaultModel: profile.root?.defaultModel ?? null,
+      expectedProviderIds: profile.expectedProviderIds,
+      loadedProviderIds: [...loadedProviderIds].sort((left, right) => left.localeCompare(right)),
+    })) break;
+    for (const catalog of [...profile.providers].sort((left, right) => left.provider.localeCompare(right.provider))) {
+      for (const model of catalog.models.slice(0, DELEGATION_CATALOG_MAX_MODELS_PER_PROVIDER)) {
+        if (!append({
+          profile: profile.profile,
+          provider: catalog.provider,
+          model: model.id,
+          reasoningEfforts: model.reasoningEfforts ?? null,
+        })) break;
+      }
+      if (catalog.models.length > DELEGATION_CATALOG_MAX_MODELS_PER_PROVIDER) truncated = true;
+    }
+  }
+  if (truncated) append({ truncated: true }, false);
+  if (truncated && catalogStatus === "complete") {
+    catalogStatus = "partial";
+    lines[0] = JSON.stringify({ version: 1, catalogStatus, usableFor: ["main", "subagent"], coverage: "profile-scoped live provider catalogs" });
+  }
+  return lines.join("\n");
+}
+
+function profileCatalogCoverageComplete(profile: DelegationProfileCatalog): boolean {
+  const loadedProviderIds = new Set(profile.providers.map(({ provider }) => provider));
+  return profile.root !== undefined
+    && !profile.providerListTruncated
+    && profile.expectedProviderIds.every((provider) => loadedProviderIds.has(provider))
+    && profile.providers.every(({ models }) => models.length <= DELEGATION_CATALOG_MAX_MODELS_PER_PROVIDER);
+}
+
+function unavailableDelegationModelCatalog(): string {
+  return formatDelegationModelCatalog([], false);
 }
 
 function officeApprovalEvent(approval: PendingApproval): HermesChatEvent {

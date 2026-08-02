@@ -8,6 +8,10 @@ import { mergeServerSessionStatus } from "./session-runtime";
 import { reconcileDefaultAvatarProfiles, registerDefaultAvatarProfiles } from "./avatar-preferences";
 import { ensurePokemonDisplayNames } from "./profile-names";
 import {
+  protectSessionInventoryOmission,
+  recordSessionInventoryObservation,
+} from "./session-inventory-observation";
+import {
   activeSessionId,
   dismissSessions,
   openSessionIds,
@@ -89,6 +93,34 @@ export async function requestInventorySnapshotRefresh(): Promise<void> {
 
 export async function loadMoreProfiles(): Promise<void> { await loadMore("profiles"); }
 export async function loadMoreSessions(): Promise<void> { await loadMore("sessions"); }
+
+/** Load every profile page before presenting a Studio-wide project directory. */
+export async function loadAllProfiles(maxPages = 1_000): Promise<boolean> {
+  let loadedPages = 0;
+  while (profileInventoryState.value.hasMore) {
+    if (loadedPages >= maxPages) return false;
+    if (profileInventoryState.value.loading) {
+      let settled = false;
+      for (let attempt = 0; attempt < 400; attempt += 1) {
+        await new Promise<void>((resolve) => window.setTimeout(resolve, 50));
+        if (!profileInventoryState.value.loading) {
+          settled = true;
+          break;
+        }
+      }
+      if (!settled) return false;
+      continue;
+    }
+    const cursor = profileInventoryState.value.nextCursor;
+    if (!cursor) return false;
+    await loadMoreProfiles();
+    loadedPages += 1;
+    const next = profileInventoryState.value;
+    if (next.error !== undefined) return false;
+    if (next.hasMore && next.nextCursor === cursor) return false;
+  }
+  return !profileInventoryState.value.hasMore && profileInventoryState.value.error === undefined;
+}
 
 /** Load every reliable session-inventory page before destructive "delete all" actions. */
 export async function loadAllSessions(maxPages = 1_000): Promise<boolean> {
@@ -217,7 +249,7 @@ function commitInventoryPage(page: InventoryPage, identity: InventoryIdentity): 
     identity.sessionsReliable &&= isReliablePage(page.pagination);
     mergeSessions(page.sessions, identity.seenSessions);
     sessionInventoryComplete.value = identity.sessionsReliable && isTerminal(page.pagination);
-    if (sessionInventoryComplete.value) pruneSessions(identity.seenSessions);
+    if (sessionInventoryComplete.value) pruneSessions(identity.seenSessions, identity);
     setProfileChatModalSessionInventoryAuthoritative(sessionInventoryComplete.value);
   }
 }
@@ -251,12 +283,15 @@ function mergeSessions(rows: OfficeSnapshot["sessions"], seen?: Set<string>): vo
   const existing = new Map(next.flatMap((session, index) => session.remoteKind === "stored" ? [[sessionKey(session), index] as const] : []));
   const pageSeen = new Set<string>();
   for (const live of rows) {
+    recordSessionInventoryObservation(live.profileId, live.id);
     if (isScheduledSessionHidden({
       id: live.id,
       storedSessionId: live.id,
       profileId: live.profileId,
       title: live.title,
       titlePresentation: undefined,
+      lastMessagePreview: live.lastMessagePreview,
+      conversationKind: live.conversationKind,
     })) continue;
     const key = sessionKey(live);
     if (pageSeen.has(key)) continue;
@@ -282,8 +317,16 @@ function pruneProfiles(seen: ReadonlySet<string>): void {
   if (!profileList.value.some((profile) => profile.id === selectedProfileId.value)) selectedProfileId.value = profileList.value[0]?.id ?? "";
 }
 
-function pruneSessions(seen: ReadonlySet<string>): void {
-  const removedIds = new Set(sessions.value.flatMap((session) => session.remoteKind === "stored" && !seen.has(sessionKey(session)) ? [session.id] : []));
+function pruneSessions(seen: ReadonlySet<string>, identity: OfficeSnapshotRequestIdentity): void {
+  const removedIds = new Set(sessions.value.flatMap((session) => {
+    const storedSessionId = session.storedSessionId;
+    return session.remoteKind === "stored"
+      && storedSessionId !== undefined
+      && !seen.has(sessionKey(session))
+      && !protectSessionInventoryOmission(session.profileId, storedSessionId, identity)
+      ? [session.id]
+      : [];
+  }));
   if (removedIds.size === 0) return;
   dismissSessions([...removedIds]);
 }

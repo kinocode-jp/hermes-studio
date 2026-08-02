@@ -125,14 +125,20 @@ for the main chat model—there is no accepted wire field for a sub model—so
 Office does not invent one. Applying a sub model to Hermes subagents remains
 blocked on Hermes support.
 
+The picker treats Hermes' full provider/model inventory as authoritative,
+including canonical providers that are not configured yet. Those providers may
+have no selectable models until their Hermes authentication/setup is completed;
+Studio does not substitute OpenCodex credentials for native Hermes providers.
+
 Before loading that picker, Studio performs a bounded local-provider sync. It
 reads only public model/provider metadata from the fixed loopback OpenCodex
 proxy (`127.0.0.1:10100`) and from running OpenAI-compatible local runtimes at
 the standard Ollama, LM Studio, and vLLM loopback ports. It then registers or
 updates only Studio-owned `local-cli-*` / `local-runtime-*` custom endpoint ids
-for the selected Hermes profile. Codex models published without a provider
-prefix are grouped using their `owned_by` metadata; namespaced Claude, Gemini,
-Kimi, xAI, and other configured OpenCodex providers remain separated. API keys,
+for the selected Hermes profile. OpenCodex is represented as one optional local
+routing gateway because Hermes intentionally groups custom providers that share
+the same URL, credential identity, and wire protocol. Its Codex, Claude, Gemini,
+Kimi, xAI, and other namespaced models remain models under that gateway. API keys,
 OAuth tokens, CLI config files, arbitrary ports, and non-loopback destinations
 are never read or accepted by this discovery path. Installed CLIs that do not
 publish an OpenAI-compatible model endpoint (for example the OpenCode session

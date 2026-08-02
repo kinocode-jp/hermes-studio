@@ -7,6 +7,7 @@ const DEFAULT_MAX_PROVIDERS = 200;
 const PROFILE_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 const PROVIDER_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_./:-]{0,127}$/;
 const MODEL_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_./:+@-]{0,255}$/;
+const HERMES_PICKER_OPTIONS_PATH = "/api/model/options?include_unconfigured=1";
 
 /** Canonical Hermes reasoning_effort values Office may surface (never invent). */
 export const REASONING_EFFORT_VALUES = [
@@ -203,8 +204,26 @@ export function createHermesModelsAdapter(options: HermesModelsAdapterOptions): 
         );
         const current = await client.requestOptional("/api/providers/custom-endpoints", "GET");
         const existing = extractCustomEndpointSignatures(current);
+        const obsolete = new Set<string>();
+        for (const [id, signature] of existing) {
+          if (isLegacyOpenCodexEndpoint(id) && signature.baseUrl === OPENCODEX_BASE_URL) {
+            obsolete.add(id);
+          }
+        }
         let registered = 0;
         for (const provider of discovered) {
+          const nativeEndpoint = [...existing.entries()].find(([id, signature]) => (
+            id !== provider.endpointId
+            && !isStudioLocalEndpoint(id)
+            && signature.baseUrl === provider.baseUrl
+          ));
+          // Reuse a user/Hermes-owned endpoint for the same local runtime.
+          // Creating a second row makes Hermes intentionally collapse the two.
+          if (nativeEndpoint !== undefined) {
+            const own = existing.get(provider.endpointId);
+            if (own?.baseUrl === provider.baseUrl) obsolete.add(provider.endpointId);
+            continue;
+          }
           const signature = existing.get(provider.endpointId);
           // The stable prefix is ours, but never overwrite a hand-written
           // endpoint that happens to use the same id for another host.
@@ -224,6 +243,12 @@ export function createHermesModelsAdapter(options: HermesModelsAdapterOptions): 
           });
           registered += 1;
         }
+        for (const id of obsolete) {
+          await client.requestOptional(
+            `/api/providers/custom-endpoints/${encodeURIComponent(id)}`,
+            "DELETE",
+          );
+        }
         for (const key of cache.keys()) {
           if (key.startsWith(`${validProfile}\0`)) cache.delete(key);
         }
@@ -237,6 +262,7 @@ export function createHermesModelsAdapter(options: HermesModelsAdapterOptions): 
 
 const OPENCODEX_ORIGIN = "http://127.0.0.1:10100";
 const OPENCODEX_BASE_URL = `${OPENCODEX_ORIGIN}/v1`;
+const OPENCODEX_ENDPOINT_ID = "local-cli-opencodex";
 
 export type LocalModelProvider = {
   endpointId: string;
@@ -293,7 +319,7 @@ async function discoverOpenCodexProviders(
   return extractOpenCodexProviders(modelsPayload, configuredPayload, maxModels, maxProviders);
 }
 
-/** Pure, secret-free extraction of providers published by the local OpenCodex proxy. */
+/** Pure, secret-free extraction of the local OpenCodex routing gateway. */
 export function extractOpenCodexProviders(
   modelsPayload: unknown,
   configuredPayload: unknown,
@@ -302,7 +328,7 @@ export function extractOpenCodexProviders(
 ): LocalModelProvider[] {
   if (!isRecord(modelsPayload) || !Array.isArray(modelsPayload.data)) return [];
   const configured = extractEnabledOpenCodexProviders(configuredPayload, maxProviders);
-  const grouped = new Map<string, string[]>();
+  const models: string[] = [];
   const rowLimit = Math.max(maxModels, maxModels * maxProviders);
   for (const row of modelsPayload.data.slice(0, rowLimit)) {
     if (!isRecord(row)) continue;
@@ -311,22 +337,17 @@ export function extractOpenCodexProviders(
     const slash = model.indexOf("/");
     const provider = sanitizeProvider(row.owned_by)
       ?? (slash > 0 ? sanitizeProvider(model.slice(0, slash)) : "openai");
-    if (provider === undefined || (configured !== undefined && !configured.has(provider))) continue;
-    let models = grouped.get(provider);
-    if (models === undefined) {
-      if (grouped.size >= maxProviders) continue;
-      models = [];
-      grouped.set(provider, models);
-    }
+    if (provider === undefined || (configured !== undefined && !configured.has(provider.toLowerCase()))) continue;
     if (models.length >= maxModels || models.includes(model)) continue;
     models.push(model);
   }
-  return [...grouped.entries()].map(([id, models]) => ({
-    endpointId: `local-cli-${id}`,
-    name: `${localCliProviderLabel(id)} · OpenCodex CLI`,
+  if (models.length === 0) return [];
+  return [{
+    endpointId: OPENCODEX_ENDPOINT_ID,
+    name: "OpenCodex · Local gateway",
     baseUrl: OPENCODEX_BASE_URL,
     models,
-  }));
+  }];
 }
 
 function extractEnabledOpenCodexProviders(value: unknown, maxProviders: number): Set<string> | undefined {
@@ -336,7 +357,7 @@ function extractEnabledOpenCodexProviders(value: unknown, maxProviders: number):
     if (!isRecord(row) || row.disabled === true) continue;
     const id = sanitizeProvider(row.name ?? row.id);
     if (id === undefined) continue;
-    providers.add(id);
+    providers.add(id.toLowerCase());
     if (providers.size >= maxProviders) break;
   }
   return providers;
@@ -409,14 +430,12 @@ function extractCustomEndpointSignatures(
   return result;
 }
 
-function localCliProviderLabel(provider: string): string {
-  if (provider === "openai") return "OpenAI Codex";
-  if (provider === "anthropic") return "Anthropic / Claude";
-  if (provider === "kimi") return "Kimi Code";
-  if (provider === "xai") return "xAI";
-  if (provider === "google-antigravity") return "Google Antigravity";
-  if (provider === "alibaba-token-plan") return "Alibaba Token Plan";
-  return provider.split(/[-_]/).map((part) => part ? `${part[0]!.toUpperCase()}${part.slice(1)}` : "").join(" ");
+function isStudioLocalEndpoint(id: string): boolean {
+  return id.startsWith("local-cli-") || id.startsWith("local-runtime-");
+}
+
+function isLegacyOpenCodexEndpoint(id: string): boolean {
+  return id.startsWith("local-cli-") && id !== OPENCODEX_ENDPOINT_ID;
 }
 
 async function loadCatalog(
@@ -520,7 +539,7 @@ async function loadProviderList(
   // The configured options surface is the authoritative place for named
   // custom endpoints, including providers imported from local CLI proxies.
   // Merge it even when the fast session catalog already listed providers.
-  const configured = await client.requestOptional("/api/model/options?explicit_only=1", "GET");
+  const configured = await client.requestOptional(HERMES_PICKER_OPTIONS_PATH, "GET");
   acc = mergeProviderCatalogs(acc, extractProviders(configured, maxProviders), maxProviders);
 
   const fallbacks = [
@@ -604,7 +623,7 @@ async function loadModelsForProvider(
   // Fallback: curated models from options for this provider only (no extra parallel fan-out).
   try {
     const optionsPayload = await client.requestOptional(
-      `/api/model/options?explicit_only=1`,
+      HERMES_PICKER_OPTIONS_PATH,
       "GET",
     );
     return extractModelsForProvider(optionsPayload, provider, maxModels);
@@ -616,11 +635,12 @@ async function loadModelsForProvider(
 
 function filterLocalCliModels(provider: string, models: LiveModelOption[]): LiveModelOption[] {
   if (provider.startsWith("local-runtime-")) return models;
+  if (provider === OPENCODEX_ENDPOINT_ID) return models;
   const marker = "local-cli-";
   if (!provider.startsWith(marker)) return models;
   const sourceProvider = provider.slice(marker.length);
-  // OpenCodex publishes its default Codex subscription models without a
-  // provider prefix; every other routed provider uses its explicit namespace.
+  // Compatibility for profiles that still contain a legacy per-provider
+  // OpenCodex endpoint during migration. The canonical gateway keeps all rows.
   if (sourceProvider === "openai") return models.filter((model) => !model.id.includes("/"));
   return models.filter((model) => model.id.startsWith(`${sourceProvider}/`));
 }
@@ -882,17 +902,10 @@ function normalizeProviderOption(value: unknown, activeFromRoot: string): LivePr
     || value.isCurrent === true
     || value.current === true
     || id === activeFromRoot;
-  // Prefer configured local providers: skip explicit unconfigured/disabled rows unless active.
-  if (!active && isExplicitlyUnavailableProvider(value)) return undefined;
+  // Keep canonical/unconfigured Hermes rows so Studio mirrors the full picker,
+  // but continue honoring an explicit user/provider disable marker.
+  if (!active && (value.enabled === false || value.available === false)) return undefined;
   return { id, label, active };
-}
-
-/** True when Hermes marks a row as not ready for selection (unless it is active). */
-function isExplicitlyUnavailableProvider(value: Record<string, unknown>): boolean {
-  if (value.configured === false || value.is_configured === false || value.isConfigured === false) return true;
-  if (value.enabled === false || value.available === false) return true;
-  if (value.authenticated === false || value.is_authenticated === false) return true;
-  return false;
 }
 
 function extractActiveProvider(value: unknown): string | undefined {
@@ -952,11 +965,11 @@ class ProfileModelsClient {
     private readonly maxResponseBytes: number,
   ) {}
 
-  async request(path: string, method: "GET" | "POST", body?: Record<string, unknown>): Promise<unknown> {
+  async request(path: string, method: "GET" | "POST" | "DELETE", body?: Record<string, unknown>): Promise<unknown> {
     return await this.#fetch(path, method, body, false);
   }
 
-  async requestOptional(path: string, method: "GET" | "POST", body?: Record<string, unknown>): Promise<unknown> {
+  async requestOptional(path: string, method: "GET" | "POST" | "DELETE", body?: Record<string, unknown>): Promise<unknown> {
     return await this.#fetch(path, method, body, true);
   }
 
@@ -966,7 +979,7 @@ class ProfileModelsClient {
 
   async #fetch(
     path: string,
-    method: "GET" | "POST",
+    method: "GET" | "POST" | "DELETE",
     body: Record<string, unknown> | undefined,
     optional: boolean,
     strictOptional = false,

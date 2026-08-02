@@ -3,7 +3,7 @@ import { officeFetchJson } from "./office-api";
 export async function deleteStoredSession(
   profileId: string,
   storedSessionId: string,
-  options: { timeoutMs?: number } = {},
+  options: { timeoutMs?: number; serverUrl?: string } = {},
 ): Promise<void> {
   const profile = profileId.trim();
   const sessionId = storedSessionId.trim();
@@ -11,13 +11,14 @@ export async function deleteStoredSession(
   await officeFetchJson<{ ok: true }>(
     `/api/v1/sessions/${encodeURIComponent(sessionId)}?profile=${encodeURIComponent(profile)}`,
     { method: "DELETE", ...(options.timeoutMs === undefined ? {} : { timeoutMs: options.timeoutMs }) },
+    options.serverUrl,
   );
 }
 
 export async function deleteStoredSessions(
   profileId: string,
   storedSessionIds: readonly string[],
-  options: { timeoutMs?: number } = {},
+  options: { timeoutMs?: number; serverUrl?: string } = {},
 ): Promise<void> {
   const profile = profileId.trim();
   const sessionIds = [...new Set(storedSessionIds.map((id) => id.trim()).filter(Boolean))];
@@ -28,5 +29,5 @@ export async function deleteStoredSessions(
     method: "POST",
     body: { profile, sessionIds },
     ...(options.timeoutMs === undefined ? {} : { timeoutMs: options.timeoutMs }),
-  });
+  }, options.serverUrl);
 }

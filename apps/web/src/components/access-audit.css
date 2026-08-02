@@ -176,7 +176,7 @@
 .access-audit__logout-action.is-danger { color: var(--coral); }
 .access-audit__logout .access-audit__message { padding: 0; }
 
-@media (max-width: 768px) {
+@media (max-width: 768px), (max-width: 1400px) and (any-pointer: coarse) {
   .access-audit__gate { grid-template-columns: auto minmax(0, 1fr) auto; gap: 12px; padding: 12px; }
   .access-audit__current {
     grid-column: 1 / -1;

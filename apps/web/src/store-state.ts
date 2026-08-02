@@ -1,5 +1,5 @@
 import { computed, signal } from "@preact/signals";
-import type { ChatPromptResult, ChatSlashResult, ChatSteerResult, ChatTarget } from "./chat-api";
+import type { ChatPromptResult, ChatSessionDeleteResult, ChatSessionEnsureOptions, ChatSlashResult, ChatSteerResult, ChatTarget } from "./chat-api";
 import type {
   ApprovalChoice,
   ChatConnectionState,
@@ -74,8 +74,11 @@ export const selectedProfileSessions = computed(() =>
 
 export const officeRuntimeHooks = {
   retryOfficeConnection: () => {},
-  ensureChatSession: (_target: ChatTarget) => {},
+  ensureChatSession: (_target: ChatTarget, _options?: ChatSessionEnsureOptions) => {},
   releaseChatSession: (_clientSessionId: string) => {},
+  deleteChatSession: (async (_clientSessionId: string) => ({ status: "deleted" })) as (
+    clientSessionId: string
+  ) => Promise<ChatSessionDeleteResult>,
   submitChatPrompt: (async () => ({ status: "rejected", message: "Chat runtime is not registered." })) as (
     clientSessionId: string, text: string, operationId: string
   ) => Promise<ChatPromptResult> | void,

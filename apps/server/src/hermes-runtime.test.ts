@@ -7,11 +7,24 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import {
+  createVersionProbeEnvironment,
   discoverHermesRuntime,
   isRecognizedHermesVersion,
   normalizeBaseUrl,
   probeHermesCli,
 } from "./hermes-runtime.js";
+
+test("version probes inherit Hermes home without forwarding credentials", () => {
+  const environment = createVersionProbeEnvironment({
+    HOME: "/Users/example",
+    HERMES_HOME: "/Volumes/D/.hermes",
+    OPENAI_API_KEY: "must-not-escape", // gitleaks:allow -- synthetic rejection fixture
+  });
+  assert.deepEqual(environment, {
+    HOME: "/Users/example",
+    HERMES_HOME: "/Volumes/D/.hermes",
+  });
+});
 
 test("ready status is validated and reduced to a secret-free DTO", async () => {
   const fixture = await statusServer({
@@ -131,7 +144,10 @@ if (process.argv.includes("--version")) {
 `, "utf8");
   await chmod(executable, 0o755);
   try {
-    const result = await probeHermesCli(executable, 200);
+    // Process startup through /usr/bin/env can exceed 200 ms on a loaded CI
+    // host. The assertion is about accepting output before process exit, not a
+    // sub-200 ms startup guarantee; production uses a 2-second default.
+    const result = await probeHermesCli(executable, 1_000);
     assert.deepEqual(result, { state: "available", version: "0.19.0" });
   } finally {
     await rm(directory, { recursive: true, force: true });

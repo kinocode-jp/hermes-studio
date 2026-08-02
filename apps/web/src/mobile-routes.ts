@@ -1,4 +1,5 @@
 import { mobileInspectorOpen, mobileWorkspaceOpen } from "./store-state";
+import { PHONE_VIEWPORT_QUERY } from "./viewport";
 
 /** Logical mobile route layers. Only the top layer is visible (mutually exclusive UI). */
 export type MobileRoute = "workspace" | "inspector";
@@ -13,7 +14,6 @@ let historyArmed = false;
 let ignorePopCount = 0;
 let historyInstalled = false;
 
-const PHONE_VIEWPORT = "(max-width: 768px)";
 const COMPACT_VIEWPORT = "(max-width: 1279px)";
 
 function matchesViewport(query: string): boolean {
@@ -22,7 +22,7 @@ function matchesViewport(query: string): boolean {
 
 function shouldTrackHistory(route: MobileRoute): boolean {
   if (typeof history === "undefined" || typeof history.pushState !== "function") return false;
-  return route === "workspace" ? matchesViewport(PHONE_VIEWPORT) : matchesViewport(COMPACT_VIEWPORT);
+  return route === "workspace" ? matchesViewport(PHONE_VIEWPORT_QUERY) : matchesViewport(COMPACT_VIEWPORT);
 }
 
 function applyTopRoute(): void {

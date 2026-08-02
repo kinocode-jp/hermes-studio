@@ -37,6 +37,7 @@ import { TeamsPanel } from "./teams-panel";
 import { ScheduledSessionsPanel } from "./scheduled-sessions-panel";
 import { ProfilesPanel } from "./profiles-panel";
 import { CloseIcon } from "./icons";
+import { PHONE_VIEWPORT_QUERY } from "../viewport";
 
 /** Minimum pane share of the resized axis. */
 const MIN_FRACTION = 0.15;
@@ -86,7 +87,7 @@ type DropTarget =
 export function DashboardView() {
   const [dropTarget, setDropTarget] = useState<DropTarget | null>(null);
   const [note, setNote] = useState<string | null>(null);
-  const [mobile, setMobile] = useState(() => typeof matchMedia === "function" && matchMedia("(max-width: 768px)").matches);
+  const [mobile, setMobile] = useState(() => typeof matchMedia === "function" && matchMedia(PHONE_VIEWPORT_QUERY).matches);
   const gestureRef = useRef<ResizeGesture | null>(null);
   const hostRef = useRef<HTMLElement>(null);
   const dashboard = activeDashboard.value;
@@ -106,7 +107,7 @@ export function DashboardView() {
 
   useEffect(() => {
     if (typeof matchMedia !== "function") return;
-    const query = matchMedia("(max-width: 768px)");
+    const query = matchMedia(PHONE_VIEWPORT_QUERY);
     const sync = () => setMobile(query.matches);
     sync();
     query.addEventListener("change", sync);

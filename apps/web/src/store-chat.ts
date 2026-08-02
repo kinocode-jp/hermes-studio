@@ -264,6 +264,17 @@ export function stageSessionModelChange(
   const session = sessions.value.find((item) => item.id === sessionId);
   if (!session) return;
   if (session.pendingModelChange?.applying) return;
+  if (session.remoteKind === "draft" && session.storedSessionId === undefined && session.liveSessionId === undefined) {
+    // An unused draft has no Hermes session to mutate. Fold the selection into
+    // session.create and refresh the tracked target instead of trying /model
+    // before the first live id exists.
+    applySessionModelPrefs(sessionId, provider, model, reasoningEffort);
+    updateChatSession(sessionId, (item) => ({ ...item, pendingModelChange: undefined }));
+    const updated = sessions.value.find((item) => item.id === sessionId);
+    const target = updated ? chatTarget(updated) : undefined;
+    if (target) officeRuntimeHooks.ensureChatSession(target);
+    return;
+  }
   const previousPending = session.pendingModelChange;
   const baseline = previousPending?.modelApplied
     ? {
@@ -352,7 +363,13 @@ export function refreshFollowUpSuggestions(sessionId: string): void {
 }
 
 export async function steerSession(sessionId: string, body: string): Promise<boolean> {
-  return steerChatRun(sessions, officeRuntimeHooks.steerChatSession, sessionId, body);
+  return steerChatRun(
+    sessions,
+    officeRuntimeHooks.steerChatSession,
+    recoverSteerAsPrompt,
+    sessionId,
+    body,
+  );
 }
 
 export async function interruptSession(sessionId: string): Promise<boolean> {
@@ -390,7 +407,7 @@ export async function respondToApproval(sessionId: string, choice: ApprovalChoic
 export function reconnectChatSession(sessionId: string): void {
   const session = sessions.value.find((item) => item.id === sessionId);
   const target = session ? chatTarget(session) : undefined;
-  if (target) officeRuntimeHooks.ensureChatSession(target);
+  if (target) officeRuntimeHooks.ensureChatSession(target, { retryFailed: true });
 }
 
 export function setChatSocketState(state: ChatConnectionState, message = ""): void {
@@ -570,7 +587,67 @@ export function setChatSessionError(sessionId: string, message: string): void {
 export function applyChatGatewayEvent(sessionId: string, event: ChatGatewayEvent): "resync-required" | void {
   let resyncRequired = false;
   updateChatSession(sessionId, (session) => reduceChatGatewayEvent(session, event, () => { resyncRequired = true; }));
+  const delivery = sessions.value.find((session) => session.id === sessionId)?.steerDelivery;
+  if (delivery?.acknowledgement === "queued" && delivery.terminalObserved === true) {
+    recoverSteerAsPrompt(sessionId, delivery.operationId);
+  }
   return resyncRequired ? "resync-required" : undefined;
+}
+
+function recoverSteerAsPrompt(sessionId: string, steerOperationId: string): void {
+  const recoveryOperationId = crypto.randomUUID();
+  let body: string | undefined;
+  updateChatSession(sessionId, (session) => {
+    const delivery = session.steerDelivery;
+    if (delivery?.operationId !== steerOperationId
+      || delivery.acknowledgement !== "queued"
+      || delivery.terminalObserved !== true
+      || delivery.recovering === true
+      || session.connectionState !== "ready"
+      || session.liveSessionId !== delivery.liveSessionId) return session;
+    body = delivery.body;
+    return {
+      ...session,
+      status: "streaming",
+      errorMessage: undefined,
+      followUpSuggestions: undefined,
+      steerDelivery: { ...delivery, recovering: true },
+      operationEvidence: boundedOperationEvidence([
+        ...(session.operationEvidence ?? []),
+        {
+          id: recoveryOperationId,
+          timelineSequence: nextChatTimelineSequence(session),
+          kind: "prompt",
+          body: delivery.body,
+          at: nowTimestamp(),
+          state: "pending",
+        },
+      ]),
+    };
+  });
+  if (body === undefined) return;
+  const finish = (result: ChatPromptResult): void => {
+    updatePromptOperation(sessionId, recoveryOperationId, result);
+    updateChatSession(sessionId, (session) => session.steerDelivery?.operationId === steerOperationId
+      ? { ...session, steerDelivery: undefined }
+      : session);
+  };
+  try {
+    const submission = officeRuntimeHooks.submitChatPrompt(sessionId, body, recoveryOperationId);
+    if (submission === undefined) {
+      finish({ status: "accepted" });
+      return;
+    }
+    void submission.then(finish, (reason) => finish({
+      status: "unconfirmed",
+      message: reason instanceof Error ? reason.message : "Prompt submission could not be confirmed.",
+    }));
+  } catch (reason) {
+    finish({
+      status: "unconfirmed",
+      message: reason instanceof Error ? reason.message : "Prompt submission could not be confirmed.",
+    });
+  }
 }
 
 function markInteractionSubmitting(sessionId: string, interactionId: string): void {

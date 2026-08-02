@@ -106,4 +106,21 @@ test("HTTP URLs and absolute API routes are not treated as local files", () => {
   assert.deepEqual(tokens[0], { kind: "code", text: "/api/v1/health" });
   assert.equal(tokens.some((token) => token.kind === "media"), false);
   assert.equal(tokens.slice(1).map((token) => token.text).join(""), " https://example.com/app.py");
+  assert.deepEqual(tokens.at(-1), {
+    kind: "link",
+    text: "https://example.com/app.py",
+    href: "https://example.com/app.py",
+  });
+});
+
+test("bare Markdown URLs retain balanced path and query parentheses", () => {
+  assert.deepEqual(tokenizeInline("https://en.wikipedia.org/wiki/Function_(mathematics)"), [{
+    kind: "link",
+    text: "https://en.wikipedia.org/wiki/Function_(mathematics)",
+    href: "https://en.wikipedia.org/wiki/Function_(mathematics)",
+  }]);
+  assert.deepEqual(tokenizeInline("https://example.com/search?q=(foo))"), [
+    { kind: "link", text: "https://example.com/search?q=(foo)", href: "https://example.com/search?q=(foo)" },
+    { kind: "text", text: ")" },
+  ]);
 });

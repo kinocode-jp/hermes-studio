@@ -13,6 +13,12 @@ const HIDDEN_ID_STORAGE = "hermes-studio.scheduled-sessions.hidden-ids.v1";
 const KEEP_STORAGE = "hermes-studio.scheduled-sessions.keep.v1";
 const KEEP_BY_GROUP_STORAGE = "hermes-studio.scheduled-sessions.keep-by-group.v1";
 const DEFAULT_KEEP_COUNT = 3;
+const KANBAN_WORKER_MARKERS = new Set([
+  "kanban task completion recorded",
+  "kanban task transition recorded",
+  "kanban terminal transition recorded",
+  "kanban terminal transition recorded; this worker run is finished",
+]);
 
 export const hiddenScheduledSessionKeys = signal<Set<string>>(loadStringSet(HIDDEN_KEY_STORAGE));
 export const hiddenScheduledSessionIds = signal<Set<string>>(loadStringSet(HIDDEN_ID_STORAGE));
@@ -20,6 +26,23 @@ export const hiddenScheduledSessionIds = signal<Set<string>>(loadStringSet(HIDDE
 export const scheduledKeepCount = signal<number>(loadDefaultKeepCount());
 /** Per scheduled-job/group keep counts. */
 export const scheduledKeepCountsByGroup = signal<Record<string, number>>(loadKeepCountsByGroup());
+
+/**
+ * This is a Hermes worker lifecycle marker, not a user-authored conversation.
+ * Keep it out of every surface that groups durable sessions as chats.
+ */
+function isKanbanWorkerSession(session: Pick<ChatSession, "title" | "lastMessagePreview" | "conversationKind">): boolean {
+  // Delegated specialist conversations are durable protocol entities and must
+  // remain visible even when their task has completed. Only exact standalone
+  // lifecycle notices are presentation-filtered; no persisted data is changed.
+  if (session.conversationKind === "delegated") return false;
+  return KANBAN_WORKER_MARKERS.has(normalizeKanbanWorkerMarker(session.title))
+    || KANBAN_WORKER_MARKERS.has(normalizeKanbanWorkerMarker(session.lastMessagePreview ?? ""));
+}
+
+function normalizeKanbanWorkerMarker(value: string): string {
+  return value.trim().replace(/\.$/u, "").replace(/\s+/gu, " ").toLowerCase();
+}
 
 /** Hermes cron/scheduled runs show up as ordinary sessions. Detect them for a focused review list. */
 export function isScheduledSession(session: Pick<ChatSession, "title" | "titlePresentation">): boolean {
@@ -42,7 +65,8 @@ export function scheduledSessionHideId(session: Pick<ChatSession, "id" | "stored
   return session.storedSessionId ?? session.id;
 }
 
-export function isScheduledSessionHidden(session: Pick<ChatSession, "id" | "storedSessionId" | "profileId" | "title" | "titlePresentation">): boolean {
+export function isScheduledSessionHidden(session: Pick<ChatSession, "id" | "storedSessionId" | "profileId" | "title" | "titlePresentation" | "lastMessagePreview" | "conversationKind">): boolean {
+  if (isKanbanWorkerSession(session)) return true;
   if (!isScheduledSession(session)) return false;
   if (hiddenScheduledSessionKeys.value.has(scheduledSessionKey(session.profileId, session.title))) return true;
   return hiddenScheduledSessionIds.value.has(scheduledSessionHideId(session));

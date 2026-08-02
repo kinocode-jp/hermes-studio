@@ -3,8 +3,17 @@ import { officeInventoryReliability } from "@hermes-studio/protocol";
 import { initialSessions, initialTaskComments, initialTasks, initialTeams, profiles } from "./demo-data";
 import { createDemoKanbanApi } from "./demo-kanban-api";
 import { loadTeamsDemoRuntime, resetTeamsRuntimeState } from "./teams-store";
-import type { ChatTarget } from "./chat-api";
-import type { OfficeSnapshot, OfficeSnapshotRequestIdentity, Profile, SettingsTab, Surface } from "./domain";
+import type { ChatSessionEnsureOptions, ChatTarget } from "./chat-api";
+import type {
+  ChatMessage,
+  ChatOperationEvidence,
+  ChatSession,
+  OfficeSnapshot,
+  OfficeSnapshotRequestIdentity,
+  Profile,
+  SettingsTab,
+  Surface,
+} from "./domain";
 import type { DeviceLoginFailure } from "./auth-state";
 import { loadKanbanDemoRuntime, registerKanbanProfileTaskUpdater, resetKanbanRuntimeState } from "./kanban-store";
 import { prefetchSelectedProfileSettings } from "./settings-prefetch";
@@ -12,7 +21,7 @@ import { findStoredSession, storedSessionClientId } from "./session-identity";
 import { isScheduledSessionHidden } from "./scheduled-sessions";
 import { deleteStoredSessions } from "./sessions-api";
 import { runSessionDeletionBatch, type SessionDeletionProgress } from "./session-deletion";
-import { isChatRunActive, mergeServerSessionStatus } from "./session-runtime";
+import { isChatSessionLeaseProtected, mergeServerSessionStatus } from "./session-runtime";
 import { reconcileChatSessionDisconnected } from "./chat-session-reconciliation";
 import { reconcileDefaultAvatarProfiles, registerDefaultAvatarProfiles } from "./avatar-preferences";
 import { ensurePokemonDisplayNames } from "./profile-names";
@@ -62,8 +71,32 @@ import {
   setRuntimeDataSource,
 } from "./store-state";
 import { persistUiNavPreferences } from "./ui-nav-prefs";
-import { addPanelToActiveDashboard, removePanel, activeDashboard } from "./dashboard-layout";
-import { clearAllChatComposerStates, clearChatComposerState } from "./chat-composer-state";
+import {
+  activeDashboard,
+  addPanelToActiveDashboard,
+  coalesceDashboardChatSessionIdentity,
+  removePanel,
+} from "./dashboard-layout";
+import {
+  clearAllChatComposerStates,
+  clearChatComposerState,
+  coalesceChatComposerState,
+} from "./chat-composer-state";
+import { boundedOperationEvidence } from "./chat-run-actions";
+import { boundedTranscriptSuffix } from "./live-transcript";
+import { isDiscardableUnusedChatDraft } from "./chat-session-retention";
+import {
+  awaitSessionInventoryObservation,
+  clearSessionInventoryObservations,
+  forgetSessionInventoryObservation,
+  protectSessionInventoryOmission,
+  recordSessionInventoryObservation,
+} from "./session-inventory-observation";
+import {
+  clearOfficeSnapshotRequestIdentities,
+  latestOfficeSnapshotRequestIdentity,
+  recordOfficeSnapshotRequestIdentity,
+} from "./office-snapshot-request-tracker";
 import {
   saveProfileChatModalLayout,
   savedProfileChatModalLayout,
@@ -130,7 +163,7 @@ import {
   setChatSessionDisconnected,
   setChatSessionError,
   setChatSessionQueued,
-  setChatSessionReady,
+  setChatSessionReady as setChatSessionReadyState,
   setChatSocketState,
   steerSession,
   tryFlushCardSeed,
@@ -159,7 +192,6 @@ export {
   setChatSessionDisconnected,
   setChatSessionError,
   setChatSessionQueued,
-  setChatSessionReady,
   setChatSocketState,
   steerSession,
   tryFlushCardSeed,
@@ -168,7 +200,295 @@ export {
   consumeChatComposerPrefill,
 };
 
+/**
+ * Promote a newly-created draft without letting an earlier HTTP snapshot's
+ * provisional stored row replace its stable client identity.
+ */
+type DurableSessionDeletion = {
+  promise: Promise<"deleted" | "failed">;
+  resolve(status: "deleted" | "failed"): void;
+};
+
+const durableSessionDeletions = new Map<string, DurableSessionDeletion>();
+
+export function setChatSessionReady(
+  sessionId: string,
+  liveSessionId: string,
+  storedSessionId?: string,
+  runtime?: import("./chat-session-reconciliation").ChatSessionReadyRuntime,
+): void | Promise<void> {
+  const deletion = storedSessionId === undefined
+    ? undefined
+    : durableSessionDeletions.get(durableSessionDeletionKey(
+      sessions.value.find((session) => session.id === sessionId)?.profileId ?? "",
+      storedSessionId,
+    ));
+  const settleDeletion = () => deletion === undefined || storedSessionId === undefined
+    ? undefined
+    : deletion.promise.then((status) => settlePromotedSessionDeletion(sessionId, storedSessionId, status));
+  const original = sessions.value.find((session) => session.id === sessionId);
+  const wasDraft = original?.remoteKind === "draft";
+  setChatSessionReadyState(sessionId, liveSessionId, storedSessionId, runtime);
+  if (!original || !wasDraft || !storedSessionId) return settleDeletion();
+
+  const provisionalId = storedSessionClientId(original.profileId, storedSessionId);
+  if (provisionalId === sessionId) return settleDeletion();
+  const provisional = sessions.value.find((session) =>
+    session.id === provisionalId
+      && session.remoteKind === "stored"
+      && session.profileId === original.profileId
+      && session.storedSessionId === storedSessionId);
+  const retained = sessions.value.find((session) => session.id === sessionId);
+  if (provisional) recordSessionInventoryObservation(original.profileId, storedSessionId);
+  else awaitSessionInventoryObservation(
+    original.profileId,
+    storedSessionId,
+    latestOfficeSnapshotRequestIdentity(latestOfficeSnapshotIdentity),
+  );
+  if (!provisional || !retained) return settleDeletion();
+
+  const previousTargetIds = new Set(getOpenChatTargets().map((target) => target.clientSessionId));
+  const messages = mergeChatRows(provisional.messages, retained.messages);
+  const historyPartial = provisional.historyPartial === true
+    || retained.historyPartial === true
+    || messages.truncated;
+  const historyNotice = provisional.historyNotice ?? retained.historyNotice;
+  const historyState = historyPartial || historyNotice !== undefined
+    ? "loaded" as const
+    : provisional.historyState !== undefined && provisional.historyState !== "unloaded"
+      ? provisional.historyState
+      : retained.historyState ?? provisional.historyState;
+  const merged: ChatSession = {
+    ...provisional,
+    ...retained,
+    id: sessionId,
+    storedSessionId,
+    title: provisional.title,
+    titlePresentation: provisional.titlePresentation,
+    messages: messages.messages,
+    operationEvidence: mergeOperationEvidence(provisional.operationEvidence, retained.operationEvidence),
+    ...(historyState === undefined ? {} : { historyState }),
+    historyPartial,
+    historyNotice,
+    liveSessionId,
+    remoteKind: "stored",
+  };
+  // Remap persisted panes before the authoritative sessions signal can make
+  // dashboard reconciliation drop the provisional panel.
+  coalesceDashboardChatSessionIdentity(provisionalId, sessionId);
+  coalesceChatComposerState(sessionId, provisionalId);
+  sessions.value = sessions.value.flatMap((session) => {
+    if (session.id === provisionalId) return [merged];
+    return session.id === sessionId ? [] : [session];
+  });
+
+  openSessionIds.value = replaceSessionIdentity(openSessionIds.value, provisionalId, sessionId);
+  profileChatModalPaneIds.value = replaceSessionIdentity(profileChatModalPaneIds.value, provisionalId, sessionId);
+  embeddedChatSessionIds.value = replaceSessionIdentity(embeddedChatSessionIds.value, provisionalId, sessionId);
+  if (activeSessionId.value === provisionalId) activeSessionId.value = sessionId;
+  if (profileChatModalActivePaneId.value === provisionalId) profileChatModalActivePaneId.value = sessionId;
+  if (pendingProfileChatModalLayout?.profileId === original.profileId) {
+    pendingProfileChatModalLayout = {
+      ...pendingProfileChatModalLayout,
+      paneSessionIds: replaceSessionIdentity(pendingProfileChatModalLayout.paneSessionIds, provisionalId, sessionId),
+      activeSessionId: pendingProfileChatModalLayout.activeSessionId === provisionalId
+        ? sessionId
+        : pendingProfileChatModalLayout.activeSessionId,
+    };
+  }
+  deferredChatTargetReleases.delete(provisionalId);
+  reconcileActiveChatTargets(previousTargetIds);
+  persistCurrentProfileChatModalLayout();
+  return settleDeletion();
+}
+
+function settlePromotedSessionDeletion(
+  clientSessionId: string,
+  storedSessionId: string,
+  status: "deleted" | "failed",
+): void {
+  const promoted = sessions.value.find((session) => session.id === clientSessionId);
+  if (!promoted) return;
+  const matchingIds = sessionClientIdsForDurableIdentity(promoted.profileId, storedSessionId);
+  if (status === "deleted") {
+    dismissSessions(matchingIds);
+    return;
+  }
+  // The user requested deletion, so a failed/ambiguous durable delete must
+  // still cancel the queued first prompt. Keep the saved row visible for an
+  // explicit retry after inventory/history reconciliation.
+  for (const id of matchingIds) {
+    releaseChatTarget(id);
+    setChatSessionDisconnected(id);
+  }
+}
+
+function durableSessionDeletionKey(profileId: string, storedSessionId: string): string {
+  return `${profileId.length}:${profileId}${storedSessionId}`;
+}
+
+function beginDurableSessionDeletion(profileId: string, storedSessionId: string): DurableSessionDeletion {
+  const key = durableSessionDeletionKey(profileId, storedSessionId);
+  const current = durableSessionDeletions.get(key);
+  if (current) return current;
+  let resolve!: (status: "deleted" | "failed") => void;
+  const promise = new Promise<"deleted" | "failed">((done) => { resolve = done; });
+  const deletion = { promise, resolve };
+  durableSessionDeletions.set(key, deletion);
+  return deletion;
+}
+
+function finishDurableSessionDeletion(
+  profileId: string,
+  storedSessionId: string,
+  deletion: DurableSessionDeletion,
+  status: "deleted" | "failed",
+): void {
+  deletion.resolve(status);
+  const key = durableSessionDeletionKey(profileId, storedSessionId);
+  if (durableSessionDeletions.get(key) === deletion) durableSessionDeletions.delete(key);
+}
+
+function sessionClientIdsForDurableIdentity(profileId: string, storedSessionId: string): string[] {
+  return sessions.value.flatMap((session) => session.profileId === profileId
+    && session.storedSessionId === storedSessionId ? [session.id] : []);
+}
+
+function retainUnconfirmedCreatedSession(
+  stableClientId: string,
+  profileId: string,
+  storedSessionId: string,
+  message?: string,
+): void {
+  const retained = sessions.value.find((session) => session.id === stableClientId);
+  if (!retained) return;
+  const provisionalId = storedSessionClientId(profileId, storedSessionId);
+  const provisional = sessions.value.find((session) => session.id === provisionalId
+    && session.profileId === profileId && session.storedSessionId === storedSessionId);
+  const mergedMessages = provisional ? mergeChatRows(provisional.messages, retained.messages) : undefined;
+  const merged: ChatSession = {
+    ...(provisional ?? retained),
+    ...retained,
+    id: stableClientId,
+    storedSessionId,
+    title: provisional?.title ?? retained.title,
+    titlePresentation: provisional?.titlePresentation,
+    remoteKind: "stored",
+    connectionState: "disconnected",
+    historyState: "error",
+    ...(mergedMessages ? { messages: mergedMessages.messages } : {}),
+    operationEvidence: provisional
+      ? mergeOperationEvidence(provisional.operationEvidence, retained.operationEvidence)
+      : retained.operationEvidence,
+    errorMessage: message === undefined ? retained.errorMessage : officeRuntimeMessage(message),
+  };
+  if (provisional) {
+    recordSessionInventoryObservation(profileId, storedSessionId);
+    coalesceDashboardChatSessionIdentity(provisionalId, stableClientId);
+    coalesceChatComposerState(stableClientId, provisionalId);
+  }
+  sessions.value = sessions.value.flatMap((session) => {
+    if (session.id === stableClientId) return [merged];
+    return session.id === provisionalId ? [] : [session];
+  });
+  openSessionIds.value = replaceSessionIdentity(openSessionIds.value, provisionalId, stableClientId);
+  profileChatModalPaneIds.value = replaceSessionIdentity(profileChatModalPaneIds.value, provisionalId, stableClientId);
+  embeddedChatSessionIds.value = replaceSessionIdentity(embeddedChatSessionIds.value, provisionalId, stableClientId);
+  if (activeSessionId.value === provisionalId) activeSessionId.value = stableClientId;
+  if (profileChatModalActivePaneId.value === provisionalId) profileChatModalActivePaneId.value = stableClientId;
+  persistCurrentProfileChatModalLayout();
+}
+
+function replaceSessionIdentity(ids: readonly string[], from: string, to: string): string[] {
+  const next: string[] = [];
+  for (const id of ids) {
+    const mapped = id === from ? to : id;
+    if (!next.includes(mapped)) next.push(mapped);
+  }
+  return next;
+}
+
+function mergeChatRows(
+  provisional: readonly ChatMessage[],
+  retained: readonly ChatMessage[],
+): { messages: ChatMessage[]; truncated: boolean } {
+  return boundedTranscriptSuffix(mergeRowsById(provisional, retained, resolveMessageConflict));
+}
+
+function mergeOperationEvidence(
+  provisional: readonly ChatOperationEvidence[] | undefined,
+  retained: readonly ChatOperationEvidence[] | undefined,
+): ChatOperationEvidence[] | undefined {
+  if (provisional === undefined && retained === undefined) return undefined;
+  return boundedOperationEvidence(mergeRowsById(
+    provisional ?? [],
+    retained ?? [],
+    resolveOperationEvidenceConflict,
+  ));
+}
+
+function mergeRowsById<T extends { id: string; timelineSequence?: number | undefined }>(
+  provisional: readonly T[],
+  retained: readonly T[],
+  resolveConflict: (durable: T, local: T) => T,
+): T[] {
+  const merged: Array<{ row: T; order: number }> = [];
+  const byId = new Map<string, number>();
+  for (const row of provisional) {
+    const duplicate = byId.get(row.id);
+    if (duplicate === undefined) {
+      byId.set(row.id, merged.length);
+      merged.push({ row, order: merged.length });
+    } else {
+      merged[duplicate] = { row: resolveConflict(merged[duplicate]!.row, row), order: merged[duplicate]!.order };
+    }
+  }
+  for (const row of retained) {
+    const duplicate = byId.get(row.id);
+    if (duplicate === undefined) {
+      byId.set(row.id, merged.length);
+      merged.push({ row, order: merged.length });
+    } else {
+      merged[duplicate] = { row: resolveConflict(merged[duplicate]!.row, row), order: merged[duplicate]!.order };
+    }
+  }
+  return merged
+    .sort((left, right) => left.row.timelineSequence !== undefined && right.row.timelineSequence !== undefined
+      ? left.row.timelineSequence - right.row.timelineSequence || left.order - right.order
+      : left.order - right.order)
+    .map(({ row }) => row);
+}
+
+function resolveMessageConflict(durable: ChatMessage, local: ChatMessage): ChatMessage {
+  const durableRank = messageCompletionRank(durable);
+  const localRank = messageCompletionRank(local);
+  if (localRank > durableRank) return local;
+  // At equal progress, the durable row is authoritative for content and
+  // terminal state; this prevents an interim live row from rewriting history.
+  return durable;
+}
+
+function messageCompletionRank(message: ChatMessage): number {
+  if (message.status === "complete" || message.status === "failed" || message.status === "cancelled") return 2;
+  if (message.status === "streaming") return 0;
+  return 1;
+}
+
+function resolveOperationEvidenceConflict(
+  durable: ChatOperationEvidence,
+  local: ChatOperationEvidence,
+): ChatOperationEvidence {
+  const durableRank = durable.state === "pending" ? 0 : 1;
+  const localRank = local.state === "pending" ? 0 : 1;
+  if (localRank > durableRank) return local;
+  if (durableRank > localRank) return durable;
+  // Evidence is client-owned. At equal progression the retained identity has
+  // the latest acknowledgement diagnostics.
+  return local;
+}
+
 export function sendMessage(sessionId: string, body: string): ReturnType<typeof sendChatMessage> {
+  const previousTargets = new Set(getOpenChatTargets().map((target) => target.clientSessionId));
   const pending = pendingProfileChatModalLayout;
   if (pending?.profileId === profileChatModalId.value
     && profileChatModalPaneIds.value.includes(sessionId)
@@ -178,7 +498,20 @@ export function sendMessage(sessionId: string, body: string): ReturnType<typeof 
     pendingProfileChatModalLayout = undefined;
     persistCurrentProfileChatModalLayout();
   }
-  return sendChatMessage(sessionId, body);
+  const result = sendChatMessage(sessionId, body);
+  // A local draft is lease-free until its first prompt. Reconcile immediately
+  // after that synchronous state transition so the selected draft can displace
+  // an older idle lease before session.create reaches the server.
+  reconcileActiveChatTargets(previousTargets);
+  if (result instanceof Promise) {
+    return result.finally(() => {
+      // Settlement can only free capacity claimed by the synchronous send.
+      // A concurrent pane close has already reconciled/released its target, so
+      // replaying the old target set here would issue a duplicate session.close.
+      for (const target of getOpenChatTargets()) officeRuntimeHooks.ensureChatSession(target);
+    });
+  }
+  return result;
 }
 
 registerKanbanProfileTaskUpdater((counts) => {
@@ -217,8 +550,9 @@ function persistNavigationState(): void {
 }
 
 export function registerChatRuntime(actions: {
-  ensureSession(target: ChatTarget): void;
+  ensureSession(target: ChatTarget, options?: ChatSessionEnsureOptions): void;
   releaseSession(clientSessionId: string): void;
+  deleteSession?(clientSessionId: string): Promise<import("./chat-api").ChatSessionDeleteResult>;
   submitPrompt(clientSessionId: string, text: string, operationId: string): Promise<import("./chat-api").ChatPromptResult> | void;
   steer(clientSessionId: string, text: string): Promise<import("./chat-api").ChatSteerResult>;
   execSlash?(clientSessionId: string, command: string, confirmExpensiveModel?: boolean): Promise<import("./chat-api").ChatSlashResult>;
@@ -229,6 +563,11 @@ export function registerChatRuntime(actions: {
 }): void {
   officeRuntimeHooks.ensureChatSession = actions.ensureSession;
   officeRuntimeHooks.releaseChatSession = actions.releaseSession;
+  officeRuntimeHooks.deleteChatSession = actions.deleteSession
+    ?? (async (clientSessionId) => {
+      actions.releaseSession(clientSessionId);
+      return { status: "deleted" };
+    });
   officeRuntimeHooks.submitChatPrompt = actions.submitPrompt;
   officeRuntimeHooks.steerChatSession = actions.steer;
   officeRuntimeHooks.execSlashCommand = actions.execSlash
@@ -263,7 +602,7 @@ export function getOpenChatTargets(): ChatTarget[] {
   const hiddenReservedSessions = [...deferredChatTargetReleases].flatMap((sessionId) => {
     if (requested.has(sessionId)) return [];
     const session = sessions.value.find((item) => item.id === sessionId);
-    return session !== undefined && isChatRunActive(session) ? [session] : [];
+    return session !== undefined && isChatSessionLeaseProtected(session) ? [session] : [];
   });
   const visibleCapacity = Math.max(0, MAX_LIVE_CHAT_SESSIONS - hiddenReservedSessions.length);
   const profileLeaseCounts = new Map<string, number>();
@@ -271,13 +610,25 @@ export function getOpenChatTargets(): ChatTarget[] {
     profileLeaseCounts.set(session.profileId, (profileLeaseCounts.get(session.profileId) ?? 0) + 1);
   }
   const activeSessionIds: string[] = [];
+  let visibleLeaseCount = 0;
   for (const sessionId of requestedSessionIds) {
-    if (activeSessionIds.length >= visibleCapacity) break;
     const session = sessions.value.find((item) => item.id === sessionId);
     if (!session) continue;
+    const idleLocalDraft = session.remoteKind === "draft"
+      && session.storedSessionId === undefined
+      && session.liveSessionId === undefined
+      && !isChatSessionLeaseProtected(session);
+    if (idleLocalDraft) {
+      // Track the local composer so its first prompt can create a session, but
+      // do not charge a lease until that prompt actually starts.
+      activeSessionIds.push(sessionId);
+      continue;
+    }
+    if (visibleLeaseCount >= visibleCapacity) continue;
     const profileLeaseCount = profileLeaseCounts.get(session.profileId) ?? 0;
     if (profileLeaseCount >= MAX_LIVE_CHAT_SESSIONS_PER_PROFILE) continue;
     profileLeaseCounts.set(session.profileId, profileLeaseCount + 1);
+    visibleLeaseCount += 1;
     activeSessionIds.push(sessionId);
   }
   return [...new Set(activeSessionIds)].flatMap((clientSessionId) => {
@@ -339,6 +690,7 @@ export function setOfficeConnecting(serverUrl: string): void {
 export function applyOfficeSnapshot(snapshot: OfficeSnapshot, source: string | OfficeSnapshotRequestIdentity): boolean {
   const serverUrl = typeof source === "string" ? source : source.serverUrl;
   if (typeof source !== "string") {
+    recordOfficeSnapshotRequestIdentity(source);
     const latest = latestOfficeSnapshotIdentity;
     if (latest && (source.connectionGeneration < latest.connectionGeneration
       || (source.connectionGeneration === latest.connectionGeneration && source.requestGeneration <= latest.requestGeneration))) return false;
@@ -395,10 +747,22 @@ export function applyOfficeSnapshot(snapshot: OfficeSnapshot, source: string | O
   }
   if (runtimeDataSource === "demo") clearRuntimeState();
 
+  for (const session of snapshot.sessions) {
+    recordSessionInventoryObservation(session.profileId, session.id);
+  }
   const previousProfiles = new Map(profileList.value.map((profile) => [profile.id, profile]));
   const previousTargetIds = new Set(getOpenChatTargets().map((target) => target.clientSessionId));
   const sessionCounts = new Map<string, number>();
   for (const session of snapshot.sessions) {
+    if (isScheduledSessionHidden({
+      id: session.id,
+      storedSessionId: session.id,
+      profileId: session.profileId,
+      title: session.title,
+      titlePresentation: undefined,
+      lastMessagePreview: session.lastMessagePreview,
+      conversationKind: session.conversationKind,
+    })) continue;
     sessionCounts.set(session.profileId, (sessionCounts.get(session.profileId) ?? 0) + 1);
   }
   const palette = ["#64b7a7", "#e07a55", "#d6a94f", "#8499c8", "#55d6be", "#f06a57"];
@@ -435,6 +799,8 @@ export function applyOfficeSnapshot(snapshot: OfficeSnapshot, source: string | O
       profileId: live.profileId,
       title: live.title,
       titlePresentation: undefined,
+      lastMessagePreview: live.lastMessagePreview,
+      conversationKind: live.conversationKind,
     }))
     .map((live): import("./domain").ChatSession => {
     const previous = findStoredSession(previousSessions, live);
@@ -459,7 +825,18 @@ export function applyOfficeSnapshot(snapshot: OfficeSnapshot, source: string | O
       readOnly: previous?.connectionState !== "ready"
     };
   });
-  const retainedStored = snapshot.inventory.sessions.hasMore || snapshot.inventory.sessions.truncated ? previousSessions.filter((session) => session.remoteKind === "stored" && !snapshot.sessions.some((live) => live.id === (session.storedSessionId ?? session.id) && live.profileId === session.profileId)) : [];
+  const incompleteSessionInventory = snapshot.inventory.sessions.hasMore || snapshot.inventory.sessions.truncated;
+  const retainedStored = previousSessions.filter((session) => {
+    if (session.remoteKind !== "stored" || session.storedSessionId === undefined) return false;
+    const omitted = !snapshot.sessions.some((live) =>
+      live.id === session.storedSessionId && live.profileId === session.profileId);
+    return omitted && (incompleteSessionInventory
+      || protectSessionInventoryOmission(
+        session.profileId,
+        session.storedSessionId,
+        typeof source === "string" ? undefined : source,
+      ));
+  });
   const unpersistedDrafts = previousSessions.filter((session) => session.remoteKind === "draft" && !session.storedSessionId);
   const nextSessions = [
     ...snapshotSessions,
@@ -689,7 +1066,7 @@ export function setProfileChatModalActivePane(sessionId: string): boolean {
   const previousTargets = new Set(getOpenChatTargets().map((target) => target.clientSessionId));
   profileChatModalActivePaneId.value = sessionId;
   reconcileActiveChatTargets(previousTargets);
-  ensureSessionConnection(sessionId);
+  ensureSessionConnection(sessionId, { retryFailed: true });
   persistCurrentProfileChatModalLayout();
   return true;
 }
@@ -710,7 +1087,7 @@ export function selectProfileChatModalSession(sessionId: string): boolean {
   // A list click may discard the unused local composer it replaces. The shared
   // replace primitive deliberately does not do this so drag-and-drop keeps its
   // existing pane-only behavior.
-  if (replaced && target !== sessionId && isDiscardableEmptyProfileModalDraft(replacedSession)) {
+  if (replaced && target !== sessionId && isDiscardableUnusedChatDraft(replacedSession)) {
     dismissSessions([target]);
   }
   return replaced;
@@ -729,7 +1106,7 @@ export function replaceProfileChatModalPane(targetSessionId: string, sessionId: 
     else if (id !== sessionId) next.push(id);
   }
   replaceProfileChatModalPanes(next, sessionId);
-  ensureSessionConnection(sessionId);
+  ensureSessionConnection(sessionId, { retryFailed: true });
   return true;
 }
 
@@ -787,17 +1164,9 @@ function discardTemporaryPendingProfileModalDrafts(): void {
   if (!pending || pending.profileId !== profileChatModalId.value) return;
   const transientDraftIds = profileChatModalPaneIds.value.filter((sessionId) =>
     !pending.paneSessionIds.includes(sessionId)
-      && isDiscardableEmptyProfileModalDraft(sessions.value.find((session) => session.id === sessionId)),
+      && isDiscardableUnusedChatDraft(sessions.value.find((session) => session.id === sessionId)),
   );
   if (transientDraftIds.length > 0) dismissSessions(transientDraftIds);
-}
-
-function isDiscardableEmptyProfileModalDraft(session: import("./domain").ChatSession | undefined): boolean {
-  return session?.titlePresentation === "new-chat"
-    && session.messages.length === 0
-    && session.status !== "streaming"
-    && session.remoteKind === "draft"
-    && session.storedSessionId === undefined;
 }
 
 /**
@@ -816,7 +1185,7 @@ function reconcilePendingProfileChatModalRestore(): void {
     : restoredPaneIds.at(-1) ?? "";
   const transientDraftIds = profileChatModalPaneIds.value.filter((sessionId) =>
     !pending.paneSessionIds.includes(sessionId)
-      && isDiscardableEmptyProfileModalDraft(sessions.value.find((session) => session.id === sessionId)),
+      && isDiscardableUnusedChatDraft(sessions.value.find((session) => session.id === sessionId)),
   );
 
   if (restoredPaneIds.length > 0) {
@@ -871,7 +1240,7 @@ export function clearWorkspaceSessionDropPreview(): void {
   workspaceSessionDropPlacement.value = null;
 }
 
-export function ensureSessionConnection(sessionId: string): void {
+export function ensureSessionConnection(sessionId: string, options?: ChatSessionEnsureOptions): void {
   if (!getOpenChatTargets().some((target) => target.clientSessionId === sessionId)) return;
   const session = sessions.value.find((item) => item.id === sessionId);
   if (!session) return;
@@ -883,7 +1252,7 @@ export function ensureSessionConnection(sessionId: string): void {
     || session.historyState === "unloaded";
   if (!needsEnsure) return;
   const target = chatTarget(session);
-  if (target) officeRuntimeHooks.ensureChatSession(target);
+  if (target) officeRuntimeHooks.ensureChatSession(target, options);
 }
 
 export function openSession(sessionId: string, options?: { workspace?: boolean; index?: number }): void {
@@ -911,7 +1280,7 @@ export function openSession(sessionId: string, options?: { workspace?: boolean; 
     const newlyActivated = addToWorkspace
       && !previousTargets.has(sessionId)
       && getOpenChatTargets().some((target) => target.clientSessionId === sessionId);
-    if (needsEnsure && !newlyActivated) ensureSessionConnection(sessionId);
+    if (needsEnsure && !newlyActivated) ensureSessionConnection(sessionId, { retryFailed: true });
   }
 }
 
@@ -951,6 +1320,11 @@ export function closeSession(sessionId: string): void {
 export function dismissSessions(sessionIds: readonly string[]): void {
   const ids = new Set(sessionIds);
   if (ids.size === 0) return;
+  for (const session of sessions.value) {
+    if (ids.has(session.id) && session.storedSessionId !== undefined) {
+      forgetSessionInventoryObservation(session.profileId, session.storedSessionId);
+    }
+  }
   for (const sessionId of ids) clearChatComposerState(sessionId);
   const previouslyActiveTargetIds = new Set(getOpenChatTargets().map((target) => target.clientSessionId));
   for (const sessionId of ids) {
@@ -1011,33 +1385,151 @@ export async function deleteSessions(
     }
   }
 
-  const deletedLocalIds = localTargets.map((session) => session.id);
-  if (deletedLocalIds.length > 0) dismissSessions(deletedLocalIds);
-  let completed = localTargets.length;
-  let deleted = localTargets.length;
+  const transactions = new Map<string, DurableSessionDeletion>();
+  for (const target of durableTargets) {
+    const key = durableSessionDeletionKey(target.session.profileId, target.storedId);
+    transactions.set(key, beginDurableSessionDeletion(target.session.profileId, target.storedId));
+  }
+
+  const deletedLocalIds: string[] = [];
+  const failedLocalIds: string[] = [];
+  let completed = 0;
+  let deleted = 0;
   let failed = 0;
-  if (completed > 0) options.onProgress?.({ completed, total: targets.length, deleted, failed });
+  // Tombstone every durable target before the first await. This blocks new
+  // sends immediately and requires an acknowledged live close before Hermes'
+  // durable bulk delete can begin.
+  const durablePreparations = new Map<string, Promise<import("./chat-api").ChatSessionDeleteResult[]>>();
+  for (const target of durableTargets) {
+    const key = durableSessionDeletionKey(target.session.profileId, target.storedId);
+    if (durablePreparations.has(key)) continue;
+    const aliases = [...new Set([
+      target.session.id,
+      ...sessionClientIdsForDurableIdentity(target.session.profileId, target.storedId),
+    ])];
+    durablePreparations.set(key, Promise.all(aliases.map((id) => officeRuntimeHooks.deleteChatSession(id))));
+  }
+  await Promise.all(localTargets.map(async (session) => {
+    try {
+      const result = await officeRuntimeHooks.deleteChatSession(session.id);
+      if (result.status === "deleted") {
+        const ids = result.storedSessionId === undefined
+          ? [session.id]
+          : [...new Set([session.id, ...sessionClientIdsForDurableIdentity(session.profileId, result.storedSessionId)])];
+        dismissSessions(ids);
+        deletedLocalIds.push(session.id);
+        deleted += 1;
+      } else {
+        if (result.storedSessionId !== undefined) {
+          awaitSessionInventoryObservation(
+            session.profileId,
+            result.storedSessionId,
+            latestOfficeSnapshotRequestIdentity(latestOfficeSnapshotIdentity),
+          );
+          retainUnconfirmedCreatedSession(
+            session.id,
+            session.profileId,
+            result.storedSessionId,
+            result.message,
+          );
+        }
+        failedLocalIds.push(session.id);
+        failed += 1;
+      }
+    } catch {
+      failedLocalIds.push(session.id);
+      failed += 1;
+    } finally {
+      completed += 1;
+      options.onProgress?.({ completed, total: targets.length, deleted, failed });
+    }
+  }));
 
   const result = await runSessionDeletionBatch(batches, async (batch) => {
     const storedIds = batch.targets.map((target) => target.storedId);
+    const preparations = await Promise.all(batch.targets.map(async (target) => ({
+      target,
+      results: await durablePreparations.get(durableSessionDeletionKey(batch.profileId, target.storedId))!,
+    })));
+    for (const target of batch.targets) {
+      for (const id of sessionClientIdsForDurableIdentity(batch.profileId, target.storedId)) {
+        setChatSessionDisconnected(id);
+      }
+    }
+    const unconfirmed = preparations.filter(({ results }) => results.some(({ status }) => status === "unconfirmed"));
+    if (unconfirmed.length > 0) {
+      for (const { target, results } of unconfirmed) {
+        const message = results.find(({ status }) => status === "unconfirmed")?.message
+          ?? "Live Sessionの終了結果を確認できませんでした。";
+        awaitSessionInventoryObservation(
+          batch.profileId,
+          target.storedId,
+          latestOfficeSnapshotRequestIdentity(latestOfficeSnapshotIdentity),
+        );
+        sessions.value = sessions.value.map((session) => session.profileId === batch.profileId
+          && session.storedSessionId === target.storedId ? {
+            ...session,
+            connectionState: "disconnected",
+            historyState: "error",
+            errorMessage: officeRuntimeMessage(message),
+          } : session);
+      }
+      for (const target of batch.targets) {
+        const transaction = transactions.get(durableSessionDeletionKey(batch.profileId, target.storedId));
+        if (transaction) finishDurableSessionDeletion(batch.profileId, target.storedId, transaction, "failed");
+      }
+      failed += batch.targets.length;
+      completed += batch.targets.length;
+      options.onProgress?.({ completed, total: targets.length, deleted, failed });
+      throw new Error("Live Session deletion fence was not acknowledged.");
+    }
     let firstFailure: unknown;
     try {
-      await deleteStoredSessions(batch.profileId, storedIds, { timeoutMs: options.timeoutMs ?? SESSION_DELETE_TIMEOUT_MS });
+      await deleteStoredSessions(batch.profileId, storedIds, {
+        timeoutMs: options.timeoutMs ?? SESSION_DELETE_TIMEOUT_MS,
+        serverUrl: officeConnection.value.serverUrl,
+      });
     } catch (error) {
       firstFailure = error;
       // Bulk deletion is idempotent: a retry safely resolves a transient
       // failure or a timeout after Hermes committed the transaction.
       try {
-        await deleteStoredSessions(batch.profileId, storedIds, { timeoutMs: options.timeoutMs ?? SESSION_DELETE_TIMEOUT_MS });
+        await deleteStoredSessions(batch.profileId, storedIds, {
+          timeoutMs: options.timeoutMs ?? SESSION_DELETE_TIMEOUT_MS,
+          serverUrl: officeConnection.value.serverUrl,
+        });
       } catch {
+        for (const target of batch.targets) {
+          awaitSessionInventoryObservation(
+            batch.profileId,
+            target.storedId,
+            latestOfficeSnapshotRequestIdentity(latestOfficeSnapshotIdentity),
+          );
+          sessions.value = sessions.value.map((session) => session.profileId === batch.profileId
+            && session.storedSessionId === target.storedId ? {
+              ...session,
+              connectionState: "disconnected",
+              historyState: "error",
+              errorMessage: officeRuntimeMessage("セッション削除結果を確認できませんでした。保存一覧を再同期してください。"),
+            } : session);
+          const transaction = transactions.get(durableSessionDeletionKey(batch.profileId, target.storedId));
+          if (transaction) finishDurableSessionDeletion(batch.profileId, target.storedId, transaction, "failed");
+        }
         failed += batch.targets.length;
         completed += batch.targets.length;
         options.onProgress?.({ completed, total: targets.length, deleted, failed });
         throw firstFailure;
       }
     }
-    const deletedIds = batch.targets.map((target) => target.session.id);
+    const deletedIds = [...new Set(batch.targets.flatMap((target) => [
+      target.session.id,
+      ...sessionClientIdsForDurableIdentity(batch.profileId, target.storedId),
+    ]))];
     dismissSessions(deletedIds);
+    for (const target of batch.targets) {
+      const transaction = transactions.get(durableSessionDeletionKey(batch.profileId, target.storedId));
+      if (transaction) finishDurableSessionDeletion(batch.profileId, target.storedId, transaction, "deleted");
+    }
     deleted += batch.targets.length;
     completed += batch.targets.length;
     options.onProgress?.({ completed, total: targets.length, deleted, failed });
@@ -1047,7 +1539,7 @@ export async function deleteSessions(
 
   return {
     deleted: [...deletedLocalIds, ...result.deleted.flatMap((batch) => batch.targets.map((target) => target.session.id))],
-    failed: result.failed.flatMap((batch) => batch.targets.map((target) => target.session.id)),
+    failed: [...failedLocalIds, ...result.failed.flatMap((batch) => batch.targets.map((target) => target.session.id))],
   };
 }
 
@@ -1109,10 +1601,10 @@ export function createSession(profileId: string, options?: { workspace?: boolean
     titlePresentation: "new-chat",
     status: "ready",
     messages: [],
-    connectionState: isLive ? "connecting" : "ready",
+    connectionState: "ready",
     historyState: "loaded",
     remoteKind: isLive ? "draft" : "demo",
-    readOnly: isLive,
+    readOnly: false,
     ...(model ? { model } : {}),
     ...(provider ? { provider } : {}),
     ...(reasoningEffort ? { reasoningEffort } : {}),
@@ -1146,6 +1638,8 @@ function loadExplicitDemoState(): void {
 function clearRuntimeState(): void {
   for (const target of getOpenChatTargets()) releaseChatTarget(target.clientSessionId);
   clearAllChatComposerStates();
+  clearSessionInventoryObservations();
+  clearOfficeSnapshotRequestIdentities();
   profileList.value = [];
   sessions.value = [];
   resetKanbanRuntimeState();
@@ -1184,7 +1678,7 @@ function chatTarget(session: import("./domain").ChatSession): ChatTarget | undef
 
 function releaseChatTarget(sessionId: string): void {
   const session = sessions.value.find((item) => item.id === sessionId);
-  if (session && isChatRunActive(session)) {
+  if (session && isChatSessionLeaseProtected(session)) {
     deferredChatTargetReleases.add(sessionId);
     return;
   }
@@ -1192,7 +1686,16 @@ function releaseChatTarget(sessionId: string): void {
 }
 
 function releaseChatTargetNow(sessionId: string): void {
-  sessions.value = sessions.value.map((session) => session.id === sessionId ? reconcileChatSessionDisconnected(session) : session);
+  sessions.value = sessions.value.map((session) => {
+    if (session.id !== sessionId) return session;
+    const unusedLocalDraft = session.remoteKind === "draft"
+      && session.storedSessionId === undefined
+      && session.liveSessionId === undefined
+      && !isChatSessionLeaseProtected(session);
+    return unusedLocalDraft
+      ? { ...session, status: "ready", connectionState: "ready", readOnly: false, errorMessage: undefined }
+      : reconcileChatSessionDisconnected(session);
+  });
   officeRuntimeHooks.releaseChatSession(sessionId);
 }
 
@@ -1208,7 +1711,7 @@ effect(() => {
       continue;
     }
     const session = currentSessions.find((item) => item.id === sessionId);
-    if (session && isChatRunActive(session)) continue;
+    if (session && isChatSessionLeaseProtected(session)) continue;
     deferredChatTargetReleases.delete(sessionId);
     releaseChatTargetNow(sessionId);
     // Releasing the hidden reservation can expose a workspace slot that was

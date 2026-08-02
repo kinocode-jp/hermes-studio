@@ -405,6 +405,30 @@ export function reconcileChatPanels(liveSessionIds: ReadonlySet<string>): void {
 }
 
 /**
+ * Replace a provisional inventory session with the client identity that
+ * created it. Existing client-bound panes win when both identities are
+ * present; otherwise the provisional pane keeps its stable panel id.
+ */
+export function coalesceDashboardChatSessionIdentity(provisionalSessionId: string, retainedSessionId: string): void {
+  if (provisionalSessionId === retainedSessionId) return;
+  let changed = false;
+  const next = dashboards.value.map((dashboard) => {
+    const retainedPanel = dashboard.panels.find((panel) =>
+      panel.kind === "chat" && panel.sessionId === retainedSessionId);
+    const panels = dashboard.panels.flatMap((panel): DashboardPanel[] => {
+      if (panel.kind !== "chat" || panel.sessionId !== provisionalSessionId) return [panel];
+      changed = true;
+      return retainedPanel ? [] : [{ ...panel, sessionId: retainedSessionId }];
+    });
+    return panels.length === dashboard.panels.length
+      && panels.every((panel, index) => panel === dashboard.panels[index])
+      ? dashboard
+      : replaceDashboardPanels(dashboard, panels);
+  });
+  if (changed) commit(next);
+}
+
+/**
  * Replace panel membership/order and invalidate position-based resize data.
  * DashboardSizes has no panel-id signature, so retaining it across structural
  * changes can later apply old fractions to unrelated panels.

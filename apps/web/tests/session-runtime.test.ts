@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import type { ChatPromptResult, ChatSteerResult } from "../src/chat-api.ts";
+import type { ChatPromptResult, ChatSteerResult, ChatTarget } from "../src/chat-api.ts";
 import type { ChatSession } from "../src/domain.ts";
 import { chatMessageBody, chatSessionTitle, locale, localizeRuntimeMessage, officeMessage, officeRuntimeMessage, setLocale, t } from "../src/i18n.ts";
 import { buildChatTimeline, chatComposerState, formatChatMessageTime, nextOperationAnnouncement, operationAnnouncementText, presentedOperationEvidence, shouldSubmitComposerKey } from "../src/components/chat-pane.tsx";
@@ -9,6 +9,7 @@ import { boundedSteerEvidence, MAX_STEER_EVIDENCE_BYTES, MAX_STEER_EVIDENCE_COUN
 import { commitUnconfirmedRpcError, explicitRpcRejection } from "../src/chat-rpc-results.ts";
 import {
   applyChatHistory,
+  applyChatGatewayEvent,
   cancelSessionModelChange,
   closeSession,
   interruptSession,
@@ -79,6 +80,39 @@ test("sendMessage rejects every in-flight shape and atomically blocks a second p
   assert.deepEqual(submitted, ["first"]);
 });
 
+test("session.ready cannot reopen the composer or release the lease while the first prompt is pending", async () => {
+  const submission = deferred<ChatPromptResult>();
+  const submitted: string[] = [];
+  const released: string[] = [];
+  const draft: ChatSession = {
+    id: "ready-first-prompt", profileId: "profile", title: "", titlePresentation: "new-chat",
+    status: "ready", messages: [], remoteKind: "draft", connectionState: "ready", historyState: "loaded",
+  };
+  sessions.value = [draft];
+  openSessionIds.value = [draft.id];
+  registerChatRuntime({
+    ensureSession() {}, releaseSession(sessionId) { released.push(sessionId); },
+    submitPrompt(_sessionId, text) { submitted.push(text); return submission.promise; },
+    async steer() { return { status: "queued" }; }, interrupt() {},
+    async respondClarify() {}, async respondApproval() {},
+  });
+
+  const first = sendMessage(draft.id, "first");
+  setChatSessionReady(draft.id, "live-first", "stored-first", { running: false });
+  assert.equal(sessions.value[0]?.status, "streaming");
+  assert.equal(isChatRunActive(sessions.value[0]!), true);
+  assert.equal(canSubmitChatPrompt(sessions.value[0]!), false);
+  assert.equal(sendMessage(draft.id, "duplicate"), false);
+  assert.deepEqual(submitted, ["first"]);
+
+  closeSession(draft.id);
+  assert.deepEqual(released, [], "a hidden pending first prompt keeps its Hermes lease");
+
+  submission.resolve({ status: "rejected", message: "synthetic rejection" });
+  assert.equal(await first, false);
+  assert.deepEqual(released, [draft.id], "the deferred lease releases after the prompt settles");
+});
+
 test("only allowlisted slash names use slash.exec and a slash command is single-flight", async () => {
   const slash = deferred<import("../src/chat-api.ts").ChatSlashResult>();
   const slashCommands: string[] = [];
@@ -115,7 +149,7 @@ test("a commit-unconfirmed slash mutation is recorded as ambiguous rather than r
   });
   sessions.value = [{ ...ready }];
 
-  assert.equal(await sendMessage(ready.id, "/undo"), false);
+  assert.equal(await sendMessage(ready.id, "/undo"), true, "commit-unknown commands clear the composer to prevent an unsafe replay");
   assert.equal(calls, 1);
   assert.deepEqual(
     sessions.value[0]?.operationEvidence?.map(({ body, state, message }) => ({ body, state, message })),
@@ -200,7 +234,9 @@ test("message.interim seals streamed commentary so message.complete cannot wipe 
 
   const completed = reduceChatGatewayEvent(session, {
     type: "message.complete", liveSessionId: "live",
-    payload: { messageId: session.streamingMessageId, text: "All done! Here is the complete summary." },
+    // The preceding delta omitted an upstream id. Its generated transcript id
+    // is client-local and must never be echoed as a server correlation id.
+    payload: { text: "All done! Here is the complete summary." },
   });
   assert.deepEqual(completed.messages.map((message) => message.body), [
     "Let me start by planning the approach.",
@@ -621,6 +657,41 @@ test("a model switch stays cancellable until send and remains retryable after fa
   assert.match(submitted[0]!, /^keep this prompt/);
 });
 
+test("an unused draft folds model selection into its create target", () => {
+  const ensured: ChatTarget[] = [];
+  const slashCommands: string[] = [];
+  registerChatRuntime({
+    ensureSession(target) { ensured.push(target); }, releaseSession() {}, async steer() { return { status: "queued" }; }, interrupt() {},
+    submitPrompt() {},
+    async execSlash(_sessionId, command) { slashCommands.push(command); return { status: "ok", output: "", warning: "" }; },
+    async respondClarify() {}, async respondApproval() {},
+  });
+  sessions.value = [{
+    ...ready,
+    storedSessionId: undefined,
+    liveSessionId: undefined,
+    remoteKind: "draft",
+    provider: undefined,
+    model: undefined,
+    reasoningEffort: undefined,
+  }];
+
+  stageSessionModelChange(ready.id, "new-provider", "new-model", "high");
+
+  assert.equal(sessions.value[0]?.pendingModelChange, undefined);
+  assert.equal(sessions.value[0]?.provider, "new-provider");
+  assert.equal(sessions.value[0]?.model, "new-model");
+  assert.equal(sessions.value[0]?.reasoningEffort, "high");
+  assert.deepEqual(ensured.at(-1), {
+    clientSessionId: ready.id,
+    profileId: ready.profileId,
+    provider: "new-provider",
+    model: "new-model",
+    reasoningEffort: "high",
+  });
+  assert.deepEqual(slashCommands, []);
+});
+
 test("a rejected manual model command rolls back an unsent staged picker change", async () => {
   registerChatRuntime({
     ensureSession() {}, releaseSession() {}, async steer() { return { status: "queued" }; }, interrupt() {},
@@ -998,7 +1069,10 @@ test("Office-owned chat titles, tool fallbacks, and transport copy switch locale
   const tool = reduceChatGatewayEvent(ready, {
     type: "tool.start", liveSessionId: "live", payload: { toolId: "tool-1", name: "Shell" },
   }).messages[0]!;
-  const genericTool = reduceChatGatewayEvent(ready, {
+  const genericToolStart = reduceChatGatewayEvent(ready, {
+    type: "tool.start", liveSessionId: "live", payload: { toolId: "tool-2" },
+  });
+  const genericTool = reduceChatGatewayEvent(genericToolStart, {
     type: "tool.complete", liveSessionId: "live", payload: { toolId: "tool-2" },
   }).messages[0]!;
   const HermesDetail = reduceChatGatewayEvent(ready, {
@@ -1175,49 +1249,109 @@ test("stop blocks duplicate prompts until acknowledgement and restores the activ
   assert.equal(staleTerminal.interruptPending, true);
 });
 
-test("same-target terminal events retain steering until queued or rejected acknowledgement", async (context) => {
-  for (const terminal of ["message.complete", "error"] as const) {
-    for (const outcome of ["queued", "rejected"] as const) {
-      await context.test(`${terminal} before ${outcome}`, async () => {
-        const operation = deferred<ChatSteerResult>();
-        const prompts: string[] = [];
-        registerChatRuntime({
-          ensureSession() {}, releaseSession() {}, interrupt() {},
-          submitPrompt(_sessionId, text) { prompts.push(text); },
-          async steer() { return operation.promise; },
-          async respondClarify() {}, async respondApproval() {}
-        });
-        sessions.value = [{
-          ...ready,
-          status: "streaming",
-          streamingMessageId: "old-agent",
-          messages: [{ id: "old-agent", from: "agent", body: "old run", at: "00:00", status: "streaming" }],
-        }];
-
-        const pendingSteer = steerSession(ready.id, `${terminal} ${outcome}`);
-        sessions.value = [reduceChatGatewayEvent(sessions.value[0]!, terminal === "message.complete" ? {
-          type: terminal, liveSessionId: "live", payload: { messageId: "old-agent", text: "old done" }
-        } : {
-          type: terminal, liveSessionId: "live", payload: { message: "old failed" }
-        })];
-        assert.ok(sessions.value[0]?.steerOperationId);
-        assert.equal(sessions.value[0]?.steerPending, true);
-        assert.equal(canSubmitChatPrompt(sessions.value[0]!), false);
-        sendMessage(ready.id, "new prompt");
-        assert.deepEqual(prompts, []);
-
-        operation.resolve({ status: outcome });
-        assert.equal(await pendingSteer, outcome === "queued");
-        assert.equal(sessions.value[0]?.steerPending, false);
-        assert.equal(sessions.value[0]?.operationEvidence?.filter(({ kind }) => kind === "steer").length ?? 0, outcome === "queued" ? 1 : 0);
-        assert.equal(canSubmitChatPrompt(sessions.value[0]!), true);
-        if (outcome === "rejected") assert.match(localizeRuntimeMessage(sessions.value[0]!.errorMessage!), /拒否/);
+test("only authoritative pre-send idle promotes steer; complete ordering stays non-replaying", async (context) => {
+  for (const order of ["terminal-first", "terminal-first-turn-ended", "ack-first", "server-idle"] as const) {
+    await context.test(order, async () => {
+      const operation = deferred<ChatSteerResult>();
+      const prompts: string[] = [];
+      registerChatRuntime({
+        ensureSession() {}, releaseSession() {}, interrupt() {},
+        submitPrompt(_sessionId, text) { prompts.push(text); return Promise.resolve({ status: "accepted" }); },
+        async steer() { return order === "server-idle" ? { status: "turn-ended" } : operation.promise; },
+        async respondClarify() {}, async respondApproval() {}
       });
-    }
+      sessions.value = [{
+        ...ready,
+        status: "streaming",
+        chatRunId: "run-old",
+        chatRunSequence: 7,
+        streamingMessageId: "old-agent",
+        messages: [{ id: "old-agent", from: "agent", body: "old run", at: "00:00", status: "streaming" }],
+      }];
+
+      const steering = steerSession(ready.id, `guidance ${order}`);
+      if (order === "terminal-first" || order === "terminal-first-turn-ended") {
+        applyChatGatewayEvent(ready.id, {
+          type: "message.complete", liveSessionId: "live",
+          payload: { messageId: "old-agent", text: "old done", runId: "run-old", runSequence: 7 },
+        });
+        operation.resolve({ status: order === "terminal-first" ? "queued" : "turn-ended" });
+      } else if (order === "ack-first") {
+        operation.resolve({ status: "queued" });
+        assert.equal(await steering, true);
+        applyChatGatewayEvent(ready.id, {
+          type: "message.complete", liveSessionId: "live",
+          payload: { messageId: "old-agent", text: "old done", runId: "run-old", runSequence: 7 },
+        });
+      }
+      assert.equal(await steering, true);
+      await Promise.resolve();
+      const safelyIdle = order === "server-idle" || order === "terminal-first-turn-ended";
+      assert.deepEqual(prompts, safelyIdle ? [`guidance ${order}`] : []);
+      assert.equal(sessions.value[0]?.operationEvidence?.filter(({ kind }) => kind === "prompt").length ?? 0, safelyIdle ? 1 : 0);
+      assert.equal(sessions.value[0]?.operationEvidence?.filter(({ kind }) => kind === "steer").length, 1);
+    });
   }
 });
 
-test("disconnect, live target replacement, and close invalidate pending steer acknowledgements", async (context) => {
+test("post-ACK run activity consumes steer recovery and prevents duplicate promotion", async () => {
+  const prompts: string[] = [];
+  registerChatRuntime({
+    ensureSession() {}, releaseSession() {}, interrupt() {},
+    submitPrompt(_sessionId, text) { prompts.push(text); },
+    async steer() { return { status: "queued" }; },
+    async respondClarify() {}, async respondApproval() {},
+  });
+  sessions.value = [{ ...ready, status: "streaming", chatRunId: "run-1", chatRunSequence: 1 }];
+  assert.equal(await steerSession(ready.id, "already consumed"), true);
+  applyChatGatewayEvent(ready.id, { type: "message.delta", liveSessionId: "live", payload: { text: "continuing", runId: "run-1", runSequence: 1 } });
+  applyChatGatewayEvent(ready.id, { type: "message.complete", liveSessionId: "live", payload: { text: "done", runId: "run-1", runSequence: 1 } });
+  assert.deepEqual(prompts, []);
+});
+
+test("pre-ACK activity suppresses queued replay but authoritative turn-ended still recovers", async (context) => {
+  for (const outcome of ["queued", "turn-ended"] as const) {
+    await context.test(outcome, async () => {
+      const acknowledgement = deferred<ChatSteerResult>();
+      const prompts: string[] = [];
+      registerChatRuntime({
+        ensureSession() {}, releaseSession() {}, interrupt() {},
+        submitPrompt(_sessionId, text) { prompts.push(text); },
+        async steer() { return acknowledgement.promise; },
+        async respondClarify() {}, async respondApproval() {},
+      });
+      sessions.value = [{
+        ...ready,
+        status: "streaming",
+        chatRunId: "run-pre-ack",
+        chatRunSequence: 9,
+        streamingMessageId: "agent-pre-ack",
+        messages: [{ id: "agent-pre-ack", from: "agent", body: "working", at: "00:00", status: "streaming" }],
+      }];
+
+      const steering = steerSession(ready.id, `consumed before ${outcome}`);
+      applyChatGatewayEvent(ready.id, {
+        type: "message.delta", liveSessionId: "live",
+        payload: { messageId: "agent-pre-ack", text: " with guidance", runId: "run-pre-ack", runSequence: 9 },
+      });
+      applyChatGatewayEvent(ready.id, {
+        type: "message.complete", liveSessionId: "live",
+        payload: { messageId: "agent-pre-ack", text: "done", runId: "run-pre-ack", runSequence: 9 },
+      });
+      acknowledgement.resolve({ status: outcome });
+
+      assert.equal(await steering, true);
+      await Promise.resolve();
+      const safelyUnsent = outcome === "turn-ended";
+      assert.deepEqual(prompts, safelyUnsent ? [`consumed before ${outcome}`] : []);
+      assert.equal(sessions.value[0]?.steerDelivery, undefined);
+      assert.equal(sessions.value[0]?.operationEvidence?.filter(({ kind }) => kind === "steer").length, 1);
+      assert.equal(sessions.value[0]?.operationEvidence?.filter(({ kind }) => kind === "prompt").length ?? 0, safelyUnsent ? 1 : 0);
+    });
+  }
+});
+
+test("disconnect and target replacement invalidate steer while pane close defers it through terminal settlement", async (context) => {
   const scenarios = ["disconnect", "target", "close"] as const;
   for (const scenario of scenarios) {
     await context.test(scenario, async () => {
@@ -1245,6 +1379,30 @@ test("disconnect, live target replacement, and close invalidate pending steer ac
       } else {
         closeSession(ready.id);
       }
+
+      if (scenario === "close") {
+        const hidden = sessions.value[0]!;
+        assert.equal(hidden.steerPending, true, "a layout close does not cancel accepted user guidance");
+        assert.deepEqual(openSessionIds.value, []);
+        assert.deepEqual(released, [], "the active run retains its hidden lease");
+
+        operation.resolve();
+        assert.equal(await staleSteer, true);
+        assert.equal(sessions.value[0]?.steerPending, false);
+        assert.equal(sessions.value[0]?.operationEvidence?.at(-1)?.kind, "steer");
+        assert.deepEqual(released, [], "a queued steer still belongs to the active run");
+
+        applyChatGatewayEvent(ready.id, {
+          type: "message.complete", liveSessionId: "live",
+          payload: { messageId: "agent-old", text: "done" },
+        });
+        assert.deepEqual(released, [ready.id]);
+        assert.equal(sessions.value[0]?.connectionState, "disconnected");
+        assert.equal(sessions.value[0]?.liveSessionId, undefined);
+        assert.equal(sessions.value[0]?.status, "ready");
+        return;
+      }
+
       const invalidated = sessions.value[0]!;
       assert.equal(invalidated.steerOperationId, undefined);
       assert.equal(invalidated.steerPending, false);
@@ -1259,13 +1417,6 @@ test("disconnect, live target replacement, and close invalidate pending steer ac
       } else if (scenario === "target") {
         assert.equal(invalidated.liveSessionId, "live-replacement");
         assert.equal(invalidated.status, "streaming");
-        assert.equal(invalidated.messages[0]?.status, "cancelled");
-      } else if (scenario === "close") {
-        assert.deepEqual(released, [ready.id]);
-        assert.deepEqual(openSessionIds.value, []);
-        assert.equal(invalidated.connectionState, "disconnected");
-        assert.equal(invalidated.liveSessionId, undefined);
-        assert.equal(invalidated.status, "ready");
         assert.equal(invalidated.messages[0]?.status, "cancelled");
       }
     });
@@ -1365,6 +1516,11 @@ test("completion, interruption, and error are authoritative run terminators", as
   assert.equal(isChatRunActive(complete), false);
   assert.deepEqual(complete.messages.map(({ status }) => status), ["complete", "complete"]);
 
+  const blankTerminal = reduceChatGatewayEvent(active, {
+    type: "message.complete", liveSessionId: "live", payload: { messageId: "agent-1", text: "   " }
+  });
+  assert.equal(blankTerminal.messages.find(({ id }) => id === "agent-1")?.body, "done");
+
   const error = reduceChatGatewayEvent(active, {
     type: "error", liveSessionId: "live", payload: { message: "failed" }
   });
@@ -1380,6 +1536,12 @@ test("completion, interruption, and error are authoritative run terminators", as
   });
   assert.equal(pendingError.pendingInteraction, undefined);
   assert.equal(isChatRunActive(pendingError), false);
+
+  const newerRun = { ...active, chatRunId: "run-2", chatRunServerSequence: 2, completedChatRunServerSequence: 1 };
+  const lateError = reduceChatGatewayEvent(newerRun, {
+    type: "error", liveSessionId: "live", payload: { message: "late", runId: "run-1", runSequence: 1 }
+  });
+  assert.equal(lateError, newerRun);
 
   const interrupts: string[] = [];
   registerChatRuntime({

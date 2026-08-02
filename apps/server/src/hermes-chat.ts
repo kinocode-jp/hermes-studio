@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { WebSocket } from "ws";
 import {
+  appendStudioDefaultDelegationTurnInstruction,
   appendStudioFollowUpTurnInstruction,
   stripStudioFollowUpTurnInstruction,
 } from "./office-agent-behavior.js";
@@ -9,6 +10,7 @@ import { redactSecrets } from "./secret-scrubber.js";
 
 const DEFAULT_TIMEOUT_MS = 15_000;
 const SLASH_TIMEOUT_MS = 180_000;
+const SESSION_START_TIMEOUT_MS = 60_000;
 const DEFAULT_MAX_FRAME_BYTES = 256 * 1024;
 const DEFAULT_MAX_HISTORY_BYTES = 2 * 1024 * 1024;
 const DEFAULT_MAX_TEXT_BYTES = 128 * 1024;
@@ -29,6 +31,19 @@ const PROFILE_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 const STUDIO_MODEL_SLASH_PATTERN = /^\/model\s+[A-Za-z0-9][A-Za-z0-9_./:+@-]{0,255}(?:\s+--provider\s+[A-Za-z0-9][A-Za-z0-9_./:-]{0,127})?\s+--session$/;
 const STUDIO_REASONING_SLASH_PATTERN = /^\/reasoning\s+(?:default|none|minimal|low|medium|high|xhigh|max|ultra)$/;
 const SAFE_REASONING_EFFORTS = new Set(["", "default", "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"]);
+const MINIMAL_PARTIAL_DELEGATION_CATALOG = JSON.stringify({
+  version: 1,
+  catalogStatus: "partial",
+  usableFor: ["main", "subagent"],
+  coverage: "profile-scoped live provider catalogs",
+  truncated: true,
+});
+const MINIMAL_UNAVAILABLE_DELEGATION_CATALOG = JSON.stringify({
+  version: 1,
+  catalogStatus: "unavailable",
+  usableFor: ["main", "subagent"],
+  coverage: "profile-scoped live provider catalogs",
+});
 
 export const HERMES_CHAT_METHODS = [
   "session.create",
@@ -69,6 +84,10 @@ export interface HermesChatResult {
 export interface HermesChatInternalRequestOptions {
   /** Trusted Office-owned system context for a brand-new session only. */
   sessionCreateSystemSeed?: string;
+  /** Trusted Studio default-Profile specialist-handoff gate for one prompt. */
+  studioDefaultDelegationTurn?: true;
+  /** Bounded, secret-free Profile model DTOs resolved by Studio Server. */
+  studioDefaultDelegationModelCatalog?: string;
   /** Trusted Studio response-format reinforcement for one ordinary prompt. */
   studioFollowUpTurn?: true;
 }
@@ -162,6 +181,50 @@ export function createHermesChatTransport(
     inspectHistory: async (request) => await inspectHistory(config, request),
     fetchHistory: async (request) => await fetchHistory(config, request),
   };
+}
+
+/**
+ * Compose trusted Studio prompt suffixes within the actual JSON-RPC frame
+ * budget. Every prompt reserves the same default-gate/minimal-catalog/footer
+ * envelope, so maximum user input does not vary by Profile. Full catalog data
+ * is opportunistic and degrades to an explicit bounded header first.
+ */
+export function composeStudioPromptForWire(
+  text: string,
+  sessionId: string,
+  internal: Pick<HermesChatInternalRequestOptions,
+    "studioDefaultDelegationTurn" | "studioDefaultDelegationModelCatalog" | "studioFollowUpTurn"> | undefined,
+  maxFrameBytes: number,
+): string {
+  if (internal?.studioDefaultDelegationModelCatalog !== undefined
+    && internal.studioDefaultDelegationTurn !== true) {
+    throw publicError("invalid_request", "Studio model catalog context requires the default delegation gate.");
+  }
+  const suppliedCatalog = internal?.studioDefaultDelegationModelCatalog === undefined
+    ? undefined
+    : requiredDelegationCatalog(internal.studioDefaultDelegationModelCatalog);
+  const minimalCatalog = minimalDelegationCatalog(suppliedCatalog);
+  const reserved = appendStudioFollowUpTurnInstruction(
+    appendStudioDefaultDelegationTurnInstruction(text, minimalCatalog),
+  );
+  if (!promptFitsWire(sessionId, reserved, maxFrameBytes)) {
+    throw publicError("invalid_request", "Prompt is too large for the Studio conversation context budget.");
+  }
+  if (internal?.studioDefaultDelegationTurn === true) {
+    const withRequestedFollowUp = (value: string): string => internal.studioFollowUpTurn === true
+      ? appendStudioFollowUpTurnInstruction(value)
+      : value;
+    const full = withRequestedFollowUp(
+      appendStudioDefaultDelegationTurnInstruction(text, suppliedCatalog ?? minimalCatalog),
+    );
+    const minimal = withRequestedFollowUp(
+      appendStudioDefaultDelegationTurnInstruction(text, minimalCatalog),
+    );
+    return promptFitsWire(sessionId, full, maxFrameBytes) ? full : minimal;
+  }
+  return internal?.studioFollowUpTurn === true
+    ? appendStudioFollowUpTurnInstruction(text)
+    : text;
 }
 
 interface NormalizedOptions {
@@ -287,11 +350,17 @@ async function openConnection(
         const content = requiredGlobalContext(internal.sessionCreateSystemSeed);
         params.messages = [{ role: "system", content }];
       }
-      if (internal?.studioFollowUpTurn === true) {
-        if (method !== "prompt.submit" || typeof params.text !== "string") {
-          throw publicError("invalid_request", "Studio follow-up context can only reinforce a prompt.");
-        }
-        params.text = appendStudioFollowUpTurnInstruction(params.text);
+      if (method === "prompt.submit" && typeof params.text === "string") {
+        params.text = composeStudioPromptForWire(
+          params.text,
+          String(params.session_id),
+          internal,
+          config.maxFrameBytes,
+        );
+      } else if (internal?.studioDefaultDelegationTurn === true
+        || internal?.studioDefaultDelegationModelCatalog !== undefined
+        || internal?.studioFollowUpTurn === true) {
+        throw publicError("invalid_request", "Studio prompt context can only reinforce a prompt.");
       }
       const id = ++sequence;
       const wire = upstreamWireRequest(method, params);
@@ -303,7 +372,11 @@ async function openConnection(
         const timer = setTimeout(() => {
           pending.delete(id);
           reject(publicError("timed_out", "Hermes chat request timed out."));
-        }, method === "slash.exec" ? Math.max(config.timeoutMs, SLASH_TIMEOUT_MS) : config.timeoutMs);
+        }, method === "slash.exec"
+          ? Math.max(config.timeoutMs, SLASH_TIMEOUT_MS)
+          : method === "session.create" || method === "session.resume"
+            ? Math.max(config.timeoutMs, SESSION_START_TIMEOUT_MS)
+            : config.timeoutMs);
         timer.unref();
         pending.set(id, { method, resolve, reject, timer });
         websocket.send(serialized, (error) => {
@@ -626,7 +699,10 @@ function normalizeEvent(raw: unknown, maxTextBytes: number): HermesChatEvent | u
     return { ...base, payload: compact({ kind: safePublicText(payload.kind, 80), status: safePublicText(payload.status, 80), message: sanitizeText(firstString(payload, ["message", "text"]), 2 * 1024) }) };
   }
   if (["gateway.ready", "session.info", "error"].includes(raw.type)) {
-    return { ...base, payload: compact({ status: safePublicText(payload.status, 80), message: sanitizeText(firstString(payload, ["message", "text"]), 2 * 1024), model: safePublicText(payload.model, 200), provider: safePublicText(payload.provider, 100), reasoningEffort: safeReasoningEffort(firstValue(payload, ["reasoning_effort", "reasoningEffort", "reasoning"])), running: typeof payload.running === "boolean" ? payload.running : undefined, storedSessionId: safeId(payload.stored_session_id), version: safePublicText(payload.version, 80) }) };
+    const messageIds = raw.type === "error"
+      ? uniqueOpaqueSourceIds([payload, raw], ["message_id", "messageId"], "message")
+      : [];
+    return { ...base, payload: compact({ status: safePublicText(payload.status, 80), message: sanitizeText(firstString(payload, ["message", "text"]), 2 * 1024), model: safePublicText(payload.model, 200), provider: safePublicText(payload.provider, 100), reasoningEffort: safeReasoningEffort(firstValue(payload, ["reasoning_effort", "reasoningEffort", "reasoning"])), running: typeof payload.running === "boolean" ? payload.running : undefined, storedSessionId: safeId(payload.stored_session_id), version: safePublicText(payload.version, 80), taskId: raw.type === "error" ? safeId(firstValue(payload, ["task_id", "taskId"])) : undefined, messageId: messageIds[0], messageIds: messageIds.length === 0 ? undefined : messageIds }) };
   }
   return undefined;
 }
@@ -747,6 +823,31 @@ function requiredProfile(value: unknown): string { if (typeof value !== "string"
 function optionalProfile(value: unknown): string | undefined { return value === undefined ? undefined : requiredProfile(value); }
 function safeProfile(value: unknown): string | undefined { return typeof value === "string" && PROFILE_PATTERN.test(value) ? value : undefined; }
 function requiredText(value: unknown, name: string, maxBytes: number): string { if (typeof value !== "string" || value.trim() === "" || Buffer.byteLength(value) > maxBytes || value.includes("\0")) throw publicError("invalid_request", `${name} is invalid.`); return value; }
+function requiredDelegationCatalog(value: unknown): string { return requiredText(value, "studioDefaultDelegationModelCatalog", 64 * 1024); }
+function minimalDelegationCatalog(value: string | undefined): string {
+  if (value === undefined) return MINIMAL_UNAVAILABLE_DELEGATION_CATALOG;
+  try {
+    const firstLine = value.split("\n", 1)[0];
+    const header = firstLine === undefined ? undefined : JSON.parse(firstLine) as unknown;
+    if (isRecord(header) && header.catalogStatus === "unavailable") {
+      return MINIMAL_UNAVAILABLE_DELEGATION_CATALOG;
+    }
+    if (isRecord(header) && (header.catalogStatus === "complete" || header.catalogStatus === "partial")) {
+      return MINIMAL_PARTIAL_DELEGATION_CATALOG;
+    }
+  } catch { /* Malformed trusted metadata degrades without exposing diagnostics. */ }
+  return MINIMAL_UNAVAILABLE_DELEGATION_CATALOG;
+}
+function promptFitsWire(sessionId: string, text: string, maxFrameBytes: number): boolean {
+  const serialized = JSON.stringify({
+    jsonrpc: "2.0",
+    // Reserve the largest id representation the process can safely emit.
+    id: Number.MAX_SAFE_INTEGER,
+    method: "prompt.submit",
+    params: { session_id: sessionId, text },
+  });
+  return Buffer.byteLength(serialized) <= maxFrameBytes;
+}
 function clarificationAnswer(value: unknown, maxBytes: number): string { if (typeof value !== "string" || Buffer.byteLength(value) > maxBytes || value.includes("\0")) throw publicError("invalid_request", "answer is invalid."); return value; }
 function optionalText(value: unknown, name: string, maxChars: number): string | undefined { if (value === undefined) return undefined; if (typeof value !== "string" || value.length > maxChars || value.includes("\0")) throw publicError("invalid_request", `${name} is invalid.`); return value; }
 function optionalBoolean(value: unknown, name: string): boolean | undefined { if (value === undefined) return undefined; if (typeof value !== "boolean") throw publicError("invalid_request", `${name} is invalid.`); return value; }

@@ -11,13 +11,15 @@ export type FontScale = (typeof fontScales)[number];
 type AppearancePreferences = {
   theme: Theme;
   fontScale: FontScale;
+  richLinkPreviews: boolean;
 };
 
-const defaults: AppearancePreferences = { theme: "paper", fontScale: 1 };
+const defaults: AppearancePreferences = { theme: "paper", fontScale: 1, richLinkPreviews: true };
 const initial = readPreferences();
 
 export const activeTheme = signal<Theme>(initial.theme);
 export const activeFontScale = signal<FontScale>(initial.fontScale);
+export const richLinkPreviewsEnabled = signal(initial.richLinkPreviews);
 
 export function initializeAppearance(): void {
   applyAppearance(activeTheme.value, activeFontScale.value);
@@ -35,6 +37,11 @@ export function setFontScale(fontScale: FontScale): void {
   persistPreferences();
 }
 
+export function setRichLinkPreviewsEnabled(enabled: boolean): void {
+  richLinkPreviewsEnabled.value = enabled;
+  persistPreferences();
+}
+
 function readPreferences(): AppearancePreferences {
   if (typeof localStorage === "undefined") return defaults;
   try {
@@ -42,6 +49,9 @@ function readPreferences(): AppearancePreferences {
     return {
       theme: isTheme(candidate?.theme) ? candidate.theme : defaults.theme,
       fontScale: normalizeFontScale(candidate?.fontScale),
+      richLinkPreviews: typeof candidate?.richLinkPreviews === "boolean"
+        ? candidate.richLinkPreviews
+        : defaults.richLinkPreviews,
     };
   } catch {
     return defaults;
@@ -54,6 +64,7 @@ function persistPreferences(): void {
     localStorage.setItem(APPEARANCE_STORAGE_KEY, JSON.stringify({
       theme: activeTheme.value,
       fontScale: activeFontScale.value,
+      richLinkPreviews: richLinkPreviewsEnabled.value,
     } satisfies AppearancePreferences));
   } catch {
     // Appearance is non-critical; keep the active session usable when storage is unavailable.

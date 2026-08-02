@@ -24,13 +24,65 @@ export function reduceChatGatewayEvent(
     ?? sequenceFromOpaqueId(eventId, "event");
   if (eventSequence !== undefined && session.processedChatEventSequence !== undefined
     && eventSequence <= session.processedChatEventSequence) return session;
-  const reduced = reduceUnseenChatGatewayEvent(session, event, onTranscriptLimit);
+  const reduced = reconcileSteerDeliveryEvent(
+    session,
+    reduceUnseenChatGatewayEvent(session, event, onTranscriptLimit),
+    event,
+  );
   if (correlationEpoch === undefined && eventSequence === undefined) return reduced;
   return {
     ...reduced,
     chatCorrelationEpoch: reduced.chatCorrelationEpoch ?? correlationEpoch,
     processedChatEventSequence: advanceSequence(reduced.processedChatEventSequence, eventSequence),
   };
+}
+
+const STEER_CONSUMPTION_EVENT_TYPES = new Set([
+  "message.start",
+  "message.delta",
+  "message.interim",
+  "tool.start",
+  "tool.progress",
+  "tool.complete",
+]);
+
+function reconcileSteerDeliveryEvent(
+  previous: ChatSession,
+  reduced: ChatSession,
+  event: ChatGatewayEvent,
+): ChatSession {
+  const delivery = previous.steerDelivery;
+  if (delivery === undefined || delivery.liveSessionId !== event.liveSessionId) return reduced;
+  const eventRunId = stringValue(event.payload?.runId) ?? stringValue(event.payload?.run_id);
+  const eventRunSequence = finitePositiveSequence(event.payload?.runSequence)
+    ?? finitePositiveSequence(event.payload?.run_sequence);
+  if ((delivery.runId !== undefined && eventRunId !== undefined && delivery.runId !== eventRunId)
+    || (delivery.runSequence !== undefined && eventRunSequence !== undefined
+      && delivery.runSequence !== eventRunSequence)) return reduced;
+  if (event.type === "error") return { ...reduced, steerDelivery: undefined };
+  if (event.type === "message.complete") {
+    const terminalDelivery = {
+      ...delivery,
+      // A terminal after steer send is itself consumption/ambiguity evidence:
+      // Hermes may have applied the guidance before completing without another
+      // delta/tool frame. Never replay it automatically as a second turn.
+      activityObserved: true,
+      terminalObserved: true,
+    };
+    return delivery.acknowledgement === "queued"
+      ? { ...reduced, steerDelivery: undefined }
+      : { ...reduced, steerDelivery: terminalDelivery };
+  }
+  // A correlated assistant/tool frame after steer send is consumption
+  // evidence even when the ACK is still in flight. Preserve that fact across
+  // a following terminal so a late queued/turn-ended ACK cannot duplicate the
+  // already-influenced run as a fresh prompt.
+  if (STEER_CONSUMPTION_EVENT_TYPES.has(event.type)) {
+    return delivery.acknowledgement === "queued"
+      ? { ...reduced, steerDelivery: undefined }
+      : { ...reduced, steerDelivery: { ...delivery, activityObserved: true } };
+  }
+  return reduced;
 }
 
 function reduceUnseenChatGatewayEvent(
@@ -224,7 +276,10 @@ function reduceUnseenChatGatewayEvent(
     const streamedText = messageId
       ? session.messages.find((message) => message.id === messageId)?.body ?? ""
       : "";
-    const sourceText = completeText || streamedText;
+    // Hermes may terminalize an already-streamed reply with an empty/blank
+    // text field. Blank terminal text is absence, not an instruction to erase
+    // the complete body accumulated from deltas.
+    const sourceText = completeText?.trim() ? completeText : streamedText;
     // A terminal frame with no text and no open stream only finishes the run.
     // Sealed interim bubbles must remain visible rather than being replaced by
     // an empty complete message.
@@ -411,6 +466,9 @@ function reduceUnseenChatGatewayEvent(
     });
   }
   if (event.type === "error") {
+    const runId = stringValue(payload.runId) ?? stringValue(payload.run_id);
+    const runServerSequence = gatewayRunServerSequence(payload, runId);
+    if (isStaleGatewayRun(session, runId, runServerSequence)) return session;
     const upstreamText = stringValue(payload.message);
     return {
       ...session,
@@ -424,7 +482,7 @@ function reduceUnseenChatGatewayEvent(
       chatRunServerSequence: undefined,
       completedChatRunServerSequence: advanceSequence(
         session.completedChatRunServerSequence,
-        session.chatRunServerSequence,
+        runServerSequence ?? session.chatRunServerSequence,
       ),
       chatRunSourceMessageId: undefined,
       chatRunSequence: undefined,

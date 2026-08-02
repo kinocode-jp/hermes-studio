@@ -6,10 +6,12 @@ import test from "node:test";
 import { HermesSettingsError } from "./hermes-settings.js";
 import {
   OfficeAgentBehaviorStore,
+  appendStudioDefaultDelegationTurnInstruction,
   appendStudioFollowUpTurnInstruction,
   buildSubagentSessionInstruction,
   composeSessionCreateSystemSeed,
   stripStudioFollowUpTurnInstruction,
+  studioDefaultDelegationGateInstruction,
   studioDefaultProfileOrchestrationInstruction,
   studioProfileAgentBehaviorInstruction,
   studioFollowUpSessionInstruction,
@@ -167,6 +169,20 @@ test("buildSubagentSessionInstruction and composeSessionCreateSystemSeed are pur
   assert.match(orchestration, /front desk and coordinator/);
   assert.match(orchestration, /kanban_create/);
   assert.match(orchestration, /new Studio chat is isolated/);
+  const gate = studioDefaultDelegationGateInstruction();
+  const assignee = gate.indexOf("Select the existing specialist Profile");
+  const main = gate.indexOf("worker's main model and reasoning level");
+  const sub = gate.indexOf("subagent model and reasoning level");
+  const wait = gate.indexOf("end the turn");
+  const delegate = gate.indexOf("call kanban_create exactly once");
+  assert.ok(assignee >= 0 && assignee < main);
+  assert.ok(main < sub && sub < wait && wait < delegate);
+  assert.match(gate, /<Profile>に依頼します/);
+  assert.match(gate, /メインモデルの指定がありません/);
+  assert.match(gate, /サブエージェントはデフォルトで良いですか/);
+  assert.match(gate, /Option 1 is always Default/);
+  assert.match(gate, /both default/);
+  assert.match(gate, /Never show it for a simple general answer/);
   assert.equal(studioProfileAgentBehaviorInstruction("default", "Use subagents proactively."), undefined);
   assert.equal(studioProfileAgentBehaviorInstruction("coder", "Use subagents proactively."), "Use subagents proactively.");
   assert.equal(buildSubagentSessionInstruction({ subagentMode: "manual", preferredSubagent: "x", preferredCandidateIds: [] }), undefined);
@@ -196,6 +212,13 @@ test("buildSubagentSessionInstruction and composeSessionCreateSystemSeed are pur
   const reinforced = appendStudioFollowUpTurnInstruction("ユーザー本文");
   assert.match(studioFollowUpTurnInstruction(), /<studio-followups>/);
   assert.equal(stripStudioFollowUpTurnInstruction(reinforced), "ユーザー本文");
+  const defaultReinforced = appendStudioFollowUpTurnInstruction(
+    appendStudioDefaultDelegationTurnInstruction(
+      "委譲してください",
+      '{"profile":"coder","provider":"openai","model":"gpt","reasoningEfforts":["high"]}',
+    ),
+  );
+  assert.equal(stripStudioFollowUpTurnInstruction(defaultReinforced), "委譲してください");
   assert.equal(stripStudioFollowUpTurnInstruction("通常の本文"), "通常の本文");
 });
 

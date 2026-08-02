@@ -1,3 +1,4 @@
+import { useEffect, useState } from "preact/hooks";
 import { DeviceLogin } from "./components/device-login";
 import { AppearanceSettings } from "./components/appearance-settings";
 import { ProfileCommand } from "./components/profile-command";
@@ -11,9 +12,27 @@ import { SettingsIcon } from "./components/icons";
 import { sidebarWidth } from "./sidebar-layout";
 import { officeAccess, officeConnection, openSessionIds, closeSettingsModal, openSettingsModal, retryStudioServer, settingsModalOpen, settingsTab, workspaceSessionDropPreview } from "./store";
 import { activateDashboardContainingPanel } from "./dashboard-actions";
+import { MobileAppShell } from "./components/mobile-app-shell";
+import { isPhoneViewport, PHONE_VIEWPORT_QUERY } from "./viewport";
 
 export function App() {
+  const [phoneViewport, setPhoneViewport] = useState(isPhoneViewport());
+
+  useEffect(() => {
+    if (typeof matchMedia !== "function") return;
+    const query = matchMedia(PHONE_VIEWPORT_QUERY);
+    const sync = () => setPhoneViewport(query.matches);
+    sync();
+    if (typeof query.addEventListener === "function") {
+      query.addEventListener("change", sync);
+      return () => query.removeEventListener("change", sync);
+    }
+    query.addListener(sync);
+    return () => query.removeListener(sync);
+  }, []);
+
   if (officeAccess.value.state !== "authenticated") return <DeviceLogin />;
+  if (phoneViewport) return <MobileAppShell />;
   const hasChats = openSessionIds.value.length > 0 || workspaceSessionDropPreview.value;
   const connection = officeConnection.value;
   const connectionLabel = connection.state === "connected"

@@ -33,8 +33,8 @@ export function boundedSteerEvidence(messages: readonly ChatMessage[]): ChatMess
 }
 
 export function invalidatePendingSteer(session: ChatSession): ChatSession {
-  if (session.steerPending !== true && session.steerOperationId === undefined) return session;
-  return { ...session, steerPending: false, steerOperationId: undefined };
+  if (session.steerPending !== true && session.steerOperationId === undefined && session.steerDelivery === undefined) return session;
+  return { ...session, steerPending: false, steerOperationId: undefined, steerDelivery: undefined };
 }
 
 export function invalidatePendingInterrupt(session: ChatSession): ChatSession {
@@ -45,6 +45,7 @@ export function invalidatePendingInterrupt(session: ChatSession): ChatSession {
 export async function steerChatRun(
   state: SessionState,
   sendSteer: (sessionId: string, text: string) => Promise<ChatSteerResult>,
+  recoverAsPrompt: (sessionId: string, operationId: string) => void,
   sessionId: string,
   body: string,
 ): Promise<boolean> {
@@ -52,37 +53,69 @@ export async function steerChatRun(
   const session = state.value.find((item) => item.id === sessionId);
   if (!trimmed || !session || !canSteerChatSession(session)) return false;
   const operationId = crypto.randomUUID();
-  updateSession(state, sessionId, (item) => ({ ...item, steerPending: true, steerOperationId: operationId, errorMessage: undefined }));
+  updateSession(state, sessionId, (item) => ({
+    ...item,
+    steerPending: true,
+    steerOperationId: operationId,
+    steerDelivery: {
+      operationId,
+      body: trimmed,
+      liveSessionId: item.liveSessionId!,
+      ...(item.chatRunId ? { runId: item.chatRunId } : {}),
+      ...(item.chatRunSequence === undefined ? {} : { runSequence: item.chatRunSequence }),
+      acknowledgement: "pending",
+    },
+    errorMessage: undefined,
+  }));
   try {
     const result = await sendSteer(sessionId, trimmed);
-    if (result.status !== "queued") {
+    if (result.status !== "queued" && result.status !== "turn-ended") {
       updateSession(state, sessionId, (item) => item.steerOperationId === operationId ? {
         ...item,
         steerPending: false,
         steerOperationId: undefined,
+        steerDelivery: undefined,
         errorMessage: result.status === "rejected"
           ? officeMessage("runtime.chat.steerRejected")
           : officeMessage("runtime.chat.steerInvalidAck"),
       } : item);
       return false;
     }
-    updateSession(state, sessionId, (item) => item.steerOperationId === operationId ? {
-      ...item,
-      steerPending: false,
-      steerOperationId: undefined,
-      operationEvidence: boundedOperationEvidence([
-        ...(item.operationEvidence ?? []),
-        {
-          id: operationId,
-          timelineSequence: nextChatTimelineSequence(item),
-          kind: "steer",
-          body: trimmed,
-          at: nowTimestamp(),
-          state: "accepted",
-        },
-      ]),
-    } : item);
-    return state.value.some((item) => item.id === sessionId && item.operationEvidence?.some(({ id }) => id === operationId));
+    let shouldRecover = false;
+    updateSession(state, sessionId, (item) => {
+      if (item.steerOperationId !== operationId || item.steerDelivery?.operationId !== operationId) return item;
+      const delivery = {
+        ...item.steerDelivery,
+        acknowledgement: "queued" as const,
+        ...(result.status === "turn-ended" ? { terminalObserved: true } : {}),
+      };
+      // turn-ended is generated only by Hub's pre-request terminal fence and
+      // proves steer never reached Hermes. It is safe to recover regardless of
+      // Browser event ordering. A real queued ACK is never auto-promoted after
+      // terminal because consumption cannot be proven either way.
+      shouldRecover = result.status === "turn-ended";
+      const clearDelivery = result.status === "queued" && delivery.activityObserved === true;
+      return {
+        ...item,
+        steerPending: false,
+        steerOperationId: undefined,
+        steerDelivery: clearDelivery ? undefined : delivery,
+        operationEvidence: boundedOperationEvidence([
+          ...(item.operationEvidence ?? []),
+          {
+            id: operationId,
+            timelineSequence: nextChatTimelineSequence(item),
+            kind: "steer",
+            body: trimmed,
+            at: nowTimestamp(),
+            state: "accepted",
+          },
+        ]),
+      };
+    });
+    const accepted = state.value.some((item) => item.id === sessionId && item.operationEvidence?.some(({ id }) => id === operationId));
+    if (accepted && shouldRecover) recoverAsPrompt(sessionId, operationId);
+    return accepted;
   } catch (reason) {
     const unconfirmed = isCommitUnconfirmedRpcError(reason);
     let recorded = false;
@@ -112,6 +145,7 @@ export async function steerChatRun(
         ...item,
         steerPending: false,
         steerOperationId: undefined,
+        steerDelivery: undefined,
         ...(unconfirmed ? {
           errorMessage: undefined,
           operationEvidence: evidence,
@@ -133,7 +167,17 @@ export async function interruptChatRun(
   const session = state.value.find((item) => item.id === sessionId);
   if (!session || session.connectionState !== "ready" || !isChatRunActive(session) || session.interruptPending) return false;
   const operationId = crypto.randomUUID();
-  updateSession(state, sessionId, (item) => ({ ...item, interruptPending: true, interruptOperationId: operationId, errorMessage: undefined }));
+  updateSession(state, sessionId, (item) => ({
+    ...item,
+    // Stop is an explicit instruction not to continue this turn. It cancels a
+    // queued steer-recovery fence before the interrupt RPC can race terminal.
+    steerPending: false,
+    steerOperationId: undefined,
+    steerDelivery: undefined,
+    interruptPending: true,
+    interruptOperationId: operationId,
+    errorMessage: undefined,
+  }));
   try {
     await sendInterrupt(sessionId);
     let acknowledged = false;
@@ -166,12 +210,24 @@ export async function interruptChatRun(
     });
     return acknowledged;
   } catch {
-    updateSession(state, sessionId, (item) => item.interruptOperationId === operationId ? {
-      ...item,
-      interruptPending: false,
-      interruptOperationId: undefined,
-      errorMessage: officeMessage("runtime.chat.interruptFailed"),
-    } : item);
+    updateSession(state, sessionId, (item) => {
+      if (item.interruptOperationId === operationId) return {
+        ...item,
+        interruptPending: false,
+        interruptOperationId: undefined,
+        errorMessage: officeMessage("runtime.chat.interruptFailed"),
+      };
+      // A commit-unknown interrupt enters the history barrier first, which
+      // invalidates pending operation markers and the live id synchronously.
+      // Preserve the user-visible failure only on that disconnected target;
+      // never attach a delayed error to a replacement live generation.
+      if (item.interruptOperationId === undefined
+        && item.connectionState === "disconnected"
+        && item.liveSessionId === undefined) {
+        return { ...item, errorMessage: officeMessage("runtime.chat.interruptFailed") };
+      }
+      return item;
+    });
     return false;
   }
 }

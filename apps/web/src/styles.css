@@ -846,7 +846,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 /* Profile inspector pane removed; profile details/settings use modals. */
 .profile-panel,
 .profile-panel.is-mobile-open { display: none !important; }
-@media (max-width: 768px) {
+@media (max-width: 768px), (max-width: 1400px) and (any-pointer: coarse) {
 }
 .profile-settings-modal-layer { position: fixed; inset: 0; z-index: 150; display: grid; place-items: center; padding: 24px; }
 .profile-settings-modal-scrim { position: absolute; inset: 0; border: 0; background: var(--scrim); backdrop-filter: none; cursor: pointer; }
@@ -1867,7 +1867,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 .sidebar-dashboard-rename { padding: 2px 8px; }
 .sidebar-dashboard-rename input { width: 100%; min-height: 30px; padding: 0 8px; border: 1px solid var(--aqua); border-radius: var(--radius-sm); color: var(--paper); background: var(--surface); font: 600 var(--text-sm)/1 var(--font-sans); }
 
-@media (max-width: 768px) {
+@media (max-width: 768px), (max-width: 1400px) and (any-pointer: coarse) {
   .dashboard-view {
     display: block;
     overflow-x: hidden;
@@ -2212,6 +2212,95 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
   color: var(--coral);
   font: 600 var(--text-xs)/1.4 var(--font-sans);
 }
+.md-link-preview-slot { width: min(100%, 560px); }
+.md-link-preview-slot:empty { display: none; }
+.md-link-preview-slot > .md-link-preview { width: 100%; }
+.md-body .md-link-preview {
+  display: grid;
+  grid-template-columns: minmax(116px, 34%) minmax(0, 1fr);
+  width: min(100%, 560px);
+  min-height: 104px;
+  margin: 8px 0;
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-md);
+  color: var(--paper);
+  background: color-mix(in srgb, var(--surface-raised) 94%, var(--aqua) 6%);
+  box-shadow: var(--shadow-sm);
+  text-decoration: none;
+}
+.md-body .md-link-preview:hover,
+.md-body .md-link-preview:focus-visible {
+  border-color: color-mix(in srgb, var(--aqua) 58%, var(--line));
+  color: var(--paper);
+  text-decoration: none;
+}
+.md-link-preview > img {
+  width: 100%;
+  height: 100%;
+  min-height: 104px;
+  max-height: 168px;
+  object-fit: cover;
+  background: var(--surface);
+}
+.md-link-preview__content {
+  display: flex;
+  min-width: 0;
+  padding: 11px 13px;
+  flex-direction: column;
+  justify-content: center;
+  gap: 4px;
+}
+.md-link-preview__site {
+  color: var(--aqua);
+  font: 700 var(--text-xs)/1.2 var(--font-sans);
+  letter-spacing: .04em;
+  text-transform: uppercase;
+}
+.md-link-preview__content > strong {
+  display: -webkit-box;
+  overflow: hidden;
+  font-size: var(--text-sm);
+  line-height: 1.35;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+}
+.md-link-preview__description {
+  display: -webkit-box;
+  overflow: hidden;
+  color: var(--muted);
+  font-size: var(--text-xs);
+  line-height: 1.4;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 3;
+}
+.md-link-preview__content > small,
+.md-link-preview__url {
+  overflow: hidden;
+  color: var(--muted);
+  font-size: var(--text-xs);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.md-link-preview.is-x { grid-template-columns: minmax(0, 1fr); border-left: 3px solid var(--paper); }
+.md-link-preview.is-loading {
+  display: grid;
+  min-height: 78px;
+  padding: 16px;
+  grid-template-columns: 1fr;
+  align-content: center;
+  gap: 9px;
+  box-shadow: none;
+}
+.md-link-preview__skeleton {
+  width: 72%;
+  height: 10px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--muted) 22%, transparent);
+  animation: md-link-preview-pulse 1.2s ease-in-out infinite alternate;
+}
+.md-link-preview__skeleton.is-short { width: 42%; }
+@keyframes md-link-preview-pulse { to { opacity: .4; } }
 .media-context-menu {
   position: fixed;
   z-index: 180;
@@ -2728,7 +2817,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
   gap: 8px;
   margin-top: 4px;
 }
-@media (max-width: 768px) {
+@media (max-width: 768px), (max-width: 1400px) and (any-pointer: coarse) {
   .task-create-modal-layer { padding: 0; align-items: end; }
   .task-create-modal {
     width: 100%;
@@ -3426,7 +3515,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
   font: 500 var(--text-md)/1.5 var(--font-sans);
   font-style: italic;
 }
-@media (max-width: 768px) {
+@media (max-width: 768px), (max-width: 1400px) and (any-pointer: coarse) {
   .task-detail-modal-layer { padding: 0; align-items: end; }
   .task-detail-modal {
     width: 100%;
@@ -3537,7 +3626,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
   .mobile-close { display: block; min-width: 40px; min-height: 40px; border: 1px solid var(--line); background: transparent; }
 }
 
-@media (max-width: 768px) {
+@media (max-width: 768px), (max-width: 1400px) and (any-pointer: coarse) {
   body { overflow: hidden; }
   .app-shell,
   .app-shell.has-open-workspace {
@@ -3796,6 +3885,330 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
   .brand > span:last-child { display: none; }
 }
 
+/* Mobile application shell: a separate, page-based information architecture. */
+@media (max-width: 768px), (max-width: 1400px) and (any-pointer: coarse) {
+  .mobile-app-shell {
+    position: fixed;
+    inset: 0;
+    display: grid;
+    grid-template-rows: calc(52px + env(safe-area-inset-top)) minmax(0, 1fr) calc(64px + env(safe-area-inset-bottom));
+    grid-template-areas: "mobile-header" "mobile-stage" "mobile-tabs";
+    width: 100%;
+    height: 100dvh;
+    min-width: 320px;
+    overflow: hidden;
+    color: var(--ink);
+    background: var(--bg);
+  }
+
+  .mobile-app-header {
+    grid-area: mobile-header;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    min-width: 0;
+    padding: env(safe-area-inset-top) max(14px, env(safe-area-inset-right)) 0 max(14px, env(safe-area-inset-left));
+    border-bottom: 1px solid var(--line);
+    background: var(--surface);
+  }
+
+  .mobile-app-heading {
+    display: flex;
+    align-items: center;
+    min-width: 0;
+    gap: 9px;
+  }
+
+  .mobile-app-heading > img {
+    width: 28px;
+    height: 28px;
+    border-radius: 8px;
+  }
+
+  .mobile-app-heading > div { display: grid; min-width: 0; gap: 1px; }
+  .mobile-app-heading small {
+    color: var(--ink-muted);
+    font: 700 9px/1 var(--font-sans);
+    letter-spacing: .12em;
+    text-transform: uppercase;
+  }
+  .mobile-app-heading h1 {
+    margin: 0;
+    overflow: hidden;
+    font: 750 17px/1.15 var(--font-sans);
+    letter-spacing: -.025em;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .mobile-connection-state {
+    display: grid;
+    place-items: center;
+    width: 36px;
+    height: 36px;
+    border-radius: 50%;
+  }
+  .mobile-connection-state > i {
+    width: 9px;
+    height: 9px;
+    border-radius: 50%;
+    background: var(--amber);
+    box-shadow: 0 0 0 4px color-mix(in srgb, var(--amber) 12%, transparent);
+  }
+  .mobile-connection-state.runtime-connected > i,
+  .mobile-connection-state.runtime-demo > i {
+    background: var(--accent);
+    box-shadow: 0 0 0 4px var(--accent-soft);
+  }
+  .mobile-connection-state.runtime-error > i {
+    background: var(--coral);
+    box-shadow: 0 0 0 4px color-mix(in srgb, var(--coral) 12%, transparent);
+  }
+
+  .mobile-page-stage {
+    grid-area: mobile-stage;
+    position: relative;
+    min-width: 0;
+    min-height: 0;
+    overflow: hidden;
+    background: var(--bg);
+  }
+
+  .mobile-page-stage > .chat-pane,
+  .mobile-page-stage > .chat-pane.is-active {
+    display: grid;
+    width: 100%;
+    height: 100%;
+    min-width: 0;
+    border: 0;
+    border-top: 0;
+  }
+
+  .mobile-page-stage--kanban > .kanban-page,
+  .mobile-page-stage--profiles > .profiles-panel,
+  .mobile-page-stage--projects > .mobile-projects-page,
+  .mobile-page-stage--more > .mobile-more-page,
+  .mobile-page-stage--more > .office-wrap,
+  .mobile-page-stage--more > .teams-panel,
+  .mobile-page-stage--more > .scheduled-sessions-panel {
+    width: 100%;
+    height: 100%;
+    min-width: 0;
+    min-height: 0;
+  }
+
+  .mobile-page-stage--kanban > .kanban-page {
+    overflow: auto;
+    overscroll-behavior: contain;
+  }
+
+  .mobile-page-stage--profiles > .profiles-panel {
+    grid-template-rows: auto auto auto minmax(0, 1fr);
+    background: var(--surface);
+  }
+
+  .mobile-page-stage--profiles .profiles-panel-toolbar { padding: 10px 12px; }
+  .mobile-page-stage--profiles .profiles-panel-search,
+  .mobile-page-stage--profiles .profiles-panel-add { min-height: 44px; }
+  .mobile-page-stage--profiles .profiles-panel-row {
+    grid-template-columns: minmax(0, 1fr) 44px 44px 44px;
+    min-height: 58px;
+  }
+  .mobile-page-stage--profiles .profiles-panel-row .icon-button {
+    width: 44px;
+    min-width: 44px;
+    min-height: 44px;
+  }
+
+  .mobile-bottom-tabs {
+    grid-area: mobile-tabs;
+    position: relative;
+    z-index: 200;
+    display: grid;
+    grid-template-columns: repeat(5, minmax(0, 1fr));
+    align-items: stretch;
+    gap: 2px;
+    padding: 4px max(6px, env(safe-area-inset-right)) max(4px, env(safe-area-inset-bottom)) max(6px, env(safe-area-inset-left));
+    border-top: 1px solid var(--line);
+    background: color-mix(in srgb, var(--surface) 96%, transparent);
+    box-shadow: 0 -6px 18px color-mix(in srgb, var(--ink) 7%, transparent);
+    backdrop-filter: blur(18px);
+    -webkit-backdrop-filter: blur(18px);
+  }
+
+  .mobile-bottom-tabs > button {
+    position: relative;
+    display: grid;
+    place-items: center;
+    min-width: 0;
+    min-height: 56px;
+    padding: 0;
+    border: 0;
+    border-radius: 14px;
+    color: var(--ink-muted);
+    background: transparent;
+    cursor: pointer;
+    touch-action: manipulation;
+  }
+  .mobile-bottom-tabs > button:focus-visible {
+    outline-offset: -3px;
+  }
+  .mobile-bottom-tabs > button.is-active {
+    color: var(--accent);
+    background: var(--accent-soft);
+  }
+  .mobile-bottom-tabs > button.is-active::before {
+    position: absolute;
+    inset: 3px auto auto;
+    width: 20px;
+    height: 3px;
+    border-radius: 999px;
+    background: var(--accent);
+    content: "";
+  }
+  .mobile-tab-icon {
+    position: relative;
+    display: grid;
+    place-items: center;
+    width: 30px;
+    height: 30px;
+  }
+  .mobile-tab-icon > svg:not(.mobile-tab-plus) { width: 24px; height: 24px; stroke-width: 1.7; }
+  .mobile-tab-icon > .mobile-tab-plus {
+    position: absolute;
+    right: -1px;
+    bottom: -1px;
+    width: 13px;
+    height: 13px;
+    padding: 1px;
+    border: 1.5px solid currentColor;
+    border-radius: 50%;
+    background: var(--surface);
+    stroke-width: 2.2;
+  }
+
+  .mobile-empty-state {
+    display: grid;
+    place-items: center;
+    align-content: center;
+    gap: 10px;
+    width: 100%;
+    height: 100%;
+    padding: 28px;
+    text-align: center;
+  }
+  .mobile-empty-state > span:first-child {
+    display: grid;
+    place-items: center;
+    width: 58px;
+    height: 58px;
+    border-radius: 18px;
+    color: var(--accent);
+    background: var(--accent-soft);
+  }
+  .mobile-empty-state > span:first-child svg { width: 27px; height: 27px; }
+  .mobile-empty-state h2 { margin: 4px 0 0; font: 750 20px/1.2 var(--font-sans); }
+  .mobile-empty-state p { margin: 0; color: var(--ink-muted); font: 500 var(--text-sm)/1.5 var(--font-sans); }
+  .mobile-empty-state .primary-button { display: inline-flex; align-items: center; gap: 7px; min-height: 44px; margin-top: 8px; }
+
+  .mobile-more-page,
+  .mobile-projects-page {
+    display: grid;
+    align-content: start;
+    min-height: 0;
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    padding: 12px;
+  }
+
+  .mobile-menu-list { display: grid; gap: 8px; }
+  .mobile-menu-list > button {
+    display: grid;
+    grid-template-columns: 42px minmax(0, 1fr);
+    grid-template-rows: auto auto;
+    align-items: center;
+    column-gap: 12px;
+    min-height: 68px;
+    padding: 10px 12px;
+    border: 1px solid var(--line);
+    border-radius: 14px;
+    color: var(--ink);
+    background: var(--surface);
+    text-align: left;
+    box-shadow: var(--shadow-sm);
+  }
+  .mobile-menu-list > button > span {
+    grid-row: 1 / 3;
+    display: grid;
+    place-items: center;
+    width: 42px;
+    height: 42px;
+    border-radius: 12px;
+    color: var(--accent);
+    background: var(--accent-soft);
+  }
+  .mobile-menu-list > button svg { width: 21px; height: 21px; }
+  .mobile-menu-list > button b { align-self: end; font: 700 var(--text-md)/1.25 var(--font-sans); }
+  .mobile-menu-list > button small { align-self: start; color: var(--ink-muted); font: 500 var(--text-xs)/1.3 var(--font-sans); }
+  .mobile-menu-utilities {
+    display: flex;
+    justify-content: flex-end;
+    gap: 8px;
+    margin-top: 14px;
+    padding-top: 12px;
+    border-top: 1px solid var(--line);
+  }
+  .mobile-menu-utilities > button,
+  .mobile-menu-utilities .appearance-trigger { min-width: 44px; min-height: 44px; }
+
+  .mobile-projects-toolbar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    margin-bottom: 10px;
+  }
+  .mobile-projects-toolbar p { margin: 0; color: var(--ink-muted); font: 500 var(--text-sm)/1.45 var(--font-sans); }
+  .mobile-projects-toolbar .primary-button { flex: 0 0 auto; min-height: 42px; }
+  .mobile-project-list { display: grid; gap: 8px; }
+  .mobile-project-list > button {
+    display: grid;
+    grid-template-columns: 42px minmax(0, 1fr) auto;
+    align-items: center;
+    gap: 11px;
+    min-height: 64px;
+    padding: 9px 11px;
+    border: 1px solid var(--line);
+    border-radius: 14px;
+    color: var(--ink);
+    background: var(--surface);
+    text-align: left;
+    box-shadow: var(--shadow-sm);
+  }
+  .mobile-project-list > button.is-active { border-color: color-mix(in srgb, var(--accent) 44%, var(--line)); }
+  .mobile-project-mark {
+    display: grid;
+    place-items: center;
+    width: 42px;
+    height: 42px;
+    border-radius: 12px;
+    color: var(--project-color, var(--accent));
+    background: color-mix(in srgb, var(--project-color, var(--accent)) 12%, var(--surface));
+    font: 700 var(--text-md)/1 var(--font-sans);
+  }
+  .mobile-project-mark svg { width: 20px; height: 20px; }
+  .mobile-project-copy { display: grid; min-width: 0; gap: 3px; }
+  .mobile-project-copy b,
+  .mobile-project-copy small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .mobile-project-copy b { font: 700 var(--text-md)/1.3 var(--font-sans); }
+  .mobile-project-copy small { color: var(--ink-muted); font: 500 var(--text-xs)/1.3 var(--font-sans); }
+  .mobile-project-list em { color: var(--accent); font: 700 10px/1 var(--font-sans); font-style: normal; }
+  .mobile-page-note,
+  .mobile-page-error { margin: 8px 0; padding: 10px 12px; border-radius: 10px; font: 600 var(--text-sm)/1.4 var(--font-sans); }
+  .mobile-page-note { color: var(--ink-muted); background: var(--surface-2); }
+  .mobile-page-error { color: var(--coral) !important; background: color-mix(in srgb, var(--coral) 8%, var(--surface)); }
+}
+
 
 /* Foldables / tablets with coarse pointers: keep composer thumb-safe even when viewport is wide. */
 @media (hover: none) and (pointer: coarse) {
@@ -3809,7 +4222,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 }
 
 /* SP density: strip wasteful chrome spacing */
-@media (max-width: 768px) {
+@media (max-width: 768px), (max-width: 1400px) and (any-pointer: coarse) {
   .app-shell,
   .app-shell.has-open-workspace {
     grid-template-rows: calc(44px + env(safe-area-inset-top)) minmax(0, 1fr) calc(56px + env(safe-area-inset-bottom));
@@ -4655,7 +5068,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 :root:not([data-theme="midnight"]) .profile-chat-detail-pane .chat-pane { background: var(--surface-raised); }
 
 /* Mobile */
-@media (max-width: 768px) {
+@media (max-width: 768px), (max-width: 1400px) and (any-pointer: coarse) {
   .profile-chat-modal-layer { padding: 0; }
   .profile-chat-detail-pane.panes-many { grid-template-columns: minmax(0, 1fr); }
   .profile-chat-modal-body.is-split {
@@ -5170,7 +5583,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
   cursor: not-allowed;
 }
 
-@media (max-width: 768px) {
+@media (max-width: 768px), (max-width: 1400px) and (any-pointer: coarse) {
   .scheduled-sessions-page {
     padding: 8px 8px 10px;
   }
@@ -5195,7 +5608,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 }
 
 /* Mobile instrument dock: every top-level action gets the same footprint. */
-@media (max-width: 768px) {
+@media (max-width: 768px), (max-width: 1400px) and (any-pointer: coarse) {
   .side-rail {
     justify-content: stretch;
     align-items: center;
@@ -5314,7 +5727,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
   grid-template-columns: var(--sidebar-width, 248px) minmax(0, 1fr);
   background: var(--bg);
 }
-@media (max-width: 768px) {
+@media (max-width: 768px), (max-width: 1400px) and (any-pointer: coarse) {
   .app-shell,
   .app-shell.has-open-workspace {
     grid-template-columns: 1fr;
@@ -5503,7 +5916,7 @@ textarea::placeholder { color: var(--ink-muted); }
   color: var(--accent);
   background: var(--accent-soft);
 }
-@media (max-width: 768px) {
+@media (max-width: 768px), (max-width: 1400px) and (any-pointer: coarse) {
   /* On phones the visible circle is drawn by ::before (18px) inside a 44px hit area;
      keep the button itself invisible so the ring is not doubled. */
   .info-tip > .info-tip__trigger,
@@ -5811,7 +6224,7 @@ textarea::placeholder { color: var(--ink-muted); }
 .side-rail[data-sidebar-icon-only="true"] .sidebar-profiles--nested { display: none; }
 .side-rail[data-sidebar-icon-only="true"] > .sidebar-resize-handle { display: grid; }
 
-@media (max-width: 768px) {
+@media (max-width: 768px), (max-width: 1400px) and (any-pointer: coarse) {
   .app-shell,
   .app-shell.has-open-workspace {
     grid-template-rows: calc(52px + env(safe-area-inset-top)) minmax(0, 1fr) calc(56px + env(safe-area-inset-bottom));
@@ -6528,7 +6941,7 @@ textarea::placeholder { color: var(--ink-muted); }
 .task-detail-chat-pane .chat-pane { box-shadow: none; }
 .kanban-unconfirmed { border: 1px solid var(--line); border-radius: var(--radius-md); color: var(--amber); background: color-mix(in srgb, var(--amber) 12%, var(--surface)); }
 
-@media (max-width: 768px) {
+@media (max-width: 768px), (max-width: 1400px) and (any-pointer: coarse) {
   .window-menu-trigger,
   .window-menu-panel button,
   .profile-context-menu button,
@@ -6677,7 +7090,7 @@ textarea::placeholder { color: var(--ink-muted); }
   border-radius: var(--radius-sm);
 }
 
-@media (max-width: 768px) {
+@media (max-width: 768px), (max-width: 1400px) and (any-pointer: coarse) {
   .profile-settings-name-editor button,
   .composer-model-actions > button,
   .composer-model-preset-actions > button,
@@ -6687,7 +7100,7 @@ textarea::placeholder { color: var(--ink-muted); }
 }
 
 /* Phone navigation: turn the desktop rail into a purpose-built bottom tab bar. */
-@media (max-width: 768px) {
+@media (max-width: 768px), (max-width: 1400px) and (any-pointer: coarse) {
   .app-shell,
   .app-shell.has-open-workspace {
     grid-template-rows: calc(52px + env(safe-area-inset-top)) minmax(0, 1fr) calc(64px + env(safe-area-inset-bottom));

@@ -189,7 +189,7 @@
 
 .host-update-dialog-confirm svg { width: 15px; height: 15px; }
 
-@media (max-width: 768px) {
+@media (max-width: 768px), (max-width: 1400px) and (any-pointer: coarse) {
   .host-apps { padding: 12px; }
   .host-apps__header button,
   .host-apps__action button { width: 44px; height: 44px; }

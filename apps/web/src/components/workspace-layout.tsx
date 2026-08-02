@@ -1,6 +1,7 @@
 import type { ComponentChildren } from "preact";
 import { useEffect, useRef, useState } from "preact/hooks";
 import { t } from "../i18n";
+import { PHONE_VIEWPORT_QUERY } from "../viewport";
 import {
   clearWorkspaceSessionDropPreview,
   openMobileWorkspace,
@@ -83,7 +84,7 @@ export function WorkspaceLayout({ main, workspace, hasChats, surfaceVisible = tr
 
   useEffect(() => {
     if (typeof matchMedia !== "function") return;
-    const query = matchMedia("(max-width: 768px)");
+    const query = matchMedia(PHONE_VIEWPORT_QUERY);
     const update = () => setMobile(query.matches);
     update();
     query.addEventListener("change", update);
@@ -369,5 +370,5 @@ function edgeLabel(placement: WorkspacePlacement): string {
 }
 
 function matchesMobile(): boolean {
-  return typeof matchMedia === "function" && matchMedia("(max-width: 768px)").matches;
+  return typeof matchMedia === "function" && matchMedia(PHONE_VIEWPORT_QUERY).matches;
 }

@@ -12,7 +12,7 @@ import {
   mergeProviderExtracts,
 } from "./hermes-models.js";
 
-test("OpenCodex discovery keeps bare Codex models and namespaced CLI providers", () => {
+test("OpenCodex discovery exposes one Hermes-compatible routing gateway", () => {
   const providers = extractOpenCodexProviders({
     data: [
       { id: "gpt-5.6-luna", owned_by: "openai" },
@@ -30,22 +30,10 @@ test("OpenCodex discovery keeps bare Codex models and namespaced CLI providers",
 
   assert.deepEqual(providers, [
     {
-      endpointId: "local-cli-openai",
-      name: "OpenAI Codex · OpenCodex CLI",
+      endpointId: "local-cli-opencodex",
+      name: "OpenCodex · Local gateway",
       baseUrl: "http://127.0.0.1:10100/v1",
-      models: ["gpt-5.6-luna"],
-    },
-    {
-      endpointId: "local-cli-anthropic",
-      name: "Anthropic / Claude · OpenCodex CLI",
-      baseUrl: "http://127.0.0.1:10100/v1",
-      models: ["anthropic/claude-sonnet-5"],
-    },
-    {
-      endpointId: "local-cli-kimi",
-      name: "Kimi Code · OpenCodex CLI",
-      baseUrl: "http://127.0.0.1:10100/v1",
-      models: ["kimi/kimi-k2.7-code"],
+      models: ["gpt-5.6-luna", "anthropic/claude-sonnet-5", "kimi/kimi-k2.7-code"],
     },
   ]);
 });
@@ -58,9 +46,15 @@ test("OpenCodex discovery falls back to model namespace when owned_by is absent"
     ],
   }, undefined, 100, 20);
   assert.deepEqual(providers.map((provider) => [provider.endpointId, provider.models]), [
-    ["local-cli-xai", ["xai/grok-4.5"]],
-    ["local-cli-openai", ["gpt-5.6-terra"]],
+    ["local-cli-opencodex", ["xai/grok-4.5", "gpt-5.6-terra"]],
   ]);
+});
+
+test("OpenCodex discovery matches configured provider ownership case-insensitively", () => {
+  const providers = extractOpenCodexProviders({
+    data: [{ id: "xai/grok-4.5", owned_by: "xAI" }],
+  }, [{ name: "xai", disabled: false }], 100, 20);
+  assert.deepEqual(providers[0]?.models, ["xai/grok-4.5"]);
 });
 
 test("catalog deadline includes backend acquisition and releases a late lease", async () => {
@@ -166,7 +160,7 @@ test("extractProviders injects active-only payloads and marks them incomplete fo
   ]);
 });
 
-test("extractProviders omits explicitly unconfigured or disabled rows unless active", () => {
+test("extractProviders keeps the full Hermes provider universe", () => {
   const result = extractProviders({
     provider: "openrouter",
     providers: [
@@ -182,13 +176,13 @@ test("extractProviders omits explicitly unconfigured or disabled rows unless act
   assert.equal(result.hasListedProviders, true);
   assert.deepEqual(result.providers.map((item) => item.id).sort(), [
     "active-unconfigured",
+    "missing-key",
     "ollama",
     "openrouter",
     "string-provider",
+    "unauth",
   ].sort());
-  assert.equal(result.providers.find((item) => item.id === "missing-key"), undefined);
   assert.equal(result.providers.find((item) => item.id === "disabled"), undefined);
-  assert.equal(result.providers.find((item) => item.id === "unauth"), undefined);
   assert.equal(result.providers.find((item) => item.id === "active-unconfigured")?.active, true);
 });
 
@@ -232,18 +226,20 @@ test("mergeProviderExtracts prefers listed fallback catalogs without dropping ac
   assert.equal(kept.providers.length, 3);
 });
 
-test("extractLiveModels accepts string ids and object rows without secrets", () => {
+test("extractLiveModels accepts public string ids and object rows while rejecting credential-shaped values", () => {
   const models = extractLiveModels({
     models: [
       "llama3.2",
       { id: "org::model", label: "Org" },
-      { model: "api_key_leak", label: "bad" },
+      { model: "api_key_leak", label: "Literal public identifier" },
+      { model: "sk-abcdefghijk", label: "credential-shaped" },
       { id: "ok", name: "OK" },
     ],
   }, 50);
   assert.deepEqual(models, [
     { id: "llama3.2", label: "llama3.2" },
     { id: "org::model", label: "Org" },
+    { id: "api_key_leak", label: "Literal public identifier" },
     { id: "ok", label: "OK" },
   ]);
 });

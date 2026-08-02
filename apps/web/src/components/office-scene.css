@@ -326,7 +326,7 @@
   .office-seg { justify-self: end; }
 }
 
-@media (max-width: 768px) {
+@media (max-width: 768px), (max-width: 1400px) and (any-pointer: coarse) {
   /* Grow with content so main-stage owns vertical scroll; scene still gets a real floor height. */
   .office-wrap {
     height: auto;
@@ -511,7 +511,7 @@
 .office-3d-kanban-close:hover { border-color: var(--line); color: var(--ink); background: var(--surface-2); }
 .office-3d-kanban-body { padding: 8px; }
 
-@media (max-width: 768px) {
+@media (max-width: 768px), (max-width: 1400px) and (any-pointer: coarse) {
   .office-wrap { padding: 8px; }
   .office-heading { padding: 8px; }
   /* Phone heading: everything on one compact row (wraps only when it truly cannot fit). */

@@ -272,8 +272,23 @@ html, body { height: 100%; }
 .layout-placement-choices button span { font: 700 25px/1 var(--font-sans); }
 .appearance-reset-layout { width: 100%; min-height: var(--target-desktop); margin-top: 9px; border: 1px solid var(--line); color: var(--muted); background: transparent; font-size: var(--text-label); cursor: pointer; }
 .appearance-reset-layout:hover { border-color: var(--aqua); color: var(--aqua); }
+.appearance-toggle-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  min-height: 58px;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+}
+.appearance-toggle-row > span { display: grid; gap: 3px; }
+.appearance-toggle-row b { font-size: var(--text-sm); }
+.appearance-toggle-row small { color: var(--muted); font-size: var(--text-xs); line-height: 1.4; }
+.appearance-toggle-row input { width: 18px; height: 18px; accent-color: var(--aqua); cursor: pointer; }
 
-@media (max-width: 768px) {
+@media (max-width: 768px), (max-width: 1400px) and (any-pointer: coarse) {
   .appearance-panel { inset: auto 0 0; width: 100%; max-height: min(76vh, 570px); padding: 16px max(16px, env(safe-area-inset-right)) max(24px, env(safe-area-inset-bottom)) max(16px, env(safe-area-inset-left)); border: 1px solid var(--line); border-bottom: 0; border-radius: var(--radius-lg) var(--radius-lg) 0 0; box-shadow: var(--shadow-lg); }
 }
 
@@ -326,7 +341,7 @@ html, body { height: 100%; }
   .avatar-picker header > button { min-width: var(--target-mobile); }
 }
 
-@media (max-width: 768px) {
+@media (max-width: 768px), (max-width: 1400px) and (any-pointer: coarse) {
   .side-rail button,
   .mobile-workspace-bar button,
   .mobile-chat-tabs button,

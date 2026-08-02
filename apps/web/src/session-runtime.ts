@@ -45,7 +45,27 @@ export function isChatRunActive(session: ChatSession): boolean {
   return session.status === "streaming" || session.status === "waiting"
     || session.pendingInteraction !== undefined
     || session.streamingMessageId !== undefined
+    || hasPendingPromptOperation(session)
     || session.messages.some((message) => message.status === "streaming");
+}
+
+/** A prompt RPC that has not reached a commit outcome still owns this turn. */
+export function hasPendingPromptOperation(session: ChatSession): boolean {
+  return session.operationEvidence?.some((operation) => (
+    operation.kind === "prompt" && operation.state === "pending"
+  )) === true;
+}
+
+/**
+ * Hidden panes retain their Hermes lease while any conversation/control-plane
+ * operation can still settle into visible state.
+ */
+export function isChatSessionLeaseProtected(session: ChatSession): boolean {
+  return isChatRunActive(session)
+    || session.steerPending === true
+    || session.interruptPending === true
+    || session.slashPending === true
+    || session.pendingModelChange?.applying === true;
 }
 
 export function mergeGatewayStatusUpdate(session: ChatSession, payload: Record<string, unknown>): ChatSession {

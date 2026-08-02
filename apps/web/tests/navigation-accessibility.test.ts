@@ -30,7 +30,8 @@ test("navigation components expose active dashboards, present panels, and profil
     readFile(new URL("../src/components/scheduled-sessions-panel.tsx", import.meta.url), "utf8"),
   ]);
   assert.match(sideRail, /aria-current=\{isActive \? "page" : undefined\}/);
-  assert.match(sideRail, /aria-current=\{present \? "page" : undefined\}/);
+  assert.match(sideRail, /const selected = phoneViewport \? mobileTabKind === item\.kind : present/);
+  assert.match(sideRail, /aria-current=\{selected \? "page" : undefined\}/);
   assert.match(sideRail, /data-panel-kind=\{item\.kind\}/);
   assert.match(sideRail, /beginSidebarPanelPointerDrag\(event, item\.kind\)/);
   assert.match(sideRail, /consumeSidebarPanelClickSuppression\(item\.kind\)/);
@@ -43,7 +44,8 @@ test("navigation components expose active dashboards, present panels, and profil
   assert.match(sideRail, /role="status" aria-live="polite" aria-atomic="true"/);
   assert.match(app, /activateDashboardContainingPanel\("studio"\)/);
   assert.doesNotMatch(app, /addDashboardPanel\("studio"\)/);
-  assert.match(sideRail, /aria-expanded=\{sidebarTasksOpen\.value\}/);
+  assert.match(sideRail, /item\.kind === "kanban"\s*\? sidebarTasksOpen\.value/);
+  assert.match(sideRail, /aria-expanded=\{hasDisclosure \? disclosureOpen : undefined\}/);
   assert.match(sideRail, /setSidebarTasksOpen\(!sidebarTasksOpen\.value\)/);
   assert.match(sideRail, /item\.kind === "kanban" && kanbanTaskTree/);
   assert.match(sideRail, /activateOrAddPanelFromClick\("kanban"\)\) focusKanbanTask\(task\.id\)/);

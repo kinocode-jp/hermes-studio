@@ -1,7 +1,9 @@
-import type { ComponentChild } from "preact";
+import { Fragment, type ComponentChild } from "preact";
 import { useEffect, useRef, useState } from "preact/hooks";
+import { richLinkPreviewsEnabled } from "../appearance";
 import { runHostFileAction, isAbsoluteMediaPath, type HostFileAction } from "../host-file-api";
 import { t } from "../i18n";
+import { extractSupportedLinkPreviewUrls, linkifyExternalUrls, LinkPreviewCard } from "./link-preview";
 
 /**
  * Minimal, safe markdown renderer for chat messages.
@@ -21,8 +23,12 @@ export type InlineToken =
 // Unquoted files stop at their extension; extensionless paths use a whitespace
 // or punctuation boundary. Paths containing spaces should use inline code or
 // an angle-bracket Markdown target: `[label](</absolute/path with spaces/file.py>)`.
-const INLINE_PATTERN = /(\*\*[^*]+\*\*|\*[^*\n]+\*|`[^`\n]+`|\[[^\]\n]+\]\((?:<[^>\n]+>|[^)\s]+)\)|MEDIA:(?:"(?:\/|[A-Za-z]:[\\/]|\\\\)[^"\n]+"|'(?:\/|[A-Za-z]:[\\/]|\\\\)[^'\n]+'|(?:\/|[A-Za-z]:[\\/]|\\\\)[^\n]*?\.[A-Za-z0-9]{1,12}(?=$|[\s,.:;!?)}\]、。！？」』】—–]))|(?:\/|[A-Za-z]:[\\/]|\\\\)[^\s<>"'`()\[\]{}]+[\\/]|(?:\/|[A-Za-z]:[\\/]|\\\\)[^\s<>"'`()\[\]{}]*?\.[A-Za-z0-9]{1,12}(?::\d+(?::\d+)?)?(?=$|[\s,.:;!?)}\]、。！？」』】—–])|(?:\/|[A-Za-z]:[\\/]|\\\\)[^\s<>"'`()\[\]{}:,;!?、。！？」』】—–]+(?=$|[\s,:;!?)}\]、。！？」』】—–]))/g;
+const INLINE_PATTERN = /(https?:\/\/[^\s<>"'`()\[\]{}]+|\*\*[^*]+\*\*|\*[^*\n]+\*|`[^`\n]+`|\[[^\]\n]+\]\((?:<[^>\n]+>|[^)\s]+)\)|MEDIA:(?:"(?:\/|[A-Za-z]:[\\/]|\\\\)[^"\n]+"|'(?:\/|[A-Za-z]:[\\/]|\\\\)[^'\n]+'|(?:\/|[A-Za-z]:[\\/]|\\\\)[^\n]*?\.[A-Za-z0-9]{1,12}(?=$|[\s,.:;!?)}\]、。！？」』】—–]))|(?:\/|[A-Za-z]:[\\/]|\\\\)[^\s<>"'`()\[\]{}]*?\.[A-Za-z0-9]{1,12}(?::\d+(?::\d+)?)?(?=$|[\s,.:;!?)}\]、。！？」』】—–])|(?:\/|[A-Za-z]:[\\/]|\\\\)[^\s<>"'`()\[\]{}]+[\\/](?=$|[\s,.:;!?)}\]、。！？」』】—–])|(?:\/|[A-Za-z]:[\\/]|\\\\)[^\s<>"'`()\[\]{}:,;!?、。！？」』】—–]+(?=$|[\s,:;!?)}\]、。！？」』】—–]))/g;
 const LINK_PATTERN = /^\[([^\]\n]+)\]\((<[^>\n]+>|[^)\s]+)\)$/;
+// Bare URLs may contain balanced parentheses (for example Wikipedia titles).
+// The legacy inline pattern excludes them for local-path safety, so widen only
+// its first, URL-specific character class.
+const INLINE_TOKEN_PATTERN = new RegExp(INLINE_PATTERN.source.replace("`()", "`"), INLINE_PATTERN.flags);
 const PATH_POSITION_SUFFIX = /:\d+(?::\d+)?$/;
 
 function isSafeHref(href: string): boolean {
@@ -32,7 +38,7 @@ function isSafeHref(href: string): boolean {
 export function tokenizeInline(text: string): InlineToken[] {
   const tokens: InlineToken[] = [];
   let lastIndex = 0;
-  for (const match of text.matchAll(INLINE_PATTERN)) {
+  for (const match of text.matchAll(INLINE_TOKEN_PATTERN)) {
     const index = match.index ?? 0;
     if (index > lastIndex) tokens.push({ kind: "text", text: text.slice(lastIndex, index) });
     const raw = match[0];
@@ -48,6 +54,12 @@ export function tokenizeInline(text: string): InlineToken[] {
       const path = mediaPathFromToken(raw);
       if (path !== undefined) tokens.push({ kind: "media", text: path, path });
       else tokens.push({ kind: "text", text: raw });
+    }
+    else if (/^https?:\/\//i.test(raw)) {
+      for (const part of linkifyExternalUrls(raw)) {
+        if (typeof part === "string") tokens.push({ kind: "text", text: part });
+        else tokens.push({ kind: "link", text: part.text, href: part.href });
+      }
     }
     else if (raw.startsWith("[")) {
       const link = LINK_PATTERN.exec(raw);
@@ -175,7 +187,13 @@ function renderInline(
       case "code": return <code key={key}>{token.text}</code>;
       case "link": return <a key={key} href={token.href} target="_blank" rel="noreferrer noopener">{token.text}</a>;
       case "media": return renderMediaLink(token, key, media);
-      default: return token.text;
+      default: return (
+        <Fragment key={key}>
+          {linkifyExternalUrls(token.text).map((part, partIndex) => typeof part === "string"
+            ? part
+            : <a key={`${key}:url:${partIndex}`} href={part.href} target="_blank" rel="noreferrer noopener">{part.text}</a>)}
+        </Fragment>
+      );
     }
   });
 }
@@ -305,14 +323,26 @@ function renderBlock(
   key: string,
   transformText?: (value: string) => string,
   media?: MediaLinkHandlers,
+  previewUrls: readonly string[] = [],
 ): ComponentChild {
   switch (block.kind) {
     case "heading": {
       const Tag = (`h${Math.min(block.level + 1, 6)}`) as "h2" | "h3" | "h4" | "h5";
-      return <Tag key={key}>{renderInline(block.text, key, transformText, media)}</Tag>;
+      return (
+        <Fragment key={key}>
+          <Tag>{renderInline(block.text, key, transformText, media)}</Tag>
+          {renderLinkPreviewCards(previewUrls, key)}
+        </Fragment>
+      );
     }
-    case "paragraph":
-      return <p key={key}>{renderInline(block.text, key, transformText, media)}</p>;
+    case "paragraph": {
+      return (
+        <Fragment key={key}>
+          <p>{renderInline(block.text, key, transformText, media)}</p>
+          {renderLinkPreviewCards(previewUrls, key)}
+        </Fragment>
+      );
+    }
     case "code": {
       const pathLines = block.text.split("\n").map(codeBlockPathReference);
       const references = pathLines.filter((line): line is { text: string; path: string } => line !== undefined);
@@ -336,32 +366,82 @@ function renderBlock(
     }
     case "list": {
       const items = block.items.map((item, itemIndex) => <li key={`${key}:${itemIndex}`}>{renderInline(item, `${key}:${itemIndex}`, transformText, media)}</li>);
-      return block.ordered ? <ol key={key}>{items}</ol> : <ul key={key}>{items}</ul>;
+      return (
+        <Fragment key={key}>
+          {block.ordered ? <ol>{items}</ol> : <ul>{items}</ul>}
+          {renderLinkPreviewCards(previewUrls, key)}
+        </Fragment>
+      );
     }
     case "table":
       return (
-        <div key={key} class="md-table-wrap">
-          <table>
-            <thead>
-              <tr>{block.header.map((cell, cellIndex) => <th key={`${key}:h${cellIndex}`}>{renderInline(cell, `${key}:h${cellIndex}`, transformText, media)}</th>)}</tr>
-            </thead>
-            <tbody>
-              {block.rows.map((row, rowIndex) => (
-                <tr key={`${key}:r${rowIndex}`}>
-                  {block.header.map((_, cellIndex) => (
-                    <td key={`${key}:r${rowIndex}c${cellIndex}`}>{renderInline(row[cellIndex] ?? "", `${key}:r${rowIndex}c${cellIndex}`, transformText, media)}</td>
-                  ))}
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
+        <Fragment key={key}>
+          <div class="md-table-wrap">
+            <table>
+              <thead>
+                <tr>{block.header.map((cell, cellIndex) => <th key={`${key}:h${cellIndex}`}>{renderInline(cell, `${key}:h${cellIndex}`, transformText, media)}</th>)}</tr>
+              </thead>
+              <tbody>
+                {block.rows.map((row, rowIndex) => (
+                  <tr key={`${key}:r${rowIndex}`}>
+                    {block.header.map((_, cellIndex) => (
+                      <td key={`${key}:r${rowIndex}c${cellIndex}`}>{renderInline(row[cellIndex] ?? "", `${key}:r${rowIndex}c${cellIndex}`, transformText, media)}</td>
+                    ))}
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+          {renderLinkPreviewCards(previewUrls, key)}
+        </Fragment>
       );
     case "hr":
       return <hr key={key} />;
     default:
       return null;
   }
+}
+
+function renderLinkPreviewCards(urls: readonly string[], key: string): ComponentChild[] {
+  return urls.map((url) => <LinkPreviewCard key={`${key}:preview:${url}`} url={url} />);
+}
+
+function linkPreviewUrlsForInline(text: string): string[] {
+  const urls: string[] = [];
+  for (const token of tokenizeInline(text)) {
+    const source = token.kind === "link" ? token.href : token.kind === "text" ? token.text : undefined;
+    if (source === undefined) continue;
+    for (const url of extractSupportedLinkPreviewUrls(source, 4 - urls.length)) {
+      if (!urls.includes(url)) urls.push(url);
+      if (urls.length >= 4) return urls;
+    }
+  }
+  return urls;
+}
+
+function linkPreviewUrlsForBlock(block: Block): string[] {
+  if (block.kind === "paragraph" || block.kind === "heading") return linkPreviewUrlsForInline(block.text);
+  if (block.kind === "list") return linkPreviewUrlsForInline(block.items.join("\n"));
+  if (block.kind === "table") {
+    return linkPreviewUrlsForInline([...block.header, ...block.rows.flat()].join("\n"));
+  }
+  return [];
+}
+
+function collectLinkPreviewUrls(blocks: readonly Block[], limit = 4): ReadonlyMap<number, readonly string[]> {
+  const byBlock = new Map<number, string[]>();
+  const seen = new Set<string>();
+  for (const [index, block] of blocks.entries()) {
+    for (const url of linkPreviewUrlsForBlock(block)) {
+      if (seen.has(url)) continue;
+      seen.add(url);
+      const blockUrls = byBlock.get(index) ?? [];
+      blockUrls.push(url);
+      byBlock.set(index, blockUrls);
+      if (seen.size >= limit) return byBlock;
+    }
+  }
+  return byBlock;
 }
 
 function renderCodeBlock(text: string, key: string, media?: MediaLinkHandlers): ComponentChild[] {
@@ -451,6 +531,9 @@ export function MarkdownBody({ text, streaming, transformText }: { text: string;
   const trimmed = text.trim();
   if (!trimmed) return <div class="md-body">{streaming ? "…" : ""}</div>;
   const blocks = parseBlocks(trimmed);
+  const richPreviewUrlsByBlock = richLinkPreviewsEnabled.value && !streaming
+    ? collectLinkPreviewUrls(blocks)
+    : undefined;
   const mediaHandlers: MediaLinkHandlers = {
     open: (path) => void runMediaAction(path, "open"),
     openMenu: openMediaMenu,
@@ -458,7 +541,13 @@ export function MarkdownBody({ text, streaming, transformText }: { text: string;
   const mediaName = mediaMenu?.path.split(/[\\/]/).filter(Boolean).at(-1) ?? mediaMenu?.path ?? "";
   return (
     <div class={`md-body ${streaming ? "is-streaming" : ""}`}>
-      {blocks.map((block, index) => renderBlock(block, `b${index}`, transformText, mediaHandlers))}
+      {blocks.map((block, index) => renderBlock(
+        block,
+        `b${index}`,
+        transformText,
+        mediaHandlers,
+        richPreviewUrlsByBlock?.get(index),
+      ))}
       {streaming && <span class="md-caret" aria-hidden="true">▍</span>}
       {mediaError && <span class="md-media-error" role="alert">{t("chat.media.actionFailed")}</span>}
       {mediaMenu && (

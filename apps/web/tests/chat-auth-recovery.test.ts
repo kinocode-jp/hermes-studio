@@ -273,6 +273,52 @@ test("ordinary open network loss reconnects without rotating authentication", as
   api.stop();
 });
 
+test("an idle local draft is unaffected by chat transport reconnects", async () => {
+  const sockets: FakeWebSocket[] = [];
+  const sessionErrors: string[] = [];
+  const disconnected: string[] = [];
+  const api = connectChatApi({
+    ...callbacks([]),
+    onSessionError(clientSessionId) { sessionErrors.push(clientSessionId); },
+    onSessionDisconnected(clientSessionId) { disconnected.push(clientSessionId); },
+  }, {
+    serverUrl: "https://office.example",
+    openWebSocket: async () => {
+      const socket = new FakeWebSocket();
+      sockets.push(socket);
+      return { socket: socket as unknown as WebSocket, authRevision: 37 };
+    },
+    reconnectDelay: () => 0,
+  });
+  api.ensureSession({ clientSessionId: "local-draft", profileId: "profile" });
+  await waitFor(() => sockets.length === 1);
+  sockets[0]!.open();
+  sockets[0]!.serverClose(1006, "network lost");
+  await waitFor(() => sockets.length === 2);
+  sockets[1]!.open();
+
+  assert.deepEqual(sessionErrors, []);
+  assert.deepEqual(disconnected, []);
+  api.stop();
+});
+
+test("a halted transport settles a lazy draft's pending first prompt", async () => {
+  let rejectOpen!: (reason: unknown) => void;
+  const states: string[] = [];
+  const api = connectChatApi(callbacks(states), {
+    serverUrl: "https://office.example",
+    openWebSocket: async () => await new Promise<never>((_resolve, reject) => { rejectOpen = reject; }),
+  });
+  api.ensureSession({ clientSessionId: "pending-draft", profileId: "profile" });
+  const submission = api.submitPrompt("pending-draft", "first prompt", "first-operation");
+  await waitFor(() => rejectOpen !== undefined);
+  rejectOpen(new OfficeSessionUnavailableError("manual recovery required", 0, false));
+
+  assert.deepEqual(await submission, { status: "rejected", message: "manual recovery required" });
+  assert.equal(states.at(-1), "error");
+  api.stop();
+});
+
 test("persistent pre-open failures spend one auth check and then stop after a bounded retry count", async () => {
   const sockets: FakeWebSocket[] = [];
   const states: string[] = [];
@@ -288,7 +334,10 @@ test("persistent pre-open failures spend one auth check and then stop after a bo
     recoverAuthentication: async () => { recoveries += 1; revision += 1; },
     reconnectDelay: () => 0,
   });
-  sessions.value = [{ id: "retry-client", profileId: "profile", title: "Retry", status: "ready", messages: [], connectionState: "connecting", historyState: "unloaded", remoteKind: "draft" }];
+  sessions.value = [{
+    id: "retry-client", storedSessionId: "stored-retry", profileId: "profile", title: "Retry",
+    status: "ready", messages: [], connectionState: "connecting", historyState: "unloaded", remoteKind: "stored",
+  }];
   openSessionIds.value = ["retry-client"];
   registerChatRuntime(api);
 
@@ -344,6 +393,95 @@ test("repeated network bootstrap failures stop after the bounded reconnect budge
   api.stop();
 });
 
+test("open sockets that never become gateway-ready exhaust the reconnect budget", async () => {
+  const states: string[] = [];
+  const sockets: FakeWebSocket[] = [];
+  const attempts: number[] = [];
+  const api = connectChatApi(callbacks(states), {
+    serverUrl: "https://office.example",
+    openWebSocket: async () => {
+      const socket = new FakeWebSocket();
+      sockets.push(socket);
+      setTimeout(() => socket.open(false), 0);
+      return { socket: socket as unknown as WebSocket, authRevision: 41 };
+    },
+    reconnectDelay: (attempt) => { attempts.push(attempt); return 0; },
+    gatewayReadyTimeoutMs: 5,
+  });
+
+  await waitFor(() => states.at(-1) === "error");
+  assert.equal(sockets.length, 6, "one initial socket plus five bounded reconnects");
+  assert.deepEqual(attempts, [0, 1, 2, 3, 4]);
+  api.stop();
+});
+
+test("ready sockets that flap before the stability window still exhaust the reconnect budget", async () => {
+  const states: string[] = [];
+  const sockets: FakeWebSocket[] = [];
+  const api = connectChatApi(callbacks(states), {
+    serverUrl: "https://office.example",
+    openWebSocket: async () => {
+      const socket = new FakeWebSocket();
+      sockets.push(socket);
+      return { socket: socket as unknown as WebSocket, authRevision: 44 };
+    },
+    reconnectDelay: () => 0,
+    reconnectStabilityMs: 60_000,
+  });
+
+  for (let expected = 1; expected <= 6; expected += 1) {
+    await waitFor(() => sockets.length === expected);
+    sockets[expected - 1]!.open();
+    sockets[expected - 1]!.serverClose(1006, "flapping network");
+  }
+  await waitFor(() => states.at(-1) === "error");
+  assert.equal(sockets.length, 6);
+  api.stop();
+});
+
+test("gateway waiting progress preserves one socket until office.ready", async () => {
+  const states: string[] = [];
+  const socket = new FakeWebSocket(true);
+  const api = connectChatApi(callbacks(states), {
+    serverUrl: "https://office.example",
+    openWebSocket: async () => {
+      setTimeout(() => socket.open(false), 0);
+      return { socket: socket as unknown as WebSocket, authRevision: 42 };
+    },
+    reconnectDelay: () => 0,
+    gatewayReadyTimeoutMs: 5,
+    gatewayReadyAbsoluteTimeoutMs: 100,
+  });
+
+  await new Promise<void>((resolve) => setTimeout(resolve, 25));
+  assert.equal(states.at(-1), "connecting");
+  assert.equal(states.includes("error"), false);
+  socket.officeReady();
+  await waitFor(() => states.at(-1) === "ready");
+  api.stop();
+});
+
+test("gateway waiting progress cannot extend the absolute readiness deadline", async () => {
+  const states: string[] = [];
+  const sockets: FakeWebSocket[] = [];
+  const api = connectChatApi(callbacks(states), {
+    serverUrl: "https://office.example",
+    openWebSocket: async () => {
+      const socket = new FakeWebSocket(true);
+      sockets.push(socket);
+      setTimeout(() => socket.open(false), 0);
+      return { socket: socket as unknown as WebSocket, authRevision: 43 };
+    },
+    reconnectDelay: () => 0,
+    gatewayReadyTimeoutMs: 5,
+    gatewayReadyAbsoluteTimeoutMs: 20,
+  });
+
+  await waitFor(() => states.at(-1) === "error");
+  assert.equal(sockets.length, 1, "the terminal readiness deadline must not churn through replacement sockets");
+  api.stop();
+});
+
 function callbacks(states: string[]): ChatApiCallbacks {
   return {
     onSocketState(state) { states.push(state); },
@@ -356,6 +494,9 @@ class FakeWebSocket {
   readyState = WebSocket.CONNECTING;
   readonly #listeners = new Map<string, Set<(event: CloseEvent | Event | MessageEvent) => void>>();
   #closed = false;
+  #waitingTimer: ReturnType<typeof setTimeout> | undefined;
+
+  constructor(private readonly respondWaitingToHello = false) {}
 
   addEventListener(type: string, listener: (event: CloseEvent | Event | MessageEvent) => void): void {
     const listeners = this.#listeners.get(type) ?? new Set();
@@ -363,12 +504,34 @@ class FakeWebSocket {
     this.#listeners.set(type, listeners);
   }
 
-  send(): void {}
+  send(body: string): void {
+    if (!this.respondWaitingToHello) return;
+    let frame: { method?: string } | undefined;
+    try { frame = JSON.parse(body) as { method?: string }; } catch { return; }
+    if (frame.method === "office.hello" && this.#waitingTimer === undefined) {
+      const emitWaiting = () => {
+        if (this.#closed || !this.respondWaitingToHello) return;
+        this.officeWaiting();
+        this.#waitingTimer = setTimeout(emitWaiting, 1);
+      };
+      queueMicrotask(emitWaiting);
+    }
+  }
   open(sendOfficeReady = true): void {
     if (this.#closed) return;
     this.readyState = WebSocket.OPEN;
     this.#emit("open", new Event("open"));
     if (sendOfficeReady) this.#emit("message", { data: JSON.stringify({ jsonrpc: "2.0", method: "office.ready", params: {} }) } as MessageEvent);
+  }
+  officeWaiting(): void {
+    if (this.#closed) return;
+    this.#emit("message", { data: JSON.stringify({ jsonrpc: "2.0", method: "office.waiting", params: { phase: "attaching" } }) } as MessageEvent);
+  }
+  officeReady(): void {
+    if (this.#closed) return;
+    if (this.#waitingTimer !== undefined) clearTimeout(this.#waitingTimer);
+    this.#waitingTimer = undefined;
+    this.#emit("message", { data: JSON.stringify({ jsonrpc: "2.0", method: "office.ready", params: {} }) } as MessageEvent);
   }
   close(code = 1000, reason = ""): void {
     this.serverClose(code, reason);
@@ -376,6 +539,8 @@ class FakeWebSocket {
   serverClose(code: number, reason: string): void {
     if (this.#closed) return;
     this.#closed = true;
+    if (this.#waitingTimer !== undefined) clearTimeout(this.#waitingTimer);
+    this.#waitingTimer = undefined;
     this.readyState = WebSocket.CLOSED;
     this.#emit("close", { code, reason } as CloseEvent);
   }

@@ -291,12 +291,20 @@ pub(crate) fn parse_leading_version(value: &str) -> Option<(u64, u64, u64)> {
 }
 
 pub(crate) fn inherit_safe_environment(command: &mut Command) {
+    inherit_safe_environment_with_lookup(command, |key| env::var_os(key));
+}
+
+pub(crate) fn inherit_safe_environment_with_lookup(
+    command: &mut Command,
+    lookup: impl Fn(&str) -> Option<OsString>,
+) {
     for key in [
         "HOME", "PATH", "USER", "LOGNAME", "SHELL", "TMPDIR", "TEMP", "TMP",
         "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME", "LANG", "LANGUAGE",
         "LC_ALL", "LC_CTYPE", "TZ", "SYSTEMROOT", "WINDIR", "COMSPEC", "PATHEXT",
+        "HERMES_HOME",
     ] {
-        if let Some(value) = env::var_os(key).filter(|value| !value.is_empty()) {
+        if let Some(value) = lookup(key).filter(|value| !value.is_empty()) {
             command.env(key, value);
         }
     }
@@ -325,7 +333,17 @@ pub(crate) fn inherit_studio_server_remote_environment(
 }
 
 pub(crate) fn node_candidates(home: Option<&Path>) -> Vec<PathBuf> {
+    node_candidates_with_lookup(home, |key| env::var_os(key))
+}
+
+pub(crate) fn node_candidates_with_lookup(
+    home: Option<&Path>,
+    lookup: impl Fn(&str) -> Option<OsString>,
+) -> Vec<PathBuf> {
     let mut values = Vec::new();
+    if let Some(hermes_home) = absolute_hermes_home(&lookup) {
+        values.push(hermes_home.join("node/bin/node"));
+    }
     if let Some(home) = home {
         values.push(home.join(".hermes/node/bin/node"));
         values.push(home.join(".local/bin/node"));
@@ -401,7 +419,19 @@ fn push_version_manager_nodes(home: &Path, values: &mut Vec<PathBuf>) {
 }
 
 pub(crate) fn hermes_candidates(home: Option<&Path>) -> Vec<PathBuf> {
+    hermes_candidates_with_lookup(home, |key| env::var_os(key))
+}
+
+pub(crate) fn hermes_candidates_with_lookup(
+    home: Option<&Path>,
+    lookup: impl Fn(&str) -> Option<OsString>,
+) -> Vec<PathBuf> {
     let mut values = Vec::new();
+    if let Some(hermes_home) = absolute_hermes_home(&lookup) {
+        values.push(hermes_home.join("hermes-agent/venv/bin/hermes"));
+        values.push(hermes_home.join("hermes-agent/hermes"));
+        values.push(hermes_home.join("bin/hermes"));
+    }
     if let Some(home) = home {
         values.push(home.join(".local/bin/hermes"));
         values.push(home.join(".hermes/hermes-agent/venv/bin/hermes"));
@@ -413,4 +443,9 @@ pub(crate) fn hermes_candidates(home: Option<&Path>) -> Vec<PathBuf> {
         PathBuf::from("/usr/local/bin/hermes"),
     ]);
     values
+}
+
+fn absolute_hermes_home(lookup: &impl Fn(&str) -> Option<OsString>) -> Option<PathBuf> {
+    let path = PathBuf::from(lookup("HERMES_HOME").filter(|value| !value.is_empty())?);
+    path.is_absolute().then_some(path)
 }

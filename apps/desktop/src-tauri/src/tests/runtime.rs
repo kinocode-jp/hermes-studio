@@ -7,17 +7,82 @@ use std::{
 
 use crate::hex_util::random_desktop_capability;
 use crate::runtime::{
-    hermes_agent_is_detected, hermes_candidates, inherit_studio_server_remote_environment,
-    node_candidates, node_version_is_compatible, run_version_command_with_timeout,
-    validated_local_executable,
+    hermes_agent_is_detected, hermes_candidates_with_lookup, inherit_safe_environment_with_lookup,
+    inherit_studio_server_remote_environment, node_candidates_with_lookup,
+    node_version_is_compatible, run_version_command_with_timeout, validated_local_executable,
 };
 
 #[test]
 fn executable_fallbacks_are_absolute() {
-    assert!(node_candidates(None).iter().all(|path| path.is_absolute()));
-    assert!(hermes_candidates(None)
+    assert!(node_candidates_with_lookup(None, |_| None)
         .iter()
         .all(|path| path.is_absolute()));
+    assert!(hermes_candidates_with_lookup(None, |_| None)
+        .iter()
+        .all(|path| path.is_absolute()));
+}
+
+#[test]
+fn absolute_hermes_home_candidates_are_prioritized_without_mutating_process_environment() {
+    let native_home = std::path::Path::new("/Users/example");
+    let hermes_home = std::path::Path::new("/Volumes/External SSD/custom-hermes");
+    let lookup = |key: &str| {
+        (key == "HERMES_HOME").then(|| OsString::from(hermes_home.as_os_str()))
+    };
+
+    let node = node_candidates_with_lookup(Some(native_home), lookup);
+    assert_eq!(node.first(), Some(&hermes_home.join("node/bin/node")));
+
+    let hermes = hermes_candidates_with_lookup(Some(native_home), lookup);
+    assert_eq!(
+        hermes.get(0),
+        Some(&hermes_home.join("hermes-agent/venv/bin/hermes")),
+    );
+    assert_eq!(
+        hermes.get(1),
+        Some(&hermes_home.join("hermes-agent/hermes")),
+    );
+    assert_eq!(hermes.get(2), Some(&hermes_home.join("bin/hermes")));
+}
+
+#[test]
+fn relative_hermes_home_is_not_an_executable_candidate() {
+    let lookup = |key: &str| {
+        (key == "HERMES_HOME").then(|| OsString::from("relative/hermes-home"))
+    };
+    assert!(node_candidates_with_lookup(None, lookup)
+        .iter()
+        .all(|path| path.is_absolute()));
+    assert!(hermes_candidates_with_lookup(None, lookup)
+        .iter()
+        .all(|path| path.is_absolute()));
+}
+
+#[test]
+fn safe_environment_inherits_hermes_home_via_injected_lookup() {
+    let mut command = Command::new("/bin/sh");
+    command.env_clear();
+    inherit_safe_environment_with_lookup(&mut command, |key| {
+        (key == "HERMES_HOME").then(|| OsString::from("/Volumes/External SSD/custom-hermes"))
+    });
+    let envs: Vec<(String, String)> = command
+        .get_envs()
+        .filter_map(|(key, value)| {
+            value.map(|value| {
+                (
+                    key.to_string_lossy().into_owned(),
+                    value.to_string_lossy().into_owned(),
+                )
+            })
+        })
+        .collect();
+    assert_eq!(
+        envs,
+        vec![(
+            "HERMES_HOME".to_string(),
+            "/Volumes/External SSD/custom-hermes".to_string(),
+        )],
+    );
 }
 
 #[test]
@@ -40,7 +105,7 @@ fn version_manager_candidates_are_not_truncated_before_validation() {
             .expect("create asdf candidate");
     }
 
-    let candidates = node_candidates(Some(&home));
+    let candidates = node_candidates_with_lookup(Some(&home), |_| None);
     let managed = candidates.iter().filter(|path| {
         path.starts_with(home.join(".nvm"))
             || path.starts_with(home.join(".local/share/fnm"))
@@ -157,7 +222,7 @@ fn studio_server_remote_environment_allowlist_is_exact_when_host_values_present(
     assert!(envs.contains(&("HERMES_STUDIO_TRUSTED_PROXY_HOPS".to_string(), "1".to_string())));
     assert!(envs.contains(&("HERMES_STUDIO_REMOTE_PRIVILEGED".to_string(), "true".to_string())));
     assert!(envs.contains(&("HERMES_STUDIO_CHAT_SESSION_LEASES_PER_PROFILE".to_string(), "16".to_string())));
-    assert_eq!(envs.len(), 4, "only the four allowed Studio Server keys may be forwarded");
+    assert_eq!(envs.len(), 5, "only the five configured Studio Server keys may be forwarded");
 }
 
 #[test]

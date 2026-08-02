@@ -95,8 +95,9 @@ invalid-digest registry fails closed and does not reopen enrollment.
   backend URL, Profile filesystem paths, or raw provider-secret objects.
 - Local model discovery probes only fixed loopback OpenCodex/Ollama/LM Studio/
   vLLM model-list URLs with short deadlines and bounded responses. It reads
-  provider/model identifiers only and writes only Studio-owned
-  `local-cli-*`/`local-runtime-*` custom endpoints with fixed loopback base URLs;
+  provider/model identifiers only and reconciles only Studio-owned
+  `local-cli-*`/`local-runtime-*` custom endpoints with fixed loopback base URLs
+  (including removal of obsolete Studio-owned duplicates at those exact URLs);
   it never imports CLI credentials or client-supplied endpoint addresses. The
   remote-safe `local-model-providers.sync` operation is therefore a bounded
   rescan of host-local public metadata, not arbitrary profile configuration.

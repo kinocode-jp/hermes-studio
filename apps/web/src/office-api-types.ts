@@ -34,6 +34,7 @@ export type OfficeApiRequestOptions = {
   method?: "GET" | "POST" | "PUT" | "PATCH" | "DELETE";
   body?: unknown;
   timeoutMs?: number;
+  signal?: AbortSignal;
 };
 
 export type DeviceLoginResult = { ok: true } | ({ ok: false } & DeviceLoginFailure);

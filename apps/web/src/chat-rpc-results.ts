@@ -64,6 +64,7 @@ export function interactionResultWasAccepted(method: "approval.respond" | "clari
 export function normalizeSteerResult(value: unknown): ChatSteerResult {
   const result = resultRecord(value);
   if (result?.status === "queued") return { status: "queued" };
+  if (result?.status === "turn_ended") return { status: "turn-ended" };
   if (result?.status === "rejected") return { status: "rejected" };
   return { status: "invalid" };
 }

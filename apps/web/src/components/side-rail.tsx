@@ -2,7 +2,7 @@ import { Fragment } from "preact";
 import { useEffect, useRef, useState } from "preact/hooks";
 import type { ChatSession, Profile, WorkTask } from "../domain";
 import { chatSessionTitle, localizeRuntimeMessage, t, type TranslationKey } from "../i18n";
-import { loadMoreProfiles, loadMoreSessions, profileInventoryState, sessionInventoryState } from "../inventory";
+import { loadAllProfiles, loadAllSessions, loadMoreProfiles, loadMoreSessions, profileInventoryState, requestInventorySnapshotRefresh, sessionInventoryState } from "../inventory";
 import { deleteTask, tasks } from "../kanban-store";
 import { profileDisplayName, profileDisplayNameMap, profileSecondaryName } from "../profile-names";
 import {
@@ -67,13 +67,16 @@ import {
   reconcileSidebarProfileOrder,
   sortProfilesBySidebarOrder,
 } from "../profile-order";
-import { ProfileContextMenu, useProfileContextMenu } from "./profile-context-menu";
+import { menuPositionFromEvent, ProfileContextMenu, useProfileContextMenu } from "./profile-context-menu";
 import { isScheduledSessionHidden } from "../scheduled-sessions";
-import { isPhoneViewport } from "../viewport";
+import { isPhoneViewport, PHONE_VIEWPORT_QUERY } from "../viewport";
 import { createProfileSession } from "./profile-panel";
-import { SessionDeleteDialog } from "./session-delete-dialog";
+import { SessionDeleteDialog, SessionsDeleteDialog } from "./session-delete-dialog";
+import { sessionMatchesDeleteScope, type SessionDeleteScope } from "../session-delete-scope";
 import { useMobileOverlay } from "./use-mobile-overlay";
-import { groupSessionsByProject, type ProjectSessionGroup } from "../project-session-groups";
+import { groupSessionsByConfiguredProjects, projectFolderGroupId, type ConfiguredProjectGroup, type ConfiguredProjectSource } from "../configured-project-groups";
+import { loadProfileProjects } from "../settings-api";
+import { profileProjectsRevision } from "../profile-project-revision";
 import {
   moveSidebarProject,
   reconcileSidebarProjectOrder,
@@ -81,6 +84,10 @@ import {
 } from "../project-order";
 
 const SIDEBAR_PROFILE_PAGE_SIZE = 8;
+
+type ProjectMenuState = { key: string; name: string; profileId: string; projectGroupIds: string[]; left: number; top: number };
+type ProjectDeleteScope = Extract<SessionDeleteScope, { kind: "project" | "all-projects" }>;
+type ProjectDeleteRequest = { sessions: readonly ChatSession[]; scope: ProjectDeleteScope };
 
 function sidebarTaskStatusLabel(status: string): string {
   switch (status) {
@@ -137,6 +144,14 @@ export function SideRail() {
   const [visibleProfileCount, setVisibleProfileCount] = useState(SIDEBAR_PROFILE_PAGE_SIZE);
   const [panelActionNote, setPanelActionNote] = useState("");
   const [sessionDeleteRequestId, setSessionDeleteRequestId] = useState<string | null>(null);
+  const projectMenuRef = useRef<HTMLDivElement>(null);
+  const [projectMenu, setProjectMenu] = useState<ProjectMenuState | null>(null);
+  const [projectDeleteRequest, setProjectDeleteRequest] = useState<ProjectDeleteRequest | null>(null);
+  const [projectDeleteLoading, setProjectDeleteLoading] = useState(false);
+  const [projectDeleteLoadFailed, setProjectDeleteLoadFailed] = useState(false);
+  const [configuredProjectSources, setConfiguredProjectSources] = useState<ConfiguredProjectSource[]>([]);
+  const [configuredProjectsLoading, setConfiguredProjectsLoading] = useState(false);
+  const [configuredProjectsLoadFailed, setConfiguredProjectsLoadFailed] = useState(false);
   const [dashboardDeleteRequest, setDashboardDeleteRequest] = useState<{ id: string; name: string } | null>(null);
   const [taskDeleteRequest, setTaskDeleteRequest] = useState<WorkTask | null>(null);
   const [taskDeleteBusy, setTaskDeleteBusy] = useState(false);
@@ -260,7 +275,7 @@ export function SideRail() {
 
   useEffect(() => {
     if (typeof matchMedia !== "function") return;
-    const query = matchMedia("(max-width: 768px)");
+    const query = matchMedia(PHONE_VIEWPORT_QUERY);
     const sync = () => setPhoneViewport(query.matches);
     sync();
     if (typeof query.addEventListener === "function") {
@@ -270,6 +285,92 @@ export function SideRail() {
     query.addListener(sync);
     return () => query.removeListener(sync);
   }, []);
+
+  useEffect(() => {
+    if (!projectMenu) return;
+    const closeOnPointer = (event: PointerEvent) => {
+      const target = event.target instanceof Element ? event.target : null;
+      if (!target?.closest(".project-context-menu")) setProjectMenu(null);
+    };
+    const closeOnKey = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setProjectMenu(null);
+    };
+    window.addEventListener("pointerdown", closeOnPointer);
+    window.addEventListener("keydown", closeOnKey);
+    return () => {
+      window.removeEventListener("pointerdown", closeOnPointer);
+      window.removeEventListener("keydown", closeOnKey);
+    };
+  }, [projectMenu]);
+
+  useEffect(() => {
+    if (!projectMenu || !projectMenuRef.current) return;
+    const rect = projectMenuRef.current.getBoundingClientRect();
+    const left = Math.min(Math.max(8, projectMenu.left), Math.max(8, window.innerWidth - rect.width - 8));
+    const top = Math.min(Math.max(8, projectMenu.top), Math.max(8, window.innerHeight - rect.height - 8));
+    if (left !== projectMenu.left || top !== projectMenu.top) setProjectMenu({ ...projectMenu, left, top });
+  }, [projectMenu]);
+
+  const openProjectMenu = (event: MouseEvent | PointerEvent, group: ConfiguredProjectGroup) => {
+    event.preventDefault();
+    event.stopPropagation();
+    setProjectDeleteLoadFailed(false);
+    setProjectMenu({ key: group.key, name: group.name, profileId: group.profileId, projectGroupIds: group.projectGroupIds, ...menuPositionFromEvent(event) });
+  };
+
+  const requestProjectSessionDelete = async (scope: ProjectDeleteScope) => {
+    if (projectDeleteLoading) return;
+    setProjectDeleteLoading(true);
+    setProjectDeleteLoadFailed(false);
+    await requestInventorySnapshotRefresh();
+    const complete = await loadAllSessions();
+    setProjectDeleteLoading(false);
+    if (!complete) {
+      setProjectDeleteLoadFailed(true);
+      return;
+    }
+    const targetSessions = sessions.value.filter((session) =>
+      sessionMatchesDeleteScope(session, scope) && !isScheduledSessionHidden(session));
+    if (targetSessions.length === 0) {
+      setProjectMenu(null);
+      return;
+    }
+    setProjectDeleteRequest({ sessions: targetSessions, scope });
+    setProjectMenu(null);
+  };
+
+  const configuredProjectRevision = profileProjectsRevision.value;
+  const configuredProjectProfileIds = profileList.value.map((profile) => profile.id).join("|");
+  useEffect(() => {
+    if (!sidebarProjectsOpen.value) return;
+    let cancelled = false;
+    setConfiguredProjectsLoading(true);
+    setConfiguredProjectsLoadFailed(false);
+    void (async () => {
+      const profilesComplete = await loadAllProfiles();
+      if (cancelled) return;
+      const profiles = [...profileList.value];
+      const sources = await Promise.all(profiles.map(async (profile): Promise<ConfiguredProjectSource | null> => {
+        try {
+          const snapshot = await loadProfileProjects(profile.id);
+          const projects = await Promise.all(snapshot.projects.map(async (project) => ({
+            project,
+            folderGroupIds: (await Promise.all(project.folders.map((folder) => projectFolderGroupId(folder.path))))
+              .filter((id): id is string => id !== undefined),
+          })));
+          return { profileId: profile.id, profileName: profileDisplayName(profile), projects };
+        } catch {
+          // A single unavailable profile does not hide projects owned by others.
+          return null;
+        }
+      }));
+      if (cancelled) return;
+      setConfiguredProjectSources(sources.filter((source): source is ConfiguredProjectSource => source !== null));
+      setConfiguredProjectsLoadFailed(!profilesComplete || sources.some((source) => source === null));
+      setConfiguredProjectsLoading(false);
+    })();
+    return () => { cancelled = true; };
+  }, [configuredProjectProfileIds, configuredProjectRevision, sidebarProjectsOpen.value]);
 
   const profileIdsKey = profileList.value.map((profile) => profile.id).join("|");
   useEffect(() => {
@@ -285,8 +386,9 @@ export function SideRail() {
   const grouping = groupMode === "teams"
     ? groupProfilesByTeams(visibleProfiles, teams.value)
     : { mode: "flat" as const, profiles: visibleProfiles };
-  const discoveredProjectGroups = groupSessionsByProject(
+  const discoveredProjectGroups = groupSessionsByConfiguredProjects(
     sessions.value.filter((session) => !isScheduledSessionHidden(session)),
+    configuredProjectSources,
   );
   const projectGroups = sortProjectsBySidebarOrder(discoveredProjectGroups);
   const projectIdsKey = discoveredProjectGroups.map((group) => group.key).join("|");
@@ -675,34 +777,47 @@ export function SideRail() {
     );
   };
 
-  const renderProjectGroup = (group: ProjectSessionGroup) => {
-    const label = group.kind === "project" ? group.name : t("project.group.unassigned");
+  const renderProjectGroup = (group: ConfiguredProjectGroup) => {
+    const label = `${group.name} (${group.profileName})`;
+    const detail = `${group.profileName} / ${group.folderNames[0] ?? t("settings.projects.noFolders")}`;
     const open = isSidebarProjectOpen(group.key);
     const dragging = dragProjectId === group.key;
     const dropTarget = dropProjectTargetId === group.key && dragProjectId !== group.key;
     return (
       <section
         key={group.key}
-        class={`profile-group project-session-group ${group.kind === "unassigned" ? "profile-group--unassigned" : ""} ${dragging ? "is-dragging" : ""} ${dropTarget ? "is-drop-target" : ""}`}
+        class={`profile-group project-session-group ${dragging ? "is-dragging" : ""} ${dropTarget ? "is-drop-target" : ""}`}
         aria-label={label}
         onDragOver={(event) => onProjectDragOver(event, group.key)}
         onDrop={(event) => onProjectDrop(event, group.key)}
       >
-        <button
-          type="button"
-          class="profile-group-header project-group-header-button"
-          draggable
-          aria-expanded={open}
-          title={label}
-          onClick={() => toggleSidebarProjectOpen(group.key)}
-          onDragStart={(event) => onProjectDragStart(event, group.key)}
-          onDragEnd={onProjectDragEnd}
-        >
-          <i aria-hidden="true" />
-          <b>{label}</b>
-          <small>{t("project.group.count", { count: group.sessions.length })}</small>
-          <span class="sidebar-profile-chevron" aria-hidden="true">{open ? "▾" : "▸"}</span>
-        </button>
+        <div class="project-group-header-row">
+          <button
+            type="button"
+            class="profile-group-header project-group-header-button"
+            draggable
+            aria-expanded={open}
+            title={label}
+            onClick={() => toggleSidebarProjectOpen(group.key)}
+            onContextMenu={(event) => openProjectMenu(event, group)}
+            onDragStart={(event) => onProjectDragStart(event, group.key)}
+            onDragEnd={onProjectDragEnd}
+          >
+            <i aria-hidden="true" />
+            <b>{label}</b>
+            <small title={detail}>{detail}</small>
+            <span class="sidebar-profile-chevron" aria-hidden="true">{open ? "▾" : "▸"}</span>
+          </button>
+          <button
+            type="button"
+            class="sidebar-item-menu-trigger project-group-menu-trigger"
+            aria-label={t("project.menu.trigger")}
+            title={t("project.menu.trigger")}
+            onClick={(event) => openProjectMenu(event, group)}
+          >
+            ⋯
+          </button>
+        </div>
         {open && (
           <div class="sidebar-session-list sidebar-project-session-list" aria-label={copy.sessionCount(group.sessions.length)}>
             {group.sessions.map(renderProjectSession)}
@@ -868,8 +983,12 @@ export function SideRail() {
         <>
           <div class="sidebar-project-list">
             {projectGroups.map(renderProjectGroup)}
-            {projectGroups.length === 0 && <p class="sidebar-nav-tree-empty">-</p>}
+            {configuredProjectsLoading && <p class="sidebar-nav-tree-empty">{t("settings.projects.loading")}</p>}
+            {!configuredProjectsLoading && projectGroups.length === 0 && <p class="sidebar-nav-tree-empty">-</p>}
           </div>
+          {configuredProjectsLoadFailed && (
+            <small class="inventory-note inventory-note--error">{t("sidebar.projectsLoadFailed")}</small>
+          )}
           {sessionInventory.hasMore && (
             <button class="sidebar-more" type="button" disabled={sessionInventory.loading} onClick={() => void loadMoreSessions()}>
               {sessionInventory.loading ? t("inventory.loading") : t("inventory.showMore")}
@@ -1140,6 +1259,14 @@ export function SideRail() {
           : null;
       })()}
 
+      {projectDeleteRequest && (
+        <SessionsDeleteDialog
+          sessions={projectDeleteRequest.sessions}
+          deleteScope={projectDeleteRequest.scope}
+          onClose={() => setProjectDeleteRequest(null)}
+        />
+      )}
+
       {dashboardDeleteRequest && (
         <div
           class="scheduled-delete-dialog-layer"
@@ -1304,6 +1431,52 @@ export function SideRail() {
           onOpenSession={openMenuSession}
           onDeleteSession={setSessionDeleteRequestId}
         />
+      )}
+
+      {projectMenu && (
+        <div
+          ref={projectMenuRef}
+          class="profile-context-menu project-context-menu"
+          role="menu"
+          aria-label={t("project.menu.aria", { name: projectMenu.name })}
+          style={{ left: `${projectMenu.left}px`, top: `${projectMenu.top}px`, maxHeight: "240px" }}
+        >
+          <p class="profile-context-menu-kicker">{t("sidebar.projects")}</p>
+          <p class="profile-context-menu-title" title={projectMenu.name}>{projectMenu.name}</p>
+          <div class="profile-context-menu-divider" role="separator" />
+          <button
+            type="button"
+            role="menuitem"
+            class="profile-context-menu-danger"
+            disabled={projectDeleteLoading}
+            onClick={() => void requestProjectSessionDelete({
+              kind: "project",
+              profileId: projectMenu.profileId,
+              projectGroupIds: projectMenu.projectGroupIds,
+            })}
+          >
+            {projectDeleteLoading ? t("project.menu.loading") : t("project.menu.deleteProjectSessions")}
+          </button>
+          <button
+            type="button"
+            role="menuitem"
+            class="profile-context-menu-danger"
+            disabled={projectDeleteLoading || configuredProjectsLoading || configuredProjectsLoadFailed}
+            onClick={() => void requestProjectSessionDelete({
+              kind: "all-projects",
+              projectGroupIds: projectGroups.flatMap((group) => group.projectGroupIds),
+            })}
+          >
+            {projectDeleteLoading ? t("project.menu.loading") : t("project.menu.deleteAllProjectSessions")}
+          </button>
+          {projectDeleteLoadFailed && (
+            <p class="profile-context-menu-delete-error" role="alert">{t("project.menu.loadFailed")}</p>
+          )}
+          <div class="profile-context-menu-divider" role="separator" />
+          <button type="button" role="menuitem" disabled={projectDeleteLoading} onClick={() => setProjectMenu(null)}>
+            {t("common.close")}
+          </button>
+        </div>
       )}
 
       {sidebarWidth.value <= SIDEBAR_ICON_THRESHOLD && <span class="visually-hidden" aria-live="polite">{t("sidebar.iconOnly")}</span>}
