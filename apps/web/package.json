@@ -17,8 +17,8 @@
   },
   "dependencies": {
     "@hermes-office/protocol": "0.0.0",
-    "@preact/signals": "^2.0.1",
-    "preact": "^10.26.4"
+    "@preact/signals": "^2.11.0",
+    "preact": "^10.29.8"
   },
   "devDependencies": {
     "@preact/preset-vite": "^2.10.1",
